@@ -88,7 +88,7 @@ final class AccessibilityObserver {
 
     // ── AXObserver lifecycle ───────────────────────────────────────
 
-    private func attachTo(pid: pid) {
+    private func attachTo(pid: pid_t) {
         var obs: AXObserver?
         let err = AXObserverCreate(pid, { observer, element, notification, refcon in
             guard let refcon = refcon else { return }
@@ -116,7 +116,7 @@ final class AccessibilityObserver {
         os_log(.info, log: log, "attached AXObserver pid=%d", pid)
     }
 
-    private func detachObserver(_ observer: AXObserver, pid: pid) {
+    private func detachObserver(_ observer: AXObserver, pid: pid_t) {
         let appEl = AXUIElementCreateApplication(pid)
         AXObserverRemoveNotification(observer, appEl,
             kAXFocusedUIElementChangedNotification as CFString)
