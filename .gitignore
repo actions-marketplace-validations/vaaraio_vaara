@@ -138,3 +138,7 @@ clients/macos/dist/
 
 # opencode local config
 opencode.json
+
+# NIIS meeting prep materials
+niis/
+social/
