@@ -102,6 +102,8 @@ GCP_MAPPINGS: tuple[CategoryMapping, ...] = (
          "Malicious URL detected. Robustness/cybersecurity signal."),
     _row(_GCP, "sdp", "pii", ("Art. 10",), ("LLM02",),
          "Sensitive Data Protection integration. infoType field carries the PII class."),
+    _row(_GCP, "virus_scan", "malicious_file", ("Art. 15",), ("LLM05",),
+         "Virus or malware found in scanned content. Robustness/cybersecurity signal."),
     _row(_GCP, "csam", "csam", ("Art. 5", "Digital Omnibus CSAM (effective 2 Dec 2026)"), (),
          "CSAM. Always hard-block per Art. 5 plus the CSAM-specific obligation from the Digital Omnibus."),
 )
@@ -204,14 +206,40 @@ _INDEX: dict[tuple[str, str], CategoryMapping] = {
 }
 
 
+def _normalize(category: str) -> str:
+    """Case and separator insensitive form of a provider category.
+
+    Providers name the same check several ways. Guardrails AI reports
+    ``validator.rail_alias``, so PII detection arrives as ``detect-pii``
+    or ``detect_pii`` while this table lists it as ``DetectPII``. Any
+    PascalCase conversion of ``detect-pii`` yields ``DetectPii``, which
+    never matches an acronym, so ``DetectPII`` and ``ValidJSON`` silently
+    resolved to "unmapped" and lost their article annotation.
+    """
+    return "".join(c for c in category.lower() if c.isalnum())
+
+
+_NORMALIZED_INDEX: dict[tuple[str, str], CategoryMapping] = {
+    (provider, _normalize(category)): mapping
+    for (provider, category), mapping in _INDEX.items()
+}
+
+
 def lookup(provider: str, provider_category: str) -> Optional[CategoryMapping]:
     """Return the canonical mapping, or None for unmapped categories.
+
+    Exact match first, then a case and separator insensitive match, so a
+    provider that renames ``DetectPII`` to ``detect_pii`` keeps its
+    article mapping instead of degrading to "unmapped".
 
     Adapter should still record the raw provider response and use
     ``vaara_category="unmapped"`` so evidence surfaces without
     article-level annotation.
     """
-    return _INDEX.get((provider, provider_category))
+    exact = _INDEX.get((provider, provider_category))
+    if exact is not None:
+        return exact
+    return _NORMALIZED_INDEX.get((provider, _normalize(provider_category)))
 
 
 def all_mappings_for(provider: str) -> tuple[CategoryMapping, ...]:
