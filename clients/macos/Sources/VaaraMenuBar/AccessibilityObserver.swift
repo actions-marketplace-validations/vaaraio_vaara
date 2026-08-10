@@ -28,14 +28,25 @@ final class AccessibilityObserver {
     private var focusObserver: NSObjectProtocol?
 
     func start() {
-        guard checkPermission() else {
-            os_log(.info, log: log, "accessibility permission not granted")
-            return
-        }
+        // Already running: do nothing. Without this every call re-ran the
+        // prompting check, and start() is called from onAppear, so clicking
+        // the menu bar icon asked for Accessibility again on an app that
+        // already had it. isRunning existed and was only ever written.
+        guard !isRunning else { return }
 
+        // Ask first, then check. The prompting call has to come before any
+        // early return, or the user is never asked and the observer never
+        // runs again: AXIsProcessTrusted() is silent, so guarding on it and
+        // returning meant the one line that shows the System Settings prompt
+        // was unreachable on exactly the machines that needed it. macOS shows
+        // the prompt once per app, so an untrusted first launch stayed
+        // untrusted forever with only "permission not granted" in the log.
         let opts: NSDictionary = [kAXTrustedCheckOptionPrompt.takeRetainedValue(): true]
         guard AXIsProcessTrustedWithOptions(opts) else {
-            os_log(.info, log: log, "not trusted by accessibility API")
+            // os_log takes a StaticString, so this cannot be built by
+            // concatenation. One literal.
+            os_log(.info, log: log,
+                   "accessibility permission not granted; prompted. Grant it in System Settings > Privacy & Security > Accessibility, then restart Vaara")
             return
         }
 
@@ -129,12 +140,6 @@ final class AccessibilityObserver {
             kAXFocusedWindowChangedNotification as CFString)
         let source = AXObserverGetRunLoopSource(observer)
         CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
-    }
-
-    // ── Permission ─────────────────────────────────────────────────
-
-    private func checkPermission() -> Bool {
-        AXIsProcessTrusted()
     }
 
     // ── Notification handler ───────────────────────────────────────
