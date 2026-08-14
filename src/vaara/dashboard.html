@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<!--
+  SPDX-FileCopyrightText: 2026 Henri Sirkkavaara
+  SPDX-License-Identifier: AGPL-3.0-or-later
+
+  Served by `vaara dashboard` from 127.0.0.1. Read-only: it reports what the
+  trail says and changes nothing. Same visual grammar as vaara.io so the local
+  tool and the public page are recognisably one thing.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vaara</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg:#ececec; --panel:#FFFFFF; --panel-2:#F1F4F0;
+    --line:rgba(60,90,72,.18); --ink:#1A2226; --dim:#566159; --faint:#7C857E;
+    --tri:#3E6B54; --accent:#2C523E;
+    --allow:#3E6B54; --escalate:#8A6100; --deny:#B4524F;
+    --mono:ui-monospace,'SFMono-Regular','JetBrains Mono',Menlo,Consolas,monospace;
+    --sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;
+  }
+  /* Light is the default, as on vaara.io. The dark grammar is preserved
+     verbatim under data-theme so the two surfaces stay one identity. */
+  html[data-theme="dark"] {
+    color-scheme: dark;
+    --bg:#0F1417; --panel:#1A2226; --panel-2:#151D20;
+    --line:rgba(123,156,138,.16); --ink:#DEE4E1; --dim:#8B9792; --faint:#5E6A66;
+    --tri:#78A08A; --accent:#93B8A3;
+    --allow:#78A08A; --escalate:#D9A441; --deny:#D98B8B;
+  }
+  /* Default follows the OS. An explicit choice from the toggle sets
+     data-theme and wins over it, which is why this is scoped to
+     :not([data-theme]) rather than applied unconditionally. */
+  @media (prefers-color-scheme: dark) {
+    html:not([data-theme]) {
+        color-scheme: dark;
+        --bg:#0F1417; --panel:#1A2226; --panel-2:#151D20;
+        --line:rgba(123,156,138,.16); --ink:#DEE4E1; --dim:#8B9792; --faint:#5E6A66;
+        --tri:#78A08A; --accent:#93B8A3;
+        --allow:#78A08A; --escalate:#D9A441; --deny:#D98B8B;
+    }
+  }
+  .theme-toggle{position:fixed;top:14px;right:16px;z-index:10;display:inline-flex;
+    gap:2px;background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:4px}
+  .theme-toggle button{appearance:none;background:none;border:0;cursor:pointer;
+    font-family:var(--mono);font-size:11px;letter-spacing:.18em;text-transform:uppercase;
+    color:var(--faint);padding:4px 11px;border-radius:999px}
+  .theme-toggle button[aria-pressed="true"]{color:var(--tri);background:var(--panel-2)}
+  .theme-toggle button:hover{color:var(--tri)}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+       font-size:16px;line-height:1.65;-webkit-font-smoothing:antialiased;
+       padding:20px 28px 96px}
+  main{max-width:820px;margin:0 auto}
+  h1{font-size:18px;font-weight:500;margin:8px 0 4px;letter-spacing:-.01em}
+  .sub{color:var(--dim);font-size:.85rem;margin:0 0 24px}
+  .stamp{font-family:var(--mono);font-size:12px;letter-spacing:.24em;
+         text-transform:uppercase;color:var(--tri);font-weight:600;margin:32px 0 12px}
+  .tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+  .tile{border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:var(--panel)}
+  .tile .k{font-family:var(--mono);font-size:11px;letter-spacing:.2em;text-transform:uppercase;
+           color:var(--faint);font-weight:600}
+  .tile .v{font-family:var(--mono);font-size:20px;margin-top:6px}
+  @media(max-width:640px){.tiles{grid-template-columns:repeat(2,1fr)}}
+  .light{display:flex;gap:12px;align-items:center;border:1px solid var(--line);
+         border-radius:12px;padding:16px;background:var(--panel)}
+  .dot{width:14px;height:14px;border-radius:50%;flex:none}
+  .allow{background:var(--allow)} .escalate{background:var(--escalate)} .deny{background:var(--deny)}
+  .none{background:var(--faint)}
+  table{width:100%;border-collapse:collapse;font-size:.82rem;font-family:var(--mono)}
+  th{text-align:left;font-size:11px;letter-spacing:.14em;text-transform:uppercase;
+     color:var(--faint);font-weight:600;padding:8px 10px;border-bottom:1px solid var(--line)}
+  td{padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  td.d-allow{color:var(--allow)} td.d-escalate{color:var(--escalate)} td.d-deny{color:var(--deny)}
+  .muted{color:var(--dim)}
+  .empty{border:1px dashed var(--line);border-radius:12px;padding:24px;text-align:center;
+         color:var(--dim);background:var(--panel)}
+  a{color:var(--accent)}
+  code{font-family:var(--mono);font-size:.8rem}
+  .wordmark{text-align:center;margin:8px auto 0}
+  .wordmark img{width:min(58vw,300px);height:auto;display:inline-block}
+  .wordmark .wm-dark{display:none}
+  html[data-theme="dark"] .wordmark .wm-light{display:none}
+  html[data-theme="dark"] .wordmark .wm-dark{display:inline-block}
+  .stance{font-family:var(--mono);font-size:12px;letter-spacing:.22em;
+          text-transform:uppercase;color:var(--tri);margin:.1rem 0 0}
+  .panel{border:1px solid var(--line);border-radius:12px;background:var(--panel);
+         padding:4px 16px}
+  .field{display:flex;gap:16px;align-items:center;padding:12px 0;
+         border-bottom:1px solid var(--line)}
+  .field:last-child{border-bottom:0}
+  .field .lbl{flex:1}
+  .field .lbl .n{font-size:.9rem}
+  .field .lbl .h{color:var(--dim);font-size:.78rem}
+  select{font-family:var(--mono);font-size:.82rem;padding:6px 10px;
+         background:var(--panel-2);color:var(--ink);
+         border:1px solid var(--line);border-radius:8px}
+  .saved{color:var(--allow);font-size:.78rem;margin-left:8px}
+</style>
+</head>
+<body>
+<div class="theme-toggle" role="group" aria-label="Color theme">
+  <button type="button" data-set-theme="light" aria-pressed="true">light</button>
+  <button type="button" data-set-theme="dark" aria-pressed="false">dark</button>
+</div>
+<main>
+  <!-- Served from the installed package, not fetched from the internet. The
+       real wordmark, and it still renders with the network off. A local
+       dashboard reaching out for its own logo would be exactly the kind of
+       quiet call this product argues against. -->
+  <div class="wordmark">
+    <img class="wm-light" src="/vaara-wordmark-light.png" alt="Vaara" width="300" height="86">
+    <img class="wm-dark" src="/vaara-wordmark-dark.png" alt="Vaara" width="300" height="86">
+    <p class="stance">Accountable Autonomy</p>
+  </div>
+  <p class="sub" id="source" style="text-align:center">reading…</p>
+
+  <div class="light">
+    <div class="dot none" id="dot"></div>
+    <div>
+      <div id="latest">No decisions recorded yet.</div>
+      <div class="muted" style="font-size:.82rem" id="latest-why"></div>
+    </div>
+  </div>
+
+  <p class="stamp">Trail</p>
+  <div class="tiles">
+    <div class="tile"><div class="k">records</div><div class="v" id="n-records">—</div></div>
+    <div class="tile"><div class="k">allowed</div><div class="v" id="n-allow">—</div></div>
+    <div class="tile"><div class="k">escalated</div><div class="v" id="n-escalate">—</div></div>
+    <div class="tile"><div class="k">denied</div><div class="v" id="n-deny">—</div></div>
+  </div>
+
+  <p class="stamp">Witness</p>
+  <div class="tiles">
+    <div class="tile"><div class="k">time anchors</div><div class="v" id="n-anchors">—</div></div>
+    <div class="tile"><div class="k">in the resin</div><div class="v" id="n-pubs">—</div></div>
+    <div class="tile"><div class="k">gaps</div><div class="v" id="n-gaps">—</div></div>
+    <div class="tile"><div class="k">last head</div><div class="v" id="last-head" style="font-size:12px">—</div></div>
+  </div>
+  <p class="muted" style="font-size:.8rem;margin-top:10px" id="gap-note"></p>
+  <p class="muted" style="font-size:.8rem;margin-top:6px">
+    Heads you publish land in the <a href="https://vaara.io/verify.html"
+    target="_blank" rel="noopener">Vaara Resin</a>, where anyone can look one up
+    and check a receipt in their own browser. Publishing is opt-in and off until
+    you run <code>vaara trail publish-head</code>.
+  </p>
+
+  <p class="stamp">Settings</p>
+  <div id="settings" class="panel"></div>
+  <p class="muted" style="font-size:.78rem;margin-top:8px" id="cfg-path"></p>
+
+  <p class="stamp">History</p>
+  <div id="history"></div>
+
+  <p class="muted" style="font-size:.78rem;margin-top:36px">
+    Served from your own machine on 127.0.0.1 and not reachable from the
+    network. Trail and witness figures are read-only; settings write to the same
+    config.json the macOS client reads. Nothing here is uploaded anywhere.
+    <br><br>
+    Vaara &copy; 2026 Henri Sirkkavaara. Licensed AGPL-3.0-or-later.
+  </p>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+function when(ts) {
+  if (!ts) return "";
+  return new Date(ts * 1000).toISOString().replace("T", " ").slice(0, 19);
+}
+
+async function load() {
+  let s, h;
+  try {
+    s = await (await fetch("/api/summary")).json();
+    h = await (await fetch("/api/history")).json();
+  } catch (e) {
+    $("source").textContent = "could not read the trail: " + e.message;
+    return;
+  }
+  if (s.error) { $("source").textContent = s.error; return; }
+
+  $("n-records").textContent = s.records;
+  $("n-allow").textContent = s.decisions.allow;
+  $("n-escalate").textContent = s.decisions.escalate;
+  $("n-deny").textContent = s.decisions.deny;
+  $("n-anchors").textContent = (s.anchors || []).length;
+  $("n-pubs").textContent = (s.publications || []).length;
+  $("n-gaps").textContent = s.gaps;
+
+  const pubs = s.publications || [];
+  if (pubs.length) {
+    const p = pubs[pubs.length - 1];
+    $("last-head").innerHTML =
+      `<a href="${esc(p.entry_url)}" rel="noopener">${esc(String(p.digest).slice(0,12))}…</a>`;
+  } else {
+    $("last-head").textContent = "not published";
+  }
+
+  // A gap is the window nobody witnessed. Say what it means rather than
+  // showing a number the reader has to interpret.
+  $("gap-note").textContent = s.gaps
+    ? `${s.gaps} period(s) where anchoring or publishing failed. Those windows are `
+      + `recorded in the chain rather than hidden, but nothing outside this machine `
+      + `saw the records inside them.`
+    : "";
+
+  const L = s.latest || {};
+  if (L.decision) {
+    const d = String(L.decision).toLowerCase();
+    $("dot").className = "dot " + (["allow","escalate","deny"].includes(d) ? d : "none");
+    $("latest").innerHTML =
+      `<strong>${esc(d)}</strong> &nbsp; <code>${esc(L.tool || "")}</code>`
+      + `<span class="muted"> &nbsp; ${esc(when(L.at))}</span>`;
+    $("latest-why").textContent = L.reason || "";
+  }
+
+  if (!h.length) {
+    $("history").innerHTML =
+      `<div class="empty">Nothing recorded yet.<br>`
+      + `Point an AI tool through Vaara and its moves show up here.</div>`;
+    return;
+  }
+  $("history").innerHTML =
+    `<table><thead><tr><th>when</th><th>event</th><th>tool</th>`
+    + `<th>decision</th><th>why</th></tr></thead><tbody>`
+    + h.map(r => {
+        const d = (r.decision || "").toLowerCase();
+        return `<tr>
+          <td class="muted">${esc(when(r.at))}</td>
+          <td class="muted">${esc(r.event)}</td>
+          <td>${esc(r.tool || "")}</td>
+          <td class="${d ? "d-" + d : ""}">${esc(r.decision || "")}</td>
+          <td class="muted">${esc(r.reason || "")}</td>
+        </tr>`;
+      }).join("")
+    + `</tbody></table>`;
+}
+
+let TOKEN = "";
+
+async function saveSetting(key, value, el) {
+  try {
+    const res = await fetch("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Vaara-Token": TOKEN },
+      body: JSON.stringify({ [key]: value }),
+    });
+    const r = await res.json();
+    el.textContent = r.error ? r.error : "saved";
+    el.style.color = r.error ? "var(--deny)" : "var(--allow)";
+  } catch (e) {
+    el.textContent = e.message;
+    el.style.color = "var(--deny)";
+  }
+  setTimeout(() => { el.textContent = ""; }, 2500);
+}
+
+async function loadSettings() {
+  let c;
+  try { c = await (await fetch("/api/config")).json(); }
+  catch (e) { $("settings").textContent = "could not read config: " + e.message; return; }
+  if (c.error) { $("settings").textContent = c.error; return; }
+  TOKEN = c.token;
+  $("cfg-path").textContent = "Written to " + c.path
+    + ". The macOS app reads the same file.";
+
+  $("settings").innerHTML = Object.entries(c.fields).map(([key, f]) => {
+    const cur = c.values[key] !== undefined ? String(c.values[key]) : f.options[0];
+    return `<div class="field">
+      <div class="lbl"><div class="n">${esc(f.label)}</div>
+        <div class="h">${esc(f.help)}</div></div>
+      <select data-key="${esc(key)}">
+        ${f.options.map(o =>
+          `<option value="${esc(o)}"${o === cur ? " selected" : ""}>${esc(o)}</option>`
+        ).join("")}
+      </select>
+      <span class="saved" id="s-${esc(key)}"></span>
+    </div>`;
+  }).join("");
+
+  $("settings").querySelectorAll("select").forEach(sel => {
+    sel.addEventListener("change", () =>
+      saveSetting(sel.dataset.key, sel.value, $("s-" + sel.dataset.key)));
+  });
+}
+
+(function(){
+  var root = document.documentElement;
+  var btns = document.querySelectorAll('.theme-toggle [data-set-theme]');
+  function apply(theme){
+    if (theme === "dark") root.setAttribute("data-theme","dark");
+    else root.removeAttribute("data-theme");
+    btns.forEach(function(b){
+      b.setAttribute("aria-pressed", String(b.getAttribute("data-set-theme") === theme));
+    });
+    try { localStorage.setItem("vaara-theme", theme); } catch(e) {}
+  }
+  // No stored choice: leave data-theme off so the OS decides, and show which
+  // side the OS landed on so the toggle is not lying about the current state.
+  function reflectAuto(){
+    root.removeAttribute("data-theme");
+    var dark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    btns.forEach(function(b){
+      b.setAttribute("aria-pressed", String(b.getAttribute("data-set-theme") === (dark ? "dark" : "light")));
+    });
+  }
+  btns.forEach(function(b){
+    b.addEventListener("click", function(){ apply(b.getAttribute("data-set-theme")); });
+  });
+  var saved = null;
+  try { saved = localStorage.getItem("vaara-theme"); } catch(e) {}
+  if (saved === "dark" || saved === "light") apply(saved); else reflectAuto();
+})();
+
+load();
+loadSettings();
+setInterval(load, 5000);
+</script>
+</body>
+</html>

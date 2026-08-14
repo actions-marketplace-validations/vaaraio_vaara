@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<!--
+  SPDX-FileCopyrightText: 2026 Henri Sirkkavaara
+  SPDX-License-Identifier: AGPL-3.0-or-later
+
+  Vaara receipt verifier. One file, no build step, no dependencies.
+
+  The receipt never leaves the browser. Everything below runs locally: the
+  DSSE pre-authentication encoding is recomputed, its digest taken, and the
+  Ed25519 signature checked with WebCrypto. Nothing is uploaded, so this page
+  learns nothing about you and you do not have to trust whoever served it.
+
+  Save it and open it with the network off. It still works. That is the point:
+  a verifier you have to be online to run is a service, and a service is a
+  party you trust.
+
+  It mirrors tests/vectors/*/\_check_independent.py, which imports no Vaara
+  code either. Producer and verifier share no implementation, so agreement
+  between them means the bytes stand on their own.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Explore the Vaara Resin: verify any autonomous-action receipt</title>
+<style>
+  /* Same tokens as vaara.io/index.html so this reads as one site. */
+  :root {
+    color-scheme: light;
+    --bg: #ececec; --panel: #FFFFFF; --panel-2: #F1F4F0;
+    --line: rgba(60,90,72,.18); --ink: #1A2226; --dim: #566159; --faint: #7C857E;
+    --tri: #3E6B54; --accent: #2C523E; --ok: #3E6B54; --no: #B4524F; --warn: #8A6100;
+    --mono: ui-monospace,'SFMono-Regular','JetBrains Mono','Fira Code',Menlo,Consolas,monospace;
+    --sans: 'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;
+  }
+  /* Light is the default across every Vaara surface; the dark grammar is
+     preserved verbatim under data-theme. Same tokens, same toggle, same
+     localStorage key as vaara.io and the local dashboard. */
+  html[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0F1417; --panel: #1A2226; --panel-2: #151D20;
+    --line: rgba(123,156,138,.16); --ink: #DEE4E1; --dim: #8B9792; --faint: #5E6A66;
+    --tri: #78A08A; --accent: #93B8A3; --ok: #78A08A; --no: #D98B8B; --warn: #D9A441;
+  }
+  /* Default follows the OS. An explicit choice from the toggle sets
+     data-theme and wins over it, which is why this is scoped to
+     :not([data-theme]) rather than applied unconditionally. */
+  @media (prefers-color-scheme: dark) {
+    html:not([data-theme]) {
+        color-scheme: dark;
+        --bg: #0F1417; --panel: #1A2226; --panel-2: #151D20;
+        --line: rgba(123,156,138,.16); --ink: #DEE4E1; --dim: #8B9792; --faint: #5E6A66;
+        --tri: #78A08A; --accent: #93B8A3; --ok: #78A08A; --no: #D98B8B; --warn: #D9A441;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font-family:var(--sans); font-size:16px; line-height:1.65;
+         -webkit-font-smoothing:antialiased; padding:20px 28px 96px; }
+  main { max-width: 760px; margin: 0 auto; }
+  h1 { font-family:var(--sans); font-size:18px; font-weight:500; margin:24px 0 12px;
+       letter-spacing:-0.01em; }
+  .sub { color:var(--dim); margin:0 0 1.75rem; font-size:.85rem; }
+  /* Stat tiles, explorer-style: the shape of the log before any detail. */
+  .tiles { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin:0 0 18px; }
+  .tile { border:1px solid var(--line); border-radius:12px; padding:14px 16px;
+          background:var(--panel); }
+  .tile .k { font-family:var(--mono); font-size:11px; letter-spacing:.2em;
+             text-transform:uppercase; color:var(--faint); font-weight:600; }
+  .tile .v { font-family:var(--mono); font-size:15px; color:var(--ink); margin-top:6px;
+             word-break:break-all; }
+  @media (max-width:560px){ .tiles{grid-template-columns:1fr} }
+  .drop { border:1px dashed var(--line); border-radius:8px; padding:1.5rem;
+          background:var(--panel); text-align:center; color:var(--dim);
+          transition:border-color .15s; }
+  .drop.over { border-color:var(--accent); color:var(--ink); }
+  textarea { width:100%; min-height:150px; margin-top:.75rem; padding:.75rem;
+             background:var(--panel); color:var(--ink); border:1px solid var(--line);
+             border-radius:6px; font:inherit; font-size:12px; resize:vertical; }
+  button { margin-top:.75rem; padding:.55rem 1.1rem; background:var(--accent);
+           color:#fff; border:0; border-radius:6px; font:inherit; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--dim); border:1px solid var(--line); }
+  section { margin-top:1.75rem; background:var(--panel); border:1px solid var(--line);
+            border-radius:8px; padding:1rem 1.15rem; }
+  section h2 { font-size:.72rem; text-transform:uppercase; letter-spacing:.09em;
+               color:var(--dim); margin:0 0 .8rem; font-weight:600; }
+  .row { display:flex; gap:.7rem; padding:.32rem 0; align-items:baseline; }
+  .mark { width:1.15rem; flex:none; font-weight:700; }
+  .ok{color:var(--ok)} .no{color:var(--no)} .warn{color:var(--warn)} .dim{color:var(--dim)}
+  .what { flex:1; }
+  .detail { color:var(--dim); font-size:.79rem; word-break:break-all; }
+  dl { margin:0; display:grid; grid-template-columns:max-content 1fr; gap:.3rem .9rem; }
+  dt { color:var(--dim); font-size:.82rem; }
+  dd { margin:0; word-break:break-all; font-size:.82rem; }
+  .verdict { font-size:1.05rem; font-weight:600; padding:.15rem .5rem;
+             border-radius:4px; display:inline-block; }
+  .hide { display:none; }
+  /* Same wordmark treatment as index.html, keyed off the same data-theme
+     attribute the shared toggle sets. */
+  .wordmark { margin:8px auto 0; text-align:center; }
+  .wordmark img { width:min(60vw,340px); height:auto; display:inline-block; }
+  .wordmark .wm-dark { display:none; }
+  html[data-theme="dark"] .wordmark .wm-light { display:none; }
+  html[data-theme="dark"] .wordmark .wm-dark { display:inline-block; }
+  .theme-toggle{position:fixed;top:14px;right:16px;z-index:10;display:inline-flex;
+    gap:2px;background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:4px}
+  .theme-toggle button{appearance:none;background:none;border:0;cursor:pointer;
+    font-family:var(--mono);font-size:11px;letter-spacing:.18em;text-transform:uppercase;
+    color:var(--faint);padding:4px 11px;border-radius:999px}
+  .theme-toggle button[aria-pressed="true"]{color:var(--tri);background:var(--panel-2)}
+  .theme-toggle button:hover{color:var(--tri)}
+  .stance { font-family:var(--mono); font-size:12px; letter-spacing:.22em;
+            text-transform:uppercase; color:var(--tri); text-align:center;
+            margin:.1rem 0 2rem; }
+  input { width:100%; padding:.6rem .75rem; background:var(--panel); color:var(--ink);
+          border:1px solid var(--line); border-radius:6px; font:inherit; font-size:12px; }
+  .entry { border:1px solid var(--line); border-radius:6px; padding:.6rem .75rem;
+           margin-bottom:.5rem; font-size:.8rem; }
+  .entry a { color:var(--accent); }
+  footer { margin-top:2rem; color:var(--dim); font-size:.76rem; line-height:1.7; }
+  code { background:var(--panel); padding:.1rem .3rem; border-radius:3px; }
+</style>
+</head>
+<body>
+<div class="theme-toggle" role="group" aria-label="Color theme">
+  <button type="button" data-set-theme="light" aria-pressed="true">light</button>
+  <button type="button" data-set-theme="dark" aria-pressed="false">dark</button>
+</div>
+<main>
+  <div class="wordmark">
+    <a href="/"><img class="wm-light" src="https://raw.githubusercontent.com/vaaraio/vaara/main/docs/vaara-wordmark-light.png" alt="Vaara" width="340" height="98"></a>
+    <a href="/"><img class="wm-dark" src="https://raw.githubusercontent.com/vaaraio/vaara/main/docs/vaara-wordmark-dark.png" alt="Vaara" width="340" height="98"></a>
+  </div>
+  <p class="stance">Accountable Autonomy</p>
+
+  <h1>Explore the Vaara Resin</h1>
+  <p class="sub">
+    Resin is Vaara's chain of autonomous-action receipts. Every allow, escalate and
+    deny an agent produced, hash-chained so a removed one stops reconciling, and
+    checkable by someone who does not trust whoever ran it. Drop a receipt below to
+    verify it here in your tab, or look one up in the public log underneath.
+  </p>
+
+  <div class="drop" id="drop">
+    Drop <code>envelope.json</code> here, or paste it below
+    <textarea id="input" spellcheck="false" placeholder='{"payload":"...","payloadType":"application/vnd.in-toto+json","signatures":[{"keyid":"...","sig":"..."}]}'></textarea>
+    <div>
+      <button id="go">Verify</button>
+      <button id="demo" class="ghost">Load an example</button>
+    </div>
+  </div>
+
+  <section id="out" class="hide">
+    <h2>Result</h2>
+    <div id="verdict"></div>
+    <div id="checks" style="margin-top:.9rem"></div>
+  </section>
+
+  <section id="content" class="hide">
+    <h2>What the receipt says</h2>
+    <dl id="fields"></dl>
+  </section>
+
+  <section id="nonclaims" class="hide">
+    <h2>What this does not establish</h2>
+    <div id="nc"></div>
+  </section>
+
+  <section id="explorer">
+    <h2>The Resin</h2>
+    <p class="sub" style="margin:0 0 .8rem">
+      Resin sets around what it caught and keeps it exactly as it was, checkable
+      by whoever finds it later without trusting whoever left it there. This is the
+      public log Vaara publishes heads to. Publishing is opt-in and off by default,
+      so an absence here means nothing was published, not that nothing happened.
+    </p>
+    <div class="tiles">
+      <div class="tile"><div class="k">log</div><div class="v" id="t-log">rekor.sigstore.dev</div></div>
+      <div class="tile"><div class="k">entries</div><div class="v" id="t-size">—</div></div>
+      <div class="tile"><div class="k">root</div><div class="v" id="t-root">—</div></div>
+    </div>
+    <input id="q" spellcheck="false" placeholder="sha256 digest, or verify a receipt above first">
+    <div>
+      <button id="look">Look up</button>
+      <button id="latest" class="ghost">Latest entries</button>
+    </div>
+    <div id="rolls" style="margin-top:.9rem"></div>
+    <p class="sub" style="margin:1rem 0 0">
+      <strong>Before you opt in.</strong> A digest reveals no content, no size and no
+      identity. What it does reveal is that something was published, and when.
+      <br><br>
+      Entries carry a public key that generates on your own machine, so they are
+      pseudonymous rather than anonymous: everything published with one key can be
+      grouped by anyone, and the moment you point someone at an entry, that key is
+      publicly yours. Use a separate key per context if you do not want two trails
+      sharing one pseudonym.
+      <br><br>
+      Publication is <em>permanent and irreversible</em>. It cannot be withdrawn,
+      deleted or corrected once the log integrates it, so there is no erasure to
+      request afterwards. The log is public and enumerable, which means everyone
+      rather than only whoever runs it.
+      <br><br>
+      The default log, Sigstore Rekor, is operated in the United States by the Linux
+      Foundation. That matters much less than publishing to everyone, but some buyers
+      will ask, and Vaara can publish to a self-hosted or EU-operated log instead.
+      <br><br>
+      Publishing is also the only usage signal Vaara ever receives, and it exists
+      because you switched it on, not because anything here collects it.
+    </p>
+  </section>
+
+  <footer>
+    A passing signature proves the payload is byte-identical to what the holder
+    of that key signed. It says nothing about whether the key belongs to who you
+    think, or whether the statement is true. Pin the public key from a source
+    the signer does not control before treating a pass as meaningful.
+    <br><br>
+    The independent Python checker this mirrors ships in the repository under
+    <code>tests/vectors/</code>.
+    <br><br>
+    Vaara and Vaara Resin &copy; 2026 Henri Sirkkavaara. Licensed AGPL-3.0-or-later.
+  </footer>
+</main>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const enc = new TextEncoder();
+
+function b64ToBytes(s) {
+  const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/"));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function hex(buf) {
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// DSSE v1 pre-authentication encoding. The signature is over this, never over
+// the raw payload, so a payload cannot be lifted into a different payloadType
+// and still verify.
+function pae(payloadType, payloadBytes) {
+  const head = enc.encode(`DSSEv1 ${payloadType.length} ${payloadType} ${payloadBytes.length} `);
+  const out = new Uint8Array(head.length + payloadBytes.length);
+  out.set(head, 0);
+  out.set(payloadBytes, head.length);
+  return out;
+}
+
+// SubjectPublicKeyInfo for Ed25519 is a fixed 12-byte prefix then the 32-byte
+// key, so the raw key can be read out without a full ASN.1 parser.
+function pemToSpki(pem) {
+  const body = pem.replace(/-----[^-]+-----/g, "").replace(/\s+/g, "");
+  return b64ToBytes(body);
+}
+
+async function importEd25519(spki) {
+  return crypto.subtle.importKey("spki", spki, { name: "Ed25519" }, false, ["verify"]);
+}
+
+function row(state, what, detail) {
+  const marks = { ok: ["ok", "✓"], no: ["no", "✗"], warn: ["warn", "!"], dim: ["dim", "·"] };
+  const [cls, ch] = marks[state] || marks.dim;
+  const d = detail ? `<div class="detail">${detail}</div>` : "";
+  return `<div class="row"><div class="mark ${cls}">${ch}</div><div class="what">${what}${d}</div></div>`;
+}
+
+async function verify(envelope, publicKeyPem) {
+  const checks = [];
+  let allOk = true;
+
+  if (!envelope.payload || !envelope.payloadType || !Array.isArray(envelope.signatures)) {
+    return { checks: [row("no", "Not a DSSE envelope",
+      "Needs payload, payloadType and signatures.")], allOk: false, statement: null };
+  }
+
+  const payloadBytes = b64ToBytes(envelope.payload);
+  const preauth = pae(envelope.payloadType, payloadBytes);
+  const paeDigest = hex(await crypto.subtle.digest("SHA-256", preauth));
+  checks.push(row("ok", "Pre-authentication encoding recomputed",
+    `sha256 ${paeDigest}`));
+
+  let statement = null;
+  try {
+    statement = JSON.parse(new TextDecoder().decode(payloadBytes));
+    checks.push(row("ok", "Payload parses as the declared type", envelope.payloadType));
+  } catch (e) {
+    checks.push(row("no", "Payload is not valid JSON", String(e)));
+    allOk = false;
+  }
+
+  if (!publicKeyPem) {
+    checks.push(row("warn", "No public key supplied, signature not checked",
+      "Paste the signer's PEM to complete the check. Without it this page has "
+      + "confirmed the encoding only."));
+    allOk = false;
+  } else if (!crypto.subtle || !("Ed25519" in { Ed25519: 1 })) {
+    checks.push(row("warn", "This browser has no Ed25519 in WebCrypto",
+      "Chrome 137+, Safari 17+ or Firefox 129+ can complete the check."));
+    allOk = false;
+  } else {
+    for (const s of envelope.signatures) {
+      try {
+        const key = await importEd25519(pemToSpki(publicKeyPem));
+        const ok = await crypto.subtle.verify("Ed25519", key, b64ToBytes(s.sig), preauth);
+        checks.push(row(ok ? "ok" : "no",
+          ok ? "Signature verifies over the pre-authentication encoding"
+             : "Signature does NOT verify",
+          `keyid ${s.keyid || "(none)"}`));
+        if (!ok) allOk = false;
+      } catch (e) {
+        checks.push(row("no", "Signature could not be checked", String(e)));
+        allOk = false;
+      }
+    }
+  }
+  return { checks, allOk, statement, paeDigest };
+}
+
+function renderStatement(st) {
+  const p = (st && st.predicate) || {};
+  const pairs = [];
+  const put = (k, v) => { if (v !== undefined && v !== null && v !== "") pairs.push([k, v]); };
+  put("decision", p.decision);
+  put("agent", p.agent_id);
+  put("principal", p.principal);
+  put("decided at", p.decided_at);
+  put("predicate type", st.predicateType);
+  if (Array.isArray(p.policy_evaluations)) {
+    p.policy_evaluations.forEach(e =>
+      put(`policy ${e.policy_id || ""}`, `${e.result || "?"}${e.rule ? "  (" + e.rule + ")" : ""}`));
+  }
+  if (Array.isArray(p.tool_calls)) {
+    p.tool_calls.forEach(t =>
+      put(`tool ${t.name || "?"}`, t.args_state === "present"
+        ? `args ${t.args_hash || "(no hash)"}`
+        : `args ${t.args_state || "unknown"}`));
+  }
+  if (Array.isArray(st.subject)) {
+    st.subject.forEach(s => {
+      const dg = s.digest && (s.digest.sha256 || Object.values(s.digest)[0]);
+      put(`subject ${s.name || ""}`.trim(), dg || "(no digest)");
+    });
+  }
+  $("fields").innerHTML = pairs.map(([k, v]) =>
+    `<dt>${k}</dt><dd>${String(v)}</dd>`).join("");
+  $("content").classList.remove("hide");
+}
+
+// Stating the boundary is part of the product. A verifier that only shows
+// green invites the reader to believe things the maths never established.
+function renderNonClaims(st) {
+  const p = (st && st.predicate) || {};
+  const items = [
+    ["that the key belongs to the party you think it does",
+     "the signature binds the payload to a key, not to an organisation"],
+    ["that the statement is true",
+     "a signed claim of a deny is evidence the agent recorded a deny, not that a deny occurred"],
+    ["when this happened",
+     `decided_at is asserted by the signer${p.decided_at ? " (" + p.decided_at + ")" : ""}. `
+     + "an external timestamp authority is what makes a time independent"],
+    ["that this is the whole history",
+     "one receipt shows one decision. only a chain, and a head somebody else witnessed, "
+     + "shows nothing was removed"],
+  ];
+  $("nc").innerHTML = items.map(([a, b]) => row("dim", a, b)).join("");
+  $("nonclaims").classList.remove("hide");
+}
+
+async function run() {
+  const raw = $("input").value.trim();
+  if (!raw) return;
+  let envelope, pem = null;
+
+  // Accept either a bare envelope, or an object carrying both so a single
+  // paste can complete the whole check.
+  try {
+    const parsed = JSON.parse(raw);
+    envelope = parsed.envelope || parsed;
+    pem = parsed.publicKey || parsed.public_key || null;
+  } catch (e) {
+    $("out").classList.remove("hide");
+    $("verdict").innerHTML = `<span class="verdict no">NOT JSON</span>`;
+    $("checks").innerHTML = row("no", "Input is not valid JSON", String(e));
+    return;
+  }
+  if (!pem) {
+    const m = raw.match(/-----BEGIN PUBLIC KEY-----[\s\S]+?-----END PUBLIC KEY-----/);
+    if (m) pem = m[0];
+  }
+
+  const { checks, allOk, statement } = await verify(envelope, pem);
+  $("out").classList.remove("hide");
+  $("verdict").innerHTML = allOk
+    ? `<span class="verdict ok">SIGNATURE VERIFIES</span>`
+    : `<span class="verdict warn">INCOMPLETE</span>`;
+  $("checks").innerHTML = checks.join("");
+  if (statement) { renderStatement(statement); renderNonClaims(statement); }
+}
+
+(function(){
+  var root = document.documentElement;
+  var btns = document.querySelectorAll('.theme-toggle [data-set-theme]');
+  function apply(theme){
+    if (theme === "dark") root.setAttribute("data-theme","dark");
+    else root.removeAttribute("data-theme");
+    btns.forEach(function(b){
+      b.setAttribute("aria-pressed", String(b.getAttribute("data-set-theme") === theme));
+    });
+    try { localStorage.setItem("vaara-theme", theme); } catch(e) {}
+  }
+  // No stored choice: leave data-theme off so the OS decides, and show which
+  // side the OS landed on so the toggle is not lying about the current state.
+  function reflectAuto(){
+    root.removeAttribute("data-theme");
+    var dark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    btns.forEach(function(b){
+      b.setAttribute("aria-pressed", String(b.getAttribute("data-set-theme") === (dark ? "dark" : "light")));
+    });
+  }
+  btns.forEach(function(b){
+    b.addEventListener("click", function(){ apply(b.getAttribute("data-set-theme")); });
+  });
+  var saved = null;
+  try { saved = localStorage.getItem("vaara-theme"); } catch(e) {}
+  if (saved === "dark" || saved === "light") apply(saved); else reflectAuto();
+})();
+
+$("go").addEventListener("click", run);
+
+// ---- explorer ----------------------------------------------------------
+// Queries the public log straight from this tab. Rekor serves
+// access-control-allow-origin: *, so no Vaara server sits in the middle and
+// there is nothing here that could log who looked something up.
+const REKOR = "https://rekor.sigstore.dev";
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+async function rekorSearchByHash(hexDigest) {
+  const res = await fetch(`${REKOR}/api/v1/index/retrieve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ hash: `sha256:${hexDigest}` }),
+  });
+  if (!res.ok) throw new Error(`index/retrieve returned ${res.status}`);
+  return res.json();
+}
+
+async function rekorEntry(uuid) {
+  const res = await fetch(`${REKOR}/api/v1/log/entries/${uuid}`);
+  if (!res.ok) throw new Error(`entry fetch returned ${res.status}`);
+  const body = await res.json();
+  const e = body[uuid];
+  let digest = null;
+  try {
+    digest = JSON.parse(atob(e.body)).spec.data.hash.value;
+  } catch (_) { /* not a hashedrekord; leave null */ }
+  return { uuid, digest, logIndex: e.logIndex, integratedTime: e.integratedTime };
+}
+
+function renderEntries(list, total) {
+  if (!list.length) {
+    $("rolls").innerHTML = row("dim", "Not in the log",
+      "Either it was never published, or it was published under a different digest. "
+      + "Absence is not evidence of anything.");
+    return;
+  }
+  // Never show a partial set as if it were the whole set. A digest can carry
+  // thousands of entries, and quietly rendering ten reads as "there are ten".
+  const note = total > list.length
+    ? row("warn", `Showing ${list.length} of ${total} entries`,
+        "This digest appears many times in the log. The rest are not listed here.")
+    : "";
+  $("rolls").innerHTML = note + list.map(e => `
+    <div class="entry">
+      <div>${esc(e.digest || "(not a hashedrekord)")}</div>
+      <div class="detail">
+        log index ${esc(e.logIndex)} ·
+        integrated ${new Date(e.integratedTime * 1000).toISOString()} ·
+        <a href="${REKOR}/api/v1/log/entries/${esc(e.uuid)}" rel="noopener">entry</a>
+      </div>
+    </div>`).join("");
+}
+
+async function lookup(hexDigest) {
+  const clean = (hexDigest || "").trim().replace(/^sha256:/i, "").toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(clean)) {
+    $("rolls").innerHTML = row("no", "That is not a sha256 digest",
+      "Expecting 64 hex characters.");
+    return;
+  }
+  $("rolls").innerHTML = row("dim", "Asking the public log…");
+  try {
+    const uuids = (await rekorSearchByHash(clean)) || [];
+    const entries = [];
+    for (const u of uuids.slice(0, 10)) entries.push(await rekorEntry(u));
+    renderEntries(entries, uuids.length);
+  } catch (e) {
+    $("rolls").innerHTML = row("warn", "Could not reach the public log", esc(e.message)
+      + ". Signature verification above is unaffected: it never needs the network.");
+  }
+}
+
+$("look").addEventListener("click", () => lookup($("q").value));
+$("q").addEventListener("keydown", ev => { if (ev.key === "Enter") lookup($("q").value); });
+
+async function logInfo() {
+  const res = await fetch(`${REKOR}/api/v1/log`);
+  if (!res.ok) throw new Error(`log returned ${res.status}`);
+  return res.json();
+}
+
+// The tiles are the shape of the log before any detail: how big it is now and
+// what root that size hashes to. Both come from the log, not from us.
+async function fillTiles() {
+  try {
+    const info = await logInfo();
+    $("t-size").textContent = Number(info.treeSize).toLocaleString("en");
+    $("t-root").textContent = String(info.rootHash).slice(0, 16) + "…";
+  } catch (e) {
+    $("t-size").textContent = "unreachable";
+    $("t-root").textContent = "—";
+  }
+}
+
+async function entryAtIndex(i) {
+  const res = await fetch(`${REKOR}/api/v1/log/entries?logIndex=${i}`);
+  if (!res.ok) throw new Error(`index ${i} returned ${res.status}`);
+  const body = await res.json();
+  const uuid = Object.keys(body)[0];
+  const e = body[uuid];
+  let digest = null, kind = null;
+  try {
+    const b = JSON.parse(atob(e.body));
+    kind = b.kind;
+    digest = b.spec && b.spec.data && b.spec.data.hash && b.spec.data.hash.value;
+  } catch (_) { /* leave null */ }
+  return { uuid, digest, kind, logIndex: e.logIndex, integratedTime: e.integratedTime };
+}
+
+// Latest N rather than an endless list. An explorer's job is to show that the
+// thing is alive and moving, not to page through two billion rows.
+const LATEST_N = 6;
+
+$("latest").addEventListener("click", async () => {
+  $("rolls").innerHTML = row("dim", "Asking the public log…");
+  try {
+    const info = await logInfo();
+    const top = Number(info.treeSize) - 1;
+    const out = [];
+    for (let i = top; i > top - LATEST_N && i >= 0; i--) {
+      try { out.push(await entryAtIndex(i)); } catch (_) { /* skip a gap */ }
+    }
+    renderEntries(out, out.length);
+  } catch (e) {
+    $("rolls").innerHTML = row("warn", "Could not reach the public log", esc(e.message));
+  }
+});
+
+fillTiles();
+
+const drop = $("drop");
+["dragover", "dragenter"].forEach(e =>
+  drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.add("over"); }));
+["dragleave", "drop"].forEach(e =>
+  drop.addEventListener(e, () => drop.classList.remove("over")));
+drop.addEventListener("drop", async ev => {
+  ev.preventDefault();
+  const f = ev.dataTransfer.files[0];
+  if (f) { $("input").value = await f.text(); run(); }
+});
+
+$("demo").addEventListener("click", () => {
+  $("input").value = JSON.stringify(DEMO, null, 1);
+  run();
+});
+
+const DEMO = {"envelope": {"payload": "eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJwcmVkaWNhdGUiOnsiYWdlbnRfaWQiOiJhZ2VudDphY21lL2NoZWNrb3V0LWJvdC8xIiwiZGVjaWRlZF9hdCI6IjIwMjYtMDYtMjNUMTI6MDA6MDVaIiwiZGVjaXNpb24iOiJkZW55IiwicG9saWN5X2V2YWx1YXRpb25zIjpbeyJwb2xpY3lfaWQiOiJwb2xpY3k6c3BlbmQtY2FwL2V1ci01MDAiLCJyZXN1bHQiOiJkZW55IiwicnVsZSI6ImFtb3VudC5sZS41MDAwMCJ9XSwicHJpbmNpcGFsIjoidGVuYW50OmFjbWUtZXUiLCJ0b29sX2NhbGxzIjpbeyJhcmdzX2Nhbm9uaWNhbGl6YXRpb24iOiJKQ1MiLCJhcmdzX2hhc2giOiJzaGEyNTY6OTFjMGMyMTVjY2UzZjVlN2M0OWQyZGRmMGE1NDBlYjIyNTU1NTRlYTNlN2E4ODUwNjdkMzkxNjhiM2FjODU2NCIsImFyZ3Nfc3RhdGUiOiJwcmVzZW50IiwibmFtZSI6InBheW1lbnRzLnRyYW5zZmVyIn0seyJhcmdzX3N0YXRlIjoiYXJnc19yZWRhY3RlZCIsIm5hbWUiOiJjdXN0b21lci5sb29rdXAifV19LCJwcmVkaWNhdGVUeXBlIjoiaHR0cHM6Ly9pbi10b3RvLmlvL2F0dGVzdGF0aW9uL2FnZW50LWRlY2lzaW9uL3YwLjEiLCJzdWJqZWN0IjpbeyJkaWdlc3QiOnsic2hhMjU2IjoiYTI3MmUzMGM4NzY4NzI4NWQ3YThkY2Q2YzVlMjMyNTRjZDVkYjJjNjgyMDI1NGRmNTQyYzI5MThlMDAxMTdiZCJ9LCJuYW1lIjoidG9vbDpwYXltZW50cy50cmFuc2ZlciJ9XX0=", "payloadType": "application/vnd.in-toto+json", "signatures": [{"keyid": "vaara-agent-decision-conformance-ed25519-k1", "sig": "mW5uAfYeWoUkc7Co6ehJ21y9vnoajFvmCGj1SkXJgZOgLGH6tfquZcoZL5Z+yMhip3zFWSA5s6Rd+oqL9me2AQ=="}]}, "publicKey": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAvHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaU=\n-----END PUBLIC KEY-----"};
+</script>
+</body>
+</html>

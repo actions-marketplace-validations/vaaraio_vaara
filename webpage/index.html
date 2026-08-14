@@ -81,6 +81,25 @@
     --tri-bright: #93B8A3;
     --warn: #D98B8B;
   }
+  /* Default follows the OS. An explicit choice from the toggle sets
+     data-theme and wins over it, which is why this is scoped to
+     :not([data-theme]) rather than applied unconditionally. */
+  @media (prefers-color-scheme: dark) {
+    html:not([data-theme]) {
+        color-scheme: dark;
+        --bg: #0F1417;
+        --panel: #1A2226;
+        --panel-2: #151D20;
+        --deep: #0B1012;
+        --line: rgba(123,156,138,.16);
+        --ink: #DEE4E1;
+        --muted: #8B9792;
+        --faint: #5E6A66;
+        --tri: #78A08A;
+        --tri-bright: #93B8A3;
+        --warn: #D98B8B;
+    }
+  }
   * { box-sizing: border-box; }
   html, body {
     margin: 0; padding: 0;
@@ -278,6 +297,7 @@ conformance: <span class="ok">CONFORMS</span>
 
 <span class="dim">no signing key, no access to the system that produced it</span></pre>
 </div>
+<p style="text-align:center;margin:0 0 40px"><a class="cta" href="/verify.html">Explore the Resin</a></p>
 <p class="stamp">What's shipped</p>
 <ul>
   <li>Check any record yourself: <code>vaara verify-record</code> tests any JSON against the published vaara.receipt/v1 format, including a record Vaara never produced, with no signing key and no access to the system that made it. <code>vaara verify-bundle</code> runs the full evidence set and prints a single pass or fail, fail-closed on authenticity.</li>
@@ -327,6 +347,7 @@ conformance: <span class="ok">CONFORMS</span>
 
 <p class="stamp">Where</p>
 <div class="links">
+  <a href="/verify.html"><span class="label">resin</span><span class="target">explore and verify, in your browser</span></a>
   <a href="https://github.com/vaaraio/vaara"><span class="label">code</span><span class="target">github.com/vaaraio/vaara</span></a>
   <a href="https://pypi.org/project/vaara/"><span class="label">pypi</span><span class="target">pypi.org/project/vaara</span></a>
   <a href="https://www.npmjs.com/package/@vaara/client"><span class="label">npm</span><span class="target">@vaara/client</span></a>
@@ -377,8 +398,17 @@ conformance: <span class="ok">CONFORMS</span>
     btns.forEach(function(b){ b.setAttribute("aria-pressed", String(b.getAttribute("data-set-theme") === theme)); });
     try { localStorage.setItem("vaara-theme", theme); } catch(e) {}
   }
+  function reflectAuto(){
+    root.removeAttribute("data-theme");
+    var dark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    btns.forEach(function(b){
+      b.setAttribute("aria-pressed", String(b.getAttribute("data-set-theme") === (dark ? "dark" : "light")));
+    });
+  }
   btns.forEach(function(b){ b.addEventListener("click", function(){ apply(b.getAttribute("data-set-theme")); }); });
-  apply(root.getAttribute("data-theme") === "dark" ? "dark" : "light");
+  var saved = null;
+  try { saved = localStorage.getItem("vaara-theme"); } catch(e) {}
+  if (saved === "dark" || saved === "light") apply(saved); else reflectAuto();
 })();
 </script>
 </body>

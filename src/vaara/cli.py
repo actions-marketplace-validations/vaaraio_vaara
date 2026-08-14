@@ -724,6 +724,127 @@ def _parse_period(spec: Optional[str]) -> Optional[tuple]:
     return (_epoch(start_s, end_of_day=False), _epoch(end_s, end_of_day=True))
 
 
+# Logs whose operator sits inside the EU, so publishing is not a third-country
+# transfer for an EU deployer. Sigstore's public Rekor is US-operated (Linux
+# Foundation), which is fine for many users and is a disclosure duty for the
+# rest. A self-hosted or EU-operated log keeps the whole chain in-jurisdiction.
+_EU_OPERATED_LOGS: tuple[str, ...] = ("localhost", "127.0.0.1", ".eu/", ".eu:")
+
+
+def _cmd_dashboard(args: argparse.Namespace) -> int:
+    """Serve the local read-only dashboard."""
+    from vaara.dashboard import free_port, serve
+
+    port = args.port if args.port else free_port()
+    return serve(
+        db=args.db,
+        trail=args.trail,
+        host=args.host,
+        port=port,
+        open_browser=not args.no_browser,
+    )
+
+
+def _cmd_trail_publish_head(args: argparse.Namespace) -> int:
+    """Publish the trail's head digest to a public transparency log.
+
+    Opt-in and off by default. What leaves the machine is one digest and a
+    signature over it: no record, no payload, no count of entries. A log the
+    operator runs proves the chain is internally consistent; a head in a log
+    somebody else runs is what stops the operator quietly keeping two
+    histories.
+    """
+    try:
+        from vaara.attestation.rekor_log import RekorError, publish_head
+    except ImportError:
+        print(_INSTALL_HINT, file=sys.stderr)
+        return 2
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    trail, err = _load_trail_source(args)
+    if err is not None:
+        return err
+    records = trail._records
+    if not records:
+        print("trail is empty, nothing to publish", file=sys.stderr)
+        return 2
+    head = records[-1].record_hash
+    if not head:
+        print("head record carries no record_hash", file=sys.stderr)
+        return 2
+
+    key_path = Path(args.key).expanduser()
+    if key_path.exists():
+        signer = serialization.load_pem_private_key(key_path.read_bytes(), password=None)
+    else:
+        # One long-lived key whose public half travels with every entry, so a
+        # verifier can tie a signer's published heads together without any
+        # identity provider being involved.
+        signer = ec.generate_private_key(ec.SECP256R1())
+        key_path.parent.mkdir(parents=True, exist_ok=True)
+        key_path.write_bytes(signer.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        ))
+        os.chmod(key_path, 0o600)
+        print(f"generated a publishing key at {key_path}")
+
+    # Publishing cannot be undone, so the facts belong in front of the act
+    # rather than in documentation. GDPR Art 13 transparency, Art 17 erasure
+    # (impossible here by design), and Art 44 transfer if the log is outside
+    # the EU. Not legal advice; these are the facts a person needs to decide.
+    eu_operated = any(h in args.log for h in _EU_OPERATED_LOGS)
+    print("Publishing to a public transparency log. Before it happens:")
+    print(f"  what goes    the digest {head[:16]}… and a signature over it")
+    print("  what stays   every record, payload, tool name, identity, and the")
+    print("               number of entries in this trail")
+    print(f"  where        {args.log}")
+    print("  who reads it everyone, forever. The whole log is public and")
+    print("               enumerable, not just visible to whoever runs it.")
+    print("  erasure      permanent and irreversible. It cannot be withdrawn,")
+    print("               deleted or corrected once integrated.")
+    if not eu_operated:
+        print("  operator     outside the EU (Sigstore Rekor is run by the Linux")
+        print("               Foundation, US). Minor next to publishing it to")
+        print("               everyone, but some buyers will ask. --log takes a")
+        print("               self-hosted or EU-operated endpoint.")
+    print("  linkability  every head published with this key is groupable by")
+    print("               anyone. Use a separate --key per context to keep")
+    print("               different trails from sharing one pseudonym.")
+    print()
+
+    if args.dry_run:
+        print("dry run, nothing published")
+        return 0
+
+    if not args.yes and sys.stdin.isatty():
+        try:
+            if input("Publish? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("nothing published")
+                return 0
+        except (EOFError, KeyboardInterrupt):
+            print("\nnothing published")
+            return 0
+
+    try:
+        pub = publish_head(head, signer, log_url=args.log)
+    except RekorError as exc:
+        print(f"publish failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"published head {head}")
+    print(f"  log         {pub.log_url}")
+    print(f"  log index   {pub.log_index}")
+    print(f"  integrated  {pub.integrated_at.isoformat()}")
+    print(f"  entry       {pub.to_dict()['entry_url']}")
+    print()
+    print("  public: one sha256 and a signature over it, permanently.")
+    print("  not public: any record, payload, identity or entry count.")
+    return 0
+
+
 def _cmd_trail_verify_anchor(args: argparse.Namespace) -> int:
     """Verify the external time anchor folded into an Article 12 package."""
     import zipfile
@@ -4700,6 +4821,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pk.set_defaults(func=_cmd_keygen)
 
+    pdash = sub.add_parser(
+        "dashboard",
+        help="Serve a local read-only dashboard (any OS, no extra dependencies)",
+    )
+    _add_trail_source_args(pdash)
+    pdash.add_argument("--host", default="127.0.0.1",
+                       help="Bind address. Defaults to loopback only.")
+    pdash.add_argument("--port", type=int, default=0,
+                       help="Port. Defaults to 7517, or a free one if taken.")
+    pdash.add_argument("--no-browser", action="store_true",
+                       help="Do not open a browser window")
+    pdash.set_defaults(func=_cmd_dashboard)
+
     pt = sub.add_parser("trail", help="Audit-trail commands")
     tsub = pt.add_subparsers(dest="trail_cmd", metavar="COMMAND")
     pt.set_defaults(func=_help_dispatch(pt))
@@ -4741,6 +4875,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to Ed25519 public key (PEM). If omitted, uses signer_pubkey.pem from inside the zip.",
     )
     pv.set_defaults(func=_cmd_trail_verify)
+
+    pph = tsub.add_parser(
+        "publish-head",
+        help="Publish the trail head digest to a public transparency log (opt-in)",
+    )
+    _add_trail_source_args(pph)
+    pph.add_argument(
+        "--key",
+        default=str(Path.home() / ".vaara" / "resin-publishing-key.pem"),
+        help="Ed25519/P-256 publishing key (PEM). Generated on first use.",
+    )
+    pph.add_argument(
+        "--log",
+        default="https://rekor.sigstore.dev",
+        help="Transparency log base URL (default: public Sigstore Rekor)",
+    )
+    pph.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the head and the disclosure without publishing anything",
+    )
+    pph.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the confirmation prompt (for non-interactive use). The "
+             "disclosure is still printed, because it cannot be undone.",
+    )
+    pph.set_defaults(func=_cmd_trail_publish_head)
 
     pva = tsub.add_parser(
         "verify-anchor",
