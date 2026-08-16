@@ -1,0 +1,142 @@
+name: Add my result to Vaara Conformance Results
+description: You ran the conformance checkers yourself and want the result listed at vaara.io/conformance.html
+title: "VCR: reproduction by "
+labels: ["conformance-row"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This form is for parties other than the maintainer who ran the
+        independent checkers and reported the result somewhere public.
+
+        Run them first. No Vaara install is needed:
+
+        ```
+        git clone https://github.com/vaaraio/vaara
+        cd vaara
+        pip install cryptography rfc8785
+        python scripts/conformance_runner.py
+        ```
+  - type: input
+    id: party
+    attributes:
+      label: Name to publish
+      description: A personal name, a handle, or an organisation. Whatever you want on the page.
+      placeholder: "Your name or handle"
+    validations:
+      required: true
+  - type: input
+    id: affiliation
+    attributes:
+      label: Affiliation
+      description: Optional. Listed as description, never as endorsement of Vaara.
+      placeholder: "Project or company, or leave blank"
+    validations:
+      required: false
+  - type: input
+    id: suites
+    attributes:
+      label: Which suites you ran
+      placeholder: "transparency_consistency_v0, evidence_bundle_v0"
+    validations:
+      required: true
+  - type: input
+    id: at-commit
+    attributes:
+      label: Commit you ran at
+      description: Full SHA, so anyone can rerun exactly what you ran.
+      placeholder: "12ff4666e738eaccd55c283483dc2e642af65e6b"
+    validations:
+      required: true
+  - type: input
+    id: result
+    attributes:
+      label: Result
+      description: The counts, including which negatives were exercised.
+      placeholder: "9 of 9 and 8 of 8, including the tampered-proof and forked-root negatives"
+    validations:
+      required: true
+  - type: textarea
+    id: scoping
+    attributes:
+      label: Your own scoping
+      description: >
+        What your run establishes and what it does not. This is published word
+        for word and is never widened. If you leave it blank the row says only
+        that you ran the checkers and got the counts above.
+      placeholder: >
+        Validates the pinned independent vector lanes. Does not establish
+        hosted-service interoperability or official SCITT conformance.
+    validations:
+      required: false
+  - type: input
+    id: record
+    attributes:
+      label: Link to where you reported it
+      description: >
+        A mailing list archive, an issue, a post, a repository. It has to be
+        public and linkable. Private mail and screenshots do not qualify.
+      placeholder: "https://mailarchive.ietf.org/arch/msg/..."
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        ## What listing you means, and it is permanent
+
+        **Read this part before you tick anything.**
+
+        The page at vaara.io/conformance.html is public and indexed. A row
+        carries the name you gave above, your affiliation if you gave one, the
+        suites, the commit, the result, your scoping quoted as you wrote it,
+        and a link to your public record.
+
+        **A row is permanent. It does not come down, and asking will not take
+        it down.** This is a record of something that happened, not a list of
+        current members. Your run happened on a date at a commit, and that does
+        not stop being true later, so the entry does not stop existing later.
+
+        The maintainer cannot remove it either. Rows are chained, each one
+        carrying the digest of the row before it, so deleting or reordering an
+        entry breaks every digest after it and anybody can see the break with
+        `python scripts/vcr_chain.py`. That constraint is the reason the table
+        is worth reading: one its owner could quietly edit would just be the
+        owner's opinion.
+
+        Nothing is edited after the fact either. A correction is a new row that
+        refers to the earlier one.
+
+        So decide now rather than later. If you would rather not have your name
+        on a permanent public record, close this form and run the checkers
+        anyway. The vectors are free either way and nothing is lost by staying
+        off the table.
+
+        A row states what your checkers returned. It is not a certification, it
+        does not say Vaara is compliant with anything, and it does not say you
+        endorse Vaara.
+
+        Once your row is up you get a badge for your README, your site, or
+        wherever you like. It is yours alone, and it carries your row number,
+        the date and the commit you ran at. Row numbers are permanent and are
+        never reissued. The badge will be posted here when the row goes up.
+
+        This is answered by a bot, usually within a minute. If something in the
+        form does not check out it says which field and why, and you can edit
+        the issue to try again.
+  - type: checkboxes
+    id: consent
+    attributes:
+      label: Consent
+      options:
+        - label: >
+            I read the section above and I agree to be listed on the public
+            Vaara Conformance Results page on these terms.
+          required: true
+        - label: >
+            I understand the row is permanent, that asking will not remove it,
+            and that the maintainer cannot remove it either.
+          required: true
+        - label: >
+            The link I gave is my own public record of this run, and the result
+            and scoping above are mine.
+          required: true
