@@ -37,9 +37,21 @@ concurrency:
 
 jobs:
   desk:
+    # The label alone was the guard until 2026-08-19, and it silently failed on
+    # the first real application. The issue form declares
+    # `labels: ["conformance-row"]`, but that label did not exist in the
+    # repository, so the issue arrived with no labels, this job was skipped, and
+    # a submitter who did nothing wrong got no answer at all. A guard whose
+    # failure mode is silence is the wrong guard for a desk that is supposed to
+    # answer within a minute. The title prefix is set by the form and is not
+    # something a stranger has to know about, so it catches the same issues
+    # without depending on repository state that can drift. Everything a run
+    # produces is still checked by scripts/vcr_row.py, so a wrong trigger costs
+    # one comment explaining why, never a bad row.
     if: >
       github.event_name == 'workflow_dispatch' ||
-      contains(github.event.issue.labels.*.name, 'conformance-row')
+      contains(github.event.issue.labels.*.name, 'conformance-row') ||
+      startsWith(github.event.issue.title, 'VCR:')
     runs-on: ubuntu-latest
     steps:
       - name: Check out main for the scripts, the suites and the history
@@ -162,8 +174,7 @@ jobs:
           gh issue comment "${{ steps.issue.outputs.number }}" --body "$(cat <<EOF
           You are row #${ID} at https://vaara.io/conformance.html
 
-          Your badge, which carries your row number, the date and the commit
-          you ran at:
+          Your badge, which carries the date and the commit you ran at:
 
           \`\`\`
           [![Vaara Conformance Results row ${ID}](https://vaara.io/badge/${SLUG}.svg)](https://vaara.io/conformance.html)
@@ -176,6 +187,11 @@ jobs:
           https://vaara.io/badge/${SLUG}.json as JCS-canonical bytes, so
           \`curl -s <that url> | sha256sum\` checks either artifact against it
           without trusting us or installing anything.
+
+          Your row number is in the badge metadata and on the page, not on the
+          badge face. Rows are chained so the order exists, but a row is a
+          record of a run and not a placing, and row 1 and row 250 say the same
+          thing.
 
           The number is permanent and is never reissued, and so is the row.
           This records a run that happened, so it is not taken down later and
