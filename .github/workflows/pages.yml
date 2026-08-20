@@ -28,7 +28,7 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       # Conformance rows arrive by issue form and land on the unprotected `vcr`
       # branch, so nobody needs write access, a fork or a pull request to get
       # onto the results table. Overlay them here at publish time. If the
