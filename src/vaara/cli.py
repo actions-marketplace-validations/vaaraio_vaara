@@ -2672,6 +2672,10 @@ def _cmd_check(args: argparse.Namespace) -> int:
     trail = SQLiteAuditBackend(db).load_trail()
     pipeline = InterceptionPipeline(registry=registry, trail=trail)
 
+    # A check nobody followed with `vaara outcome` is closed as orphaned, on
+    # the trail, once it is a day old. Nothing is deleted silently.
+    pipeline.close_orphaned_outcomes()
+
     params = {}
     for p in args.param or []:
         if "=" in p:
@@ -4562,6 +4566,16 @@ def _cmd_conformance_check(args: argparse.Namespace) -> int:
     conformance logic of its own, so the two paths never drift from the
     commands they wrap. Keyless: runs in the base install.
     """
+    if args.all:
+        if args.path is not None:
+            print("vaara conformance check: --all runs every published suite; it "
+                  "takes no path", file=sys.stderr)
+            raise SystemExit(2)
+        return _conformance_check_all(args)
+    if args.path is None:
+        print("vaara conformance check: a path is required (a record file or a "
+              "directory of records), or --all", file=sys.stderr)
+        raise SystemExit(2)
     path = Path(args.path).expanduser()
     if path.is_file():
         args.record = str(path)
@@ -4571,6 +4585,32 @@ def _cmd_conformance_check(args: argparse.Namespace) -> int:
         return _cmd_verify_records(args)
     print(f"vaara conformance check: no such path: {path}", file=sys.stderr)
     return 2
+
+
+def _conformance_check_all(args: argparse.Namespace) -> int:
+    """Every published suite, through the neutral runner, verdict per suite."""
+    from vaara import _conformance_all as suites
+
+    def log(message: str) -> None:
+        print(f"vaara conformance check --all: {message}", file=sys.stderr)
+
+    try:
+        vectors, how = suites.locate_vectors(
+            Path(args.vectors) if args.vectors else None, log=log,
+        )
+        runner = suites.locate_runner(vectors, log=log)
+    except suites.NoSuitesError as exc:
+        print(f"vaara conformance check --all: {exc}", file=sys.stderr)
+        return 2
+    if not args.json:
+        source = {
+            "given": f"suites: {vectors}",
+            "environment": f"suites: {vectors} (from ${suites.TREE_ENV})",
+            "checkout": f"suites: {vectors} (this checkout)",
+            "release": f"suites: {vectors} (release archive v{__version__})",
+        }[how]
+        log(source)
+    return suites.run_all(vectors, runner, as_json=args.json, suites=args.suite)
 
 
 def _cmd_verify_bundles(args: argparse.Namespace) -> int:
@@ -5050,10 +5090,16 @@ def _cmd_policy_reload(args: argparse.Namespace) -> int:
             payload["format"] = fmt
 
     url = args.server.rstrip("/") + "/v1/policy/reload"
+    headers = {"Content-Type": "application/json"}
+    # The server refuses every endpoint but health without its key; the
+    # reload is the operator's own call and carries the same key.
+    api_key = getattr(args, "api_key", None) or os.environ.get("VAARA_SERVER_API_KEY") or None
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(
         url,
         data=_json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
@@ -7390,11 +7436,32 @@ def build_parser() -> argparse.ArgumentParser:
         "check",
         help="Conformance-check a SEP-2828 record (a JSON file) or a record set "
              "(a directory of them). File or directory is auto-detected; the "
-             "verdict matches verify-record / verify-records. Keyless.",
+             "verdict matches verify-record / verify-records. With --all, run "
+             "every published conformance suite instead and print a verdict "
+             "per suite. Keyless.",
     )
     pcc.add_argument(
-        "path",
-        help="A record JSON file, or a directory of record JSON files",
+        "path", nargs="?", default=None,
+        help="A record JSON file, or a directory of record JSON files "
+             "(required unless --all)",
+    )
+    pcc.add_argument(
+        "--all", action="store_true",
+        help="Run every published conformance suite (tests/vectors/*/"
+             "_check_independent.py) through scripts/conformance_runner.py and "
+             "print PASS, FAIL or SKIP per suite. The suites come from "
+             "--vectors, from $VAARA_CONFORMANCE_TREE, from the checkout this "
+             "install runs from, or from the release archive of this version, "
+             "fetched once from GitHub and kept in the cache directory.",
+    )
+    pcc.add_argument(
+        "--vectors", default=None, metavar="DIR",
+        help="With --all: the directory of suites to run, or a tree holding "
+             "tests/vectors (default: find them as described under --all)",
+    )
+    pcc.add_argument(
+        "--suite", action="append", default=None, metavar="NAME",
+        help="With --all: run only this suite (repeatable)",
     )
     pcc.add_argument(
         "--attestation", default=None,
@@ -7673,6 +7740,13 @@ def build_parser() -> argparse.ArgumentParser:
     preload.add_argument(
         "--timeout", type=float, default=10.0,
         help="HTTP request timeout in seconds (default 10)",
+    )
+    preload.add_argument(
+        "--api-key", default=None,
+        help=(
+            "The server's API key, sent as a bearer token. Defaults to "
+            "VAARA_SERVER_API_KEY, the variable vaara serve reads."
+        ),
     )
     preload.set_defaults(func=_cmd_policy_reload)
 

@@ -65,6 +65,23 @@ class EventType(str, Enum):
     DISCLOSURE_RECORDED = "disclosure_recorded"  # EU AI Act Art 50 transparency disclosure
     ACCESS_RECORDED = "access_recorded"     # Something was opened, and by whom
     AGENT_SEEN = "agent_seen"               # vaara scan --watch saw an agent start
+    WITNESS_CONFIGURED = "witness_configured"  # Heads reach a log or a TSA at a stated cadence
+
+
+# Written only by the trail's own record_* methods, never accepted through an
+# append API. Verification reads them back: a REPAIR_GAP naming missing seqs
+# turns a broken chain into declared gaps, an ANCHOR_GAP marks an unwitnessed
+# stretch, KEY_LIFECYCLE is custodian evidence for SOC 2 CC6.2 and CC8.1.
+SYSTEM_EVENT_TYPES = frozenset({
+    EventType.ANCHOR_GAP,
+    EventType.REPAIR_GAP,
+    EventType.KEY_LIFECYCLE,
+    EventType.WITNESS_CONFIGURED,
+})
+
+# Every other type: what POST /v1/audit/events, the OpenAPI enum and the
+# TypeScript EventType accept. tests/test_event_type_vocabulary.py holds them.
+CLIENT_EVENT_TYPES = tuple(e for e in EventType if e not in SYSTEM_EVENT_TYPES)
 
 
 # ── Regulatory article mappings ───────────────────────────────────────────
@@ -363,6 +380,11 @@ TRANSPARENCY_DEFAULTS: dict[EventType, dict[str, str]] = {
         "system_operation": "store_repair",
         "data_usage": "surviving_record_seqs",
         "decision_making": "n/a",
+    },
+    EventType.WITNESS_CONFIGURED: {
+        "system_operation": "witness_configuration",
+        "data_usage": "cadence+target+key_fingerprint",
+        "decision_making": "operator_configuration",
     },
     EventType.KEY_LIFECYCLE: {
         "system_operation": "key_custodian_management",
@@ -1474,6 +1496,60 @@ class AuditTrail:
             regulatory_articles=[],
             tenant_id=self._tenant_for(action_id),
         ))
+
+    def record_witness_configured(
+        self,
+        kind: str,
+        every_records: int,
+        target: str,
+        *,
+        key_fingerprint: str = "",
+        source: str = "",
+    ) -> Optional[str]:
+        """State on the trail that heads reach an outside witness at a cadence.
+
+        ``kind`` is ``publish`` (a public transparency log) or ``anchor`` (an
+        RFC 3161 authority). The record is what makes the bound on the
+        unpublished window readable: a verifier sees how many records can
+        pass between two heads a third party holds. Written once per
+        configuration, not once per process: when the newest record of this
+        kind already states the same cadence, target and key, nothing is
+        appended and ``None`` is returned.
+        """
+        if kind not in ("publish", "anchor"):
+            raise ValueError(f"record_witness_configured: kind must be publish or anchor, got {kind!r}")
+        if int(every_records) < 1:
+            raise ValueError("record_witness_configured: every_records must be a positive integer")
+        data = {
+            "kind": kind,
+            "every_records": int(every_records),
+            "target": self._cap_record_str(target, 512),
+            "key_fingerprint": self._cap_record_str(key_fingerprint, 128),
+            "source": self._cap_record_str(source, 128),
+        }
+        with self._lock:
+            latest = next(
+                (r for r in reversed(self._records)
+                 if r.event_type == EventType.WITNESS_CONFIGURED
+                 and (r.data or {}).get("kind") == kind),
+                None,
+            )
+        if latest is not None and latest.data == data:
+            return None
+        record_id = str(uuid.uuid4())
+        action_id = str(uuid.uuid4())
+        self._append(AuditRecord(
+            record_id=record_id,
+            action_id=action_id,
+            event_type=EventType.WITNESS_CONFIGURED,
+            timestamp=time.time(),
+            agent_id="vaara",
+            tool_name=f"witness:{kind}",
+            data=data,
+            regulatory_articles=[],
+            tenant_id=self._tenant_for(action_id),
+        ))
+        return record_id
 
     def record_escalation(
         self,

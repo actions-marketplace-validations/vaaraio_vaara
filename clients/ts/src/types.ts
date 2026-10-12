@@ -20,6 +20,11 @@ export type Reversibility =
 
 export type BlastRadius = "local" | "account" | "organization" | "global";
 
+/**
+ * Event types a client may append. The trail's own markers (`anchor_gap`,
+ * `repair_gap`, `key_lifecycle`, `witness_configured`) are refused on append
+ * and can appear in `AuditChainEvent.event_type` when a chain is read back.
+ */
 export type EventType =
   | "action_requested"
   | "risk_scored"
@@ -29,7 +34,10 @@ export type EventType =
   | "escalation_sent"
   | "escalation_resolved"
   | "outcome_recorded"
-  | "policy_override";
+  | "policy_override"
+  | "disclosure_recorded"
+  | "access_recorded"
+  | "agent_seen";
 
 export interface ScoreRequest {
   tool_name: string;
@@ -128,6 +136,8 @@ export interface PolicyReloadRequest {
   path?: string;
   body?: Record<string, unknown>;
   format?: "json" | "yaml";
+  /** Tenant whose policy to reload on a server started with --policy-dir; empty or absent reloads the default policy. */
+  tenant_id?: string;
 }
 
 export interface PolicyReloadResponse {
@@ -136,6 +146,34 @@ export interface PolicyReloadResponse {
   sequence_count: number;
   action_class_count: number;
   escalation_route_count: number;
+  /** Tenant whose policy was reloaded; empty for the default policy. */
+  tenant_id: string;
+}
+
+export interface AnchorRequest {
+  receipt: Record<string, unknown>;
+}
+
+export interface TimestampAnchor {
+  method: string;
+  anchoredDigest: string;
+  token: string;
+  authority: string;
+  tsaUrl: string;
+}
+
+export interface AnchorResponse {
+  anchor: TimestampAnchor;
+  attested: string;
+  dss_hint: string;
+  settlement_evidence_digest?: string | null;
+}
+
+/** The x402 payment requirements a paid route answers with HTTP 402. */
+export interface X402Challenge {
+  x402Version: number;
+  accepts: Array<Record<string, unknown>>;
+  error: string;
 }
 
 export interface DetectInjectionRequest {
