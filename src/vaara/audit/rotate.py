@@ -39,6 +39,8 @@ class RotateResult:
     purged_records: int = 0
     archive_path: Union[Path, None] = None
     errors: list[str] = field(default_factory=list)
+    sealed_path: Union[Path, None] = None
+    seal_path: Union[Path, None] = None
 
 
 def rotate(
@@ -50,6 +52,7 @@ def rotate(
     tenant_id: str = "",
     dry_run: bool = False,
     revocation=None,
+    encrypt_to: Union[str, Path, bytes, None] = None,
 ) -> RotateResult:
     """Export the whole trail as a signed zip, verify it, then purge.
 
@@ -58,6 +61,14 @@ def rotate(
     keeps only the retention window. Purging is skipped entirely when the
     export or its verification fails, and in ``dry_run`` mode the purge
     count is reported without deleting anything.
+
+    With ``encrypt_to`` (an X25519 public key, PEM), the verified zip is
+    encrypted to that recipient and a public seal signed with ``signer_key``
+    is written beside it (``vaara.audit.sealed_archive``). The plaintext zip
+    is removed only after the seal verifies against the ciphertext (the sealed
+    file was decrypted back to the zip before it was written), and the purge
+    runs only after that. ``archive_path`` is then the sealed file. In
+    ``dry_run`` the plaintext zip is kept beside the sealed file.
     """
     from vaara.audit.export import export_signed
     from vaara.audit.verify import verify_signed
@@ -66,6 +77,13 @@ def rotate(
         return RotateResult(ok=False, errors=[f"retention_days must be > 0, got {retention_days}"])
 
     out = Path(out_path)
+    if encrypt_to is not None:
+        for existing in (out.with_name(out.name + ".sealed"),
+                         out.with_name(out.name + ".seal.json")):
+            if existing.exists():
+                return RotateResult(ok=False, errors=[
+                    f"{existing} exists; an earlier period's sealed archive is never "
+                    "replaced. Choose a new --out."])
     backend = SQLiteAuditBackend(db_path, tenant_id=tenant_id)
     try:
         exported = backend.count()
@@ -98,6 +116,31 @@ def rotate(
                 errors=["archive failed re-verification, purge skipped"] + verdict.errors,
             )
 
+        sealed_path = seal_path = None
+        if encrypt_to is not None:
+            from vaara.audit.sealed_archive import (
+                SealError, discard_sealed, seal_archive, verify_seal,
+            )
+
+            try:
+                sealed_path, seal_path, _ = seal_archive(out, encrypt_to, signer_key)
+            except (SealError, OSError, ValueError, TypeError) as exc:
+                return RotateResult(
+                    ok=False, exported_records=exported, archive_path=out,
+                    errors=[f"sealing failed, purge skipped: {exc}"],
+                )
+            sealed_verdict = verify_seal(seal_path, sealed_path)
+            if not sealed_verdict.ok:
+                discard_sealed(sealed_path, seal_path)
+                return RotateResult(
+                    ok=False, exported_records=exported, archive_path=out,
+                    errors=["seal failed verification, purge skipped"] + sealed_verdict.errors,
+                )
+            if not dry_run:
+                # The sealed file decrypted back to this zip before it was
+                # written into place, so the plaintext copy can go.
+                out.unlink()
+
         purged = backend.purge_older_than(retention_days * 86400, dry_run=dry_run)
         logger.info(
             "rotate: archived %d record(s) to %s, %s %d record(s) older than %d day(s)",
@@ -107,7 +150,9 @@ def rotate(
             ok=True,
             exported_records=exported,
             purged_records=purged,
-            archive_path=out,
+            archive_path=out if dry_run or sealed_path is None else sealed_path,
+            sealed_path=sealed_path,
+            seal_path=seal_path,
         )
     finally:
         backend.close()
