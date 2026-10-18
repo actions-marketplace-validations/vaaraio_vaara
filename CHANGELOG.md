@@ -20,6 +20,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ### Security
 - The pipeline's log lines replace CR, LF and other control characters in a caller's agent id, session id or tool name with `?`, so a crafted name cannot start a fake log line. The MCP proxy uses the same helper.
 
+### Changed
+- The container image builds on `registry.suse.com/bci/python:3.12` pinned to its multi-arch index digest, so a rebuild of a tagged release uses the same base. Dependabot now watches the Dockerfile and proposes digest updates weekly.
+
 ## [2.14.0] - 2026-10-15
 
 ### Added
