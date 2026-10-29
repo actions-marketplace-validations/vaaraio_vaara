@@ -1472,6 +1472,7 @@ def _cmd_trail_verify_anchor(args: argparse.Namespace) -> int:
         from vaara.audit.timeanchor import (
             TimeAnchor,
             TimeAnchorError,
+            _cert_der,
             verify_anchor_over_records,
         )
         from vaara.audit.trail import AuditRecord
@@ -1483,6 +1484,26 @@ def _cmd_trail_verify_anchor(args: argparse.Namespace) -> int:
     if not zip_path.exists():
         print(f"package zip not found: {zip_path}", file=sys.stderr)
         return 2
+
+    pins: dict[str, bytes] = {}
+    for flag, path in (("--tsa-cert", args.tsa_cert), ("--tsa-issuer", args.tsa_issuer)):
+        if path is None:
+            continue
+        pin_path = Path(path).expanduser()
+        try:
+            pin_bytes = pin_path.read_bytes()
+        except FileNotFoundError:
+            print(f"{flag} file not found: {pin_path}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"could not read {flag} file: {exc}", file=sys.stderr)
+            return 2
+        try:
+            _cert_der(pin_bytes)
+        except ValueError:
+            print(f"{flag} is not a PEM or DER certificate: {pin_path}", file=sys.stderr)
+            return 2
+        pins[flag] = pin_bytes
 
     try:
         with zipfile.ZipFile(zip_path) as zf:
@@ -1506,7 +1527,12 @@ def _cmd_trail_verify_anchor(args: argparse.Namespace) -> int:
     ]
 
     try:
-        attested = verify_anchor_over_records(anchor, record_hashes)
+        attested = verify_anchor_over_records(
+            anchor,
+            record_hashes,
+            trusted_signer_cert=pins.get("--tsa-cert"),
+            trusted_issuer_cert=pins.get("--tsa-issuer"),
+        )
     except TimeAnchorError as exc:
         print(f"time anchor INVALID: {exc}", file=sys.stderr)
         return 1
@@ -1515,8 +1541,16 @@ def _cmd_trail_verify_anchor(args: argparse.Namespace) -> int:
     print(f"  backend:        {anchor.backend}")
     print(f"  TSA:            {anchor.tsa_url}")
     print(f"  anchored head:  {anchor.chain_head_hash}")
-    print(f"  attested (UTC): {attested.isoformat()}")
-    print("  note: pin the TSA certificate to enforce an eIDAS-qualified authority.")
+    print(
+        f"  attested (UTC): {attested.isoformat()}"
+        " (the anchored head existed no later than this)"
+    )
+    if "--tsa-cert" in pins:
+        print("  pinned:         signer certificate equals --tsa-cert")
+    if "--tsa-issuer" in pins:
+        print("  pinned:         signer issued by --tsa-issuer")
+    if not pins:
+        print("  UNPINNED: time as asserted by the certificate in the package")
     return 0
 
 
@@ -1968,6 +2002,40 @@ def _cmd_review_expire(args: argparse.Namespace) -> int:
     verb = "Would expire" if args.dry_run else "Expired"
     print(f"{verb} {n} pending item(s) older than "
           f"{args.timeout_seconds} second(s).")
+    return 0
+
+
+def _cmd_review_purge(args: argparse.Namespace) -> int:
+    """Delete closed review items past retention. GDPR Art. 5(1)(e) and 17."""
+    if args.older_than_days <= 0:
+        print(f"--older-than-days must be > 0, got {args.older_than_days}",
+              file=sys.stderr)
+        return 2
+    db_path = Path(args.db).expanduser()
+    if not db_path.exists():
+        print(f"review queue DB not found: {db_path}", file=sys.stderr)
+        return 1
+    seconds = args.older_than_days * 86400
+    with _open_review_queue(args.db) as q:
+        n = q.purge_older_than(seconds, dry_run=args.dry_run)
+        scrubbed = q.last_purge_scrubbed
+        still_open = q.open_older_than(seconds)
+    if args.dry_run:
+        print(f"Would purge {n} closed item(s) older than "
+              f"{args.older_than_days} day(s).")
+        print("Run without --dry-run to apply.")
+    else:
+        print(f"Purged {n} closed item(s) older than "
+              f"{args.older_than_days} day(s).")
+        if scrubbed is False:
+            print("Note: the WAL could not be truncated (another process "
+                  "holds the queue open): the purged bytes stay in the -wal "
+                  "file until the next checkpoint", file=sys.stderr)
+    if still_open:
+        print(f"Note: {still_open} open item(s) older than the cutoff are "
+              "kept, a decision is still owed on them. 'vaara review expire' "
+              "closes pending ones; a later purge then removes them.",
+              file=sys.stderr)
     return 0
 
 
@@ -2967,7 +3035,15 @@ def _cmd_receipt_verify(args: argparse.Namespace) -> int:
         "back_link_valid": back_link.ok,
         "status": receipt.outcome_derived.status,
         "completed_at": receipt.outcome_derived.completed_at,
+        "outcome_observed": receipt.outcome_derived.status != "unobserved",
+        "outcome_note": "status and completed_at as asserted by the issuer",
     }
+    if receipt.outcome_derived.status == "unobserved":
+        result["outcome_note"] = (
+            "unobserved: the issuer sent the request and observed no outcome, "
+            "so it cannot say whether the action ran; read as neither executed "
+            "nor errored (status and completed_at as asserted by the issuer)"
+        )
 
     commitment = receipt.outcome_derived.result_commitment
     if commitment is None:
@@ -3992,8 +4068,10 @@ def _cmd_verify_contiguity(args: argparse.Namespace) -> int:
     """Check authorization receipts for completeness gaps under one boundary.
 
     Reads the ``evidence`` half of each ``*-authz.json`` file and checks that the
-    per-boundary sequence is contiguous. Exit 0 when complete, 1 when a gap is
-    found, 2 on a usage or input error.
+    per-boundary sequence is contiguous. Exit 0 when the held set is consistent,
+    1 when a gap is found, 2 on a usage or input error. Consistent is not
+    complete: a tail removed before the set was held shows only through a held
+    seal, and this command checks no external anchor.
     """
     from vaara.credential import evidence_binding_ok, verify_contiguity
 
@@ -4030,6 +4108,9 @@ def _cmd_verify_contiguity(args: argparse.Namespace) -> int:
         return 2
 
     evidence: list[dict] = []
+    # The whole file each evidence record came from: two different receipts at
+    # one seq are a fork, the same receipt twice is a replay.
+    wholes: list[dict] = []
     dropped = 0
     for f in files:
         try:
@@ -4047,11 +4128,13 @@ def _cmd_verify_contiguity(args: argparse.Namespace) -> int:
                 dropped += 1
                 continue
             evidence.append(payload["evidence"])
+            wholes.append(payload)
         else:
             # Keyless/structural path: accept a full payload or a bare record.
             ev = payload.get("evidence", payload)
             if isinstance(ev, dict):
                 evidence.append(ev)
+                wholes.append(payload)
 
     if verifying_material is not None and dropped:
         print(
@@ -4067,7 +4150,9 @@ def _cmd_verify_contiguity(args: argparse.Namespace) -> int:
         )
 
     try:
-        report = verify_contiguity(evidence, boundary_id=args.boundary_id)
+        report = verify_contiguity(
+            evidence, boundary_id=args.boundary_id, records=wholes
+        )
     except ValueError as exc:
         print(f"vaara verify-contiguity: {exc}", file=sys.stderr)
         return 2
@@ -4088,8 +4173,12 @@ def _cmd_verify_contiguity(args: argparse.Namespace) -> int:
                     "expected": report.expected,
                     "missingSeqs": report.missing_seqs,
                     "duplicateSeqs": report.duplicate_seqs,
+                    "duplicates": report.duplicates,
                     "countMismatches": report.count_mismatches,
                     "dropped": dropped,
+                    "sealed": report.sealed,
+                    # This command takes no anchor, so none is ever checked.
+                    "anchorChecked": False,
                     "ok": ok,
                 },
                 indent=2,
@@ -6342,6 +6431,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Verify the external time anchor in an Article 12 package",
     )
     pva.add_argument("--zip", required=True, help="Path to the package zip")
+    pva.add_argument(
+        "--tsa-cert",
+        metavar="PEM_OR_DER",
+        help="Pin the TSA signer certificate (PEM or DER) you hold out of band; "
+             "a token signed by any other certificate is refused",
+    )
+    pva.add_argument(
+        "--tsa-issuer",
+        metavar="PEM_OR_DER",
+        help="Pin the CA certificate (PEM or DER) that issued the TSA signer; "
+             "survives the signer certificate rotating",
+    )
     pva.set_defaults(func=_cmd_trail_verify_anchor)
 
     pep = tsub.add_parser(
@@ -6866,6 +6967,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Report the count without modifying the DB",
     )
     re_.set_defaults(func=_cmd_review_expire)
+
+    rp_ = rsub.add_parser(
+        "purge",
+        help="Delete resolved and expired items past a retention age",
+    )
+    rp_.add_argument("--db", required=True, help="Path to the review queue DB")
+    rp_.add_argument(
+        "--older-than-days", required=True, type=int,
+        help="Closed items whose case closed more than this many days ago "
+             "are deleted, with secure_delete and a WAL truncate. Pending "
+             "and claimed items are kept.",
+    )
+    rp_.add_argument(
+        "--dry-run", action="store_true",
+        help="Report the count without modifying the DB",
+    )
+    rp_.set_defaults(func=_cmd_review_purge)
 
     pp_policy = sub.add_parser(
         "policy",

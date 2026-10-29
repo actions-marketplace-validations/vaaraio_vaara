@@ -57,6 +57,10 @@ _INSTALL_HINT = (
 # digest, so sha256 is the natural default.
 _DIGEST_LEN = {"sha256": 32, "sha384": 48, "sha512": 64}
 
+# id-ct-TSTInfo (RFC 3161 2.4.2): the content type a token's signed
+# content-type attribute must name.
+_ID_CT_TSTINFO = "1.2.840.113549.1.9.16.1.4"
+
 
 class TimeAnchorError(Exception):
     """Anchoring or anchor verification failed."""
@@ -297,6 +301,28 @@ def _cert_der(cert_bytes: bytes) -> bytes:
     return cert.public_bytes(serialization.Encoding.DER)
 
 
+def _require_timestamping_purpose(signer_cert: Any) -> None:
+    """Refuse a signer certificate that is not an RFC 3161 TSA certificate."""
+    from cryptography import x509
+    from cryptography.x509.oid import ExtendedKeyUsageOID
+
+    try:
+        ext = signer_cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage)
+    except x509.ExtensionNotFound:
+        raise TimeAnchorError(
+            "token signer certificate has no extended key usage; RFC 3161 "
+            "requires id-kp-timeStamping, so the timestamp is not trusted"
+        ) from None
+    purposes = list(ext.value)
+    if purposes != [ExtendedKeyUsageOID.TIME_STAMPING] or not ext.critical:
+        raise TimeAnchorError(
+            "token signer certificate is not a TSA certificate: RFC 3161 requires "
+            "one critical extended key usage holding id-kp-timeStamping only "
+            f"(found {[p.dotted_string for p in purposes]}, "
+            f"critical={ext.critical}); the timestamp is not trusted"
+        )
+
+
 def verify_timestamp_token(
     token_der: bytes,
     expected_digest: bytes,
@@ -325,6 +351,11 @@ def verify_timestamp_token(
     by that exact CA certificate. TSA signer certificates rotate while the
     issuing CA is the stable entry on a trusted list, so this is the pin that
     survives rotation. Both pins may be given; each is enforced.
+
+    With either pin the signer certificate must also be a TSA certificate as
+    RFC 3161 section 2.3 defines it: one critical extended key usage holding
+    id-kp-timeStamping and nothing else. A pinned CA may issue certificates for
+    other purposes, and none of those may mint a trusted time.
     """
     _require_deps()
     try:
@@ -365,10 +396,28 @@ def verify_timestamp_token(
     signer_info = signed_data["signer_infos"][0]
     digest_alg = signer_info["digest_algorithm"]["algorithm"].native
     md_attr = None
+    ct_attrs = []
     for attr in signer_info["signed_attrs"]:
-        if attr["type"].native == "message_digest":
+        kind = attr["type"].native
+        if kind == "message_digest" and md_attr is None:
             md_attr = attr["values"][0].native
-            break
+        elif kind == "content_type":
+            ct_attrs.append(attr)
+    # RFC 5652 5.3 and RFC 3161 2.4.2: the content-type signed attribute is
+    # mandatory, single-valued, and names the eContentType, id-ct-TSTInfo.
+    # Without it the TSA's signature does not say what kind of content it
+    # covers.
+    if len(ct_attrs) != 1 or len(ct_attrs[0]["values"]) != 1:
+        raise TimeAnchorError(
+            "token signed attributes must carry exactly one content-type "
+            f"attribute with one value (found {len(ct_attrs)})"
+        )
+    ct_oid = ct_attrs[0]["values"][0].dotted
+    if ct_oid != _ID_CT_TSTINFO:
+        raise TimeAnchorError(
+            f"token signed content-type attribute names {ct_oid}, not "
+            f"id-ct-TSTInfo ({_ID_CT_TSTINFO})"
+        )
     if md_attr is None:
         raise TimeAnchorError("token signed attributes lack a message_digest")
     h = hashes.Hash(_hash_for(digest_alg))
@@ -400,6 +449,8 @@ def verify_timestamp_token(
                 "token signer certificate was not issued by the pinned trusted "
                 f"CA; the timestamp is not independently trusted ({exc})"
             ) from exc
+    if trusted_signer_cert is not None or trusted_issuer_cert is not None:
+        _require_timestamping_purpose(signer_cert)
 
     gen_time = tst_info["gen_time"].native
     if gen_time.tzinfo is None:
@@ -497,11 +548,18 @@ def _digest_bytes(chain_head_hash: str, hash_algorithm: str) -> bytes:
     return digest
 
 
-def verify_anchor(anchor: TimeAnchor) -> datetime:
+def verify_anchor(
+    anchor: TimeAnchor,
+    *,
+    trusted_signer_cert: Optional[bytes] = None,
+    trusted_issuer_cert: Optional[bytes] = None,
+) -> datetime:
     """Verify an anchor's token attests its own ``chain_head_hash``.
 
     Returns the attested UTC time. Does not check the hash belongs to a given
-    chain; use :func:`verify_anchor_over_records` for that.
+    chain; use :func:`verify_anchor_over_records` for that. The two pins are
+    passed to :func:`verify_timestamp_token`; without them the time is
+    asserted by the certificate carried in the token.
     """
     _require_deps()
     import base64
@@ -510,17 +568,30 @@ def verify_anchor(anchor: TimeAnchor) -> datetime:
     except Exception as exc:
         raise TimeAnchorError(f"anchor token_b64 is not valid base64: {exc}") from exc
     digest = _digest_bytes(anchor.chain_head_hash, anchor.hash_algorithm)
-    return verify_timestamp_token(token_der, digest, hash_algorithm=anchor.hash_algorithm)
+    return verify_timestamp_token(
+        token_der,
+        digest,
+        hash_algorithm=anchor.hash_algorithm,
+        trusted_signer_cert=trusted_signer_cert,
+        trusted_issuer_cert=trusted_issuer_cert,
+    )
 
 
-def verify_anchor_over_records(anchor: TimeAnchor, record_hashes: list[str]) -> datetime:
+def verify_anchor_over_records(
+    anchor: TimeAnchor,
+    record_hashes: list[str],
+    *,
+    trusted_signer_cert: Optional[bytes] = None,
+    trusted_issuer_cert: Optional[bytes] = None,
+) -> datetime:
     """Verify an anchor binds to an actual record in a chain.
 
     ``record_hashes`` is the ordered list of ``record_hash`` values from the
     trail. Confirms the record at ``anchor.chain_position`` has exactly
     ``anchor.chain_head_hash``, then verifies the token over it. This proves
-    the chain (and every execution record up to that position) existed at the
-    attested time. Returns the attested UTC time.
+    the chain (and every execution record up to that position) existed no
+    later than the attested time. Returns the attested UTC time. The pins are
+    those of :func:`verify_timestamp_token`.
     """
     pos = anchor.chain_position
     if pos < 0 or pos >= len(record_hashes):
@@ -533,7 +604,11 @@ def verify_anchor_over_records(anchor: TimeAnchor, record_hashes: list[str]) -> 
             f"anchor chain_position {pos} does not match the trail "
             "(anchor refers to a different or rewritten chain)"
         )
-    return verify_anchor(anchor)
+    return verify_anchor(
+        anchor,
+        trusted_signer_cert=trusted_signer_cert,
+        trusted_issuer_cert=trusted_issuer_cert,
+    )
 
 
 __all__ = [

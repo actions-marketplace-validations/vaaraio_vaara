@@ -12,7 +12,9 @@ Vaara governs every agent tool call and model call against the organisation's
 policy, and writes the decision and its outcome into a signed, hash-chained
 record that an outside party recomputes from the bytes and verifies offline,
 with none of the operator's software. The record can be anchored to up to five
-independent roots of trust, with zero-knowledge and post-quantum options. 52
+roots of trust, with zero-knowledge and post-quantum options. Two are outside
+witnesses (a qualified timestamp authority and a public transparency log); the
+others are the operator's own or the platform's (section 3). 52
 conformance suites each ship a checker that imports no Vaara code.
 
 License: AGPL-3.0-or-later.
@@ -32,7 +34,7 @@ License: AGPL-3.0-or-later.
 | Cage layer | `vaara cage`, `src/vaara/cage/`, `docs/cage.md` | The containment an agent runs in, as a choosable part. Twelve drivers, each over the cage's own tool unmodified: the Vaara cage, NVIDIA OpenShell, the Codex sandbox, Anthropic sandbox-runtime, nono, gVisor, Kata, kubernetes-sigs agent-sandbox, Firecracker, microsandbox, E2B self-hosted, Apple's container. Start, stop, status, enforcement state, events; `vaara cage drivers` says which are ready on the machine. Every decision record and its signed receipt carry a `cage` block: which cage the deciding process ran in, the digest of its effective configuration, and whether the kernel confirmed the confinement at decision time. A run outside any cage says so. |
 | Whole-machine install | `vaara init`, `vaara ungovern`, `integrations/init_governance.py` | Writes the host hooks, routes MCP client configs through the proxy and installs a managed launchd or systemd service. Reversible. |
 | Agent discovery | `vaara scan`, `vaara scan --watch`, `integrations/_mcp_beacon.py` | Finds AI agents on the machine (processes talking to a model API or a local model server, MCP clients) and says whether Vaara governs each. `--watch` records each new agent it sees. The Vaara MCP server and `vaara-mcp-proxy` do the same for whatever connects to them on stdio: the client is read from the process table above them, alongside its own `clientInfo`, and recorded on the same agents trail, so an ungoverned client is announced when it connects. `VAARA_BEACON=0` turns this off. |
-| Credential gateway | `credential/gateway.py`, `credential/_grant_*` | Short-lived scoped grants per call, capability-scope enforcement, and delegated-privilege attenuation: authority cannot grow down a delegation chain. `vaara trail check-grant` checks a whole recorded trail against a signed grant offline and separates allowed calls outside the grant from refused ones. |
+| Credential gateway | `credential/gateway.py`, `credential/_grant_*` | Short-lived scoped grants per call, capability-scope enforcement, and delegated-privilege attenuation: authority cannot grow down a delegation chain. The pipeline reads a parent grant it does not hold in memory from the trail, denies a child whose parent grant is on neither (`unknown_parent="allow"` opts out), and marks each delegated decision `attenuation` `held`, `violated` or `unverified` ([architecture.md](architecture.md#delegated-grants)). `vaara trail check-grant` checks a whole recorded trail against a signed grant offline and separates allowed calls outside the grant from refused ones. |
 | Principal-signed permission | `credential/_permission.py`, `vaara permission sign`, `vaara trail check-permission` | `vaara.permission/v1`: what a person allowed an agent, signed with that person's key. Per-call bounds plus totals and counts over rolling windows; a trail replays against it offline, refusals included. |
 | Egress guard | `integrations/_egress_guard.py` | Blocks DNS rebinding, cloud-metadata and private-network egress before any socket opens; pins the resolved IP; strips `Authorization` and `Cookie` on cross-origin redirects. |
 | Enforcement modes | `pipeline.py`, `vaara-mcp-proxy --shadow`, hook `mode` | Observe, shadow (score and record, block nothing) and enforce. The recorded numbers are the same in every mode, so a deployment can be measured before it blocks anything. |
@@ -50,7 +52,7 @@ License: AGPL-3.0-or-later.
 | Delegation attribution | `audit/delegation.py`, `credential/_grant_attenuation.py` | Reconstructs delegation chains and refuses any step that broadens authority, or that a parent naming its `delegatees` did not name; the graph reports such a hop as substituted and a hop under a parent that named nobody as unbound. |
 | Gap-evident completeness | `vaara verify-contiguity` | Signed sequence numbers and a running count make a dropped record a provable gap. Run sealing and a sealed class gate. |
 | Cross-organisation handoff | `vaara build-handoff`, `vaara verify-handoff`, `attestation/_handoff*.py` | A package of record, DID document, key history, revocations and anchor, with the producer identity pinned. EU AI Act Article 26(6). |
-| Access records | `audit/access.py` (`ACCESS_RECORDED`) | A read is an event: who read, on whose behalf, a digest of the returned set, and whether an outcome was recorded. |
+| Access records | `audit/access.py` (`ACCESS_RECORDED`) | A read is recorded when the deployer's code calls `record_access`; Vaara calls it itself only when the encrypted retention archive is opened with a trail. The record holds who read, on whose behalf, a digest of the returned set, and whether an outcome was recorded. |
 | Digest-only capture | `_capture.py`, `docs/capture-digest-only.md`, `capture_digest_only_v0` | An operator declares argument fields in `~/.vaara/capture.json`. The trail row, the review queue copy and the approval request then hold each declared value as a keyed digest and a reference, and the value is not stored, through the pipeline, the hook, the MCP proxy and the shell proxy. The key is not on the trail. Reason text, tool results and reviewer free text are not masked. Off unless the file exists. |
 | Audience and task binding | `attestation/_receipt_audience.py`, `attestation/_receipt_task.py` | `aud` and `taskId` inside the signed preimage. Verdicts `bound`, `conflict` or `unsupported`; a missing field never passes. |
 | Decision-before-effect ordering | `attestation/_decision_verifier.py` (`effect_ordering`) | Reports `ordered`, `effect_precedes_decision` or `not_comparable`. |
@@ -62,7 +64,11 @@ License: AGPL-3.0-or-later.
 
 ## 3. Witness roots
 
-The same record can be anchored to any or all of these.
+The same record can be anchored to any or all of these. A qualified timestamp
+authority and a public transparency log or SCITT service are run by someone
+else, so they witness the operator from outside. A self-hosted timestamp
+authority, or a log the operator runs itself, does not. TPM and confidential-VM
+attestation root in the platform's hardware and its vendor.
 
 | Root | Where | What it gives |
 |---|---|---|
@@ -107,7 +113,7 @@ Provider, and S3P, a safety-violation-rate measurement an auditor can reproduce.
 - DORA Articles 9, 10 and 13: event-to-article mappings in `audit/trail.py`, `compliance/engine.py`
 - SOC 2 Trust Services Criteria CC6.1 to CC6.3, CC7.2, CC7.3 and CC8.1: event-to-criterion mappings in `audit/trail.py`, `compliance/engine.py`, `docs/COMPLIANCE.md`
 - GDPR Chapter V, data locality and transfers: `attestation/data_locality.py`, `data_locality_v0`
-- GDPR Article 17, erasure: `audit/erase.py`, `vaara trail erase` (one record's data in the trail; the hash stays and a `record_erased` record names it; the eraser can sign it and `vaara trail verify --erasure-key` checks that; receipts, the review queue and earlier exports are not reached)
+- GDPR Article 17, erasure: `audit/erase.py`, `vaara trail erase` (one record's data in the trail; the hash stays and a `record_erased` record names it; the eraser can sign it and `vaara trail verify --erasure-key` checks that; receipts, the review queue and earlier exports are not reached; `vaara review purge` deletes closed queue items by age)
 - eIDAS 2.0 qualified electronic ledger profile: `docs/eidas-qel-profile.md`
 - prEN ISO/IEC 12792 transparency taxonomy: per-record tagging in `audit/trail.py`
 - W3C PROV-DM and PROV-JSON export: `audit/prov_export.py`, `vaara trail export-prov`
@@ -184,7 +190,7 @@ reproductions: [vaara.io/conformance.html](https://vaara.io/conformance.html).
 
 | Capability | Where | What it does |
 |---|---|---|
-| Review queue | `vaara review list`, `claim`, `resolve`, `audit/review_queue.py` | Pending, claimed and resolved (allow, deny or abstain); the resolution is written into the chain as `ESCALATION_RESOLVED`. |
+| Review queue | `vaara review list`, `claim`, `resolve`, `purge`, `audit/review_queue.py` | Pending, claimed and resolved (allow, deny or abstain); the resolution is written into the chain as `ESCALATION_RESOLVED`. `vaara review purge --older-than-days N` deletes closed items past retention with `secure_delete`; open items are kept. |
 | Signed approvals | `approvals.py`, host hooks | An escalated call waits for a human answer that is signed, which the governed agent cannot write. The request carries the call's full arguments and their SHA-256. A timeout or a corrupt answer stays a refusal, and the trail closes the hold as a deny by policy, so it never reads as one still waiting. |
 | Reviewer-signed resolutions | `vaara review resolve --sign-key`, `vaara trail check-permission`, `credential/_review_signature.py` | The reviewer signs the resolution with their own key, bound to the decision record it resolves. A third party checks it against a reviewer key the principal pinned in the signed permission, never a key the record carries, and an allow over a held call is named as an override for that one action. |
 | Shadow report | `vaara trail shadow-report`, `audit/shadow_report.py` | Groups what would have been denied or held, by tool, over a period. |

@@ -40,7 +40,9 @@ def jsonable(value: Any) -> Any:
 
 
 def engine_state(*, version: str, enforce: bool, scorer: Any, authority: Any = None,
-                 require_delegatee_binding: bool = False) -> dict[str, Any]:
+                 require_delegatee_binding: bool = False,
+                 unknown_parent: str = "deny",
+                 grantless_child: str = "deny") -> dict[str, Any]:
     """The ``vaara.engine-policy/v0`` object for a pipeline."""
     describe = getattr(scorer, "policy_state", None)
     scorer_state = describe() if callable(describe) else {"scorer": type(scorer).__name__}
@@ -55,6 +57,11 @@ def engine_state(*, version: str, enforce: bool, scorer: Any, authority: Any = N
     # Present only when on, so every digest taken without it stays the same.
     if require_delegatee_binding:
         state["require_delegatee_binding"] = True
+    # Same rule: only the non-default answer for an unknown parent grant.
+    if unknown_parent != "deny":
+        state["unknown_parent"] = unknown_parent
+    if grantless_child != "deny":
+        state["grantless_child"] = grantless_child
     return state
 
 

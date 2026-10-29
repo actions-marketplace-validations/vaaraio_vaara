@@ -264,6 +264,23 @@ class TestEngineDrivers:
         state = GVisorDriver(engine=engine, runsc="/nonexistent/runsc").enforcement_state("g")
         assert not state.confirmed and state.upstream == "gvisor"
 
+    def test_podman_inspect_confirms_by_oci_runtime(self, fake):
+        # podman reports HostConfig.Runtime as "oci" for every container and
+        # names the runtime it used in the top-level OCIRuntime (seen on
+        # podman 4.9 with gVisor release-20261026.0, 28.10).
+        podman = [dict(INSPECT[0], HostConfig={"Runtime": "oci"}, OCIRuntime="runsc")]
+        engine, _ = fake("podman", [[["inspect"], podman]])
+        from vaara.cage.gvisor import GVisorDriver
+        state = GVisorDriver(engine=engine, runsc="/nonexistent/runsc").enforcement_state("g")
+        assert state.confirmed and state.detail["runtime"] == "runsc"
+
+    def test_podman_with_another_runtime_is_not_confirmed(self, fake):
+        podman = [dict(INSPECT[0], HostConfig={"Runtime": "oci"}, OCIRuntime="crun")]
+        engine, _ = fake("podman", [[["inspect"], podman]])
+        from vaara.cage.gvisor import GVisorDriver
+        state = GVisorDriver(engine=engine, runsc="/nonexistent/runsc").enforcement_state("g")
+        assert not state.confirmed and state.detail["runtime"] == "crun"
+
     def test_kata_runtime_name_and_version(self, fake, tmp_path):
         engine, calls = fake("docker", [[["run"], "id\n"],
                                         [["inspect"], [dict(INSPECT[0], HostConfig={"Runtime": "kata"})]]])
@@ -278,11 +295,87 @@ class TestEngineDrivers:
         assert c["argv"][c["argv"].index("--security-opt") + 1] == "no-new-privileges"
         assert launch.state.upstream == "kata 3.12.0" and launch.state.confirmed
 
+    def test_kata4_shim_gives_the_version(self, tmp_path, monkeypatch):
+        # Kata 4 ships no kata-runtime; the Rust shim answers --version with
+        # this line (Kata 4.3.1, read 28.10 on Ubuntu 24.04).
+        shim = tmp_path / "containerd-shim-kata-v2"
+        shim.write_text("#!/bin/sh\necho 'Kata Containers containerd shim (Rust): id: "
+                        "io.containerd.kata.v2, version: 4.3.1, commit: 03cf2ec06a5d'\n")
+        shim.chmod(shim.stat().st_mode | stat.S_IXUSR)
+        monkeypatch.delenv("KATA_RUNTIME_BIN", raising=False)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        from vaara.cage.kata import KataDriver
+        assert KataDriver(engine="docker").upstream_version() == "kata 4.3.1"
+        from vaara.cage import readiness
+        assert not any("kata" in m for m in readiness._missing("kata", KataDriver(engine=str(shim))))
+
+    def test_kata_runtime_still_wins_when_present(self, tmp_path, monkeypatch):
+        for name, line in (("kata-runtime", "kata-runtime  : 3.12.0"),
+                           ("containerd-shim-kata-v2", "shim (Golang): id: x, version: 3.12.0, commit: y")):
+            t = tmp_path / name
+            t.write_text(f"#!/bin/sh\necho '{line}'\n")
+            t.chmod(t.stat().st_mode | stat.S_IXUSR)
+        monkeypatch.delenv("KATA_RUNTIME_BIN", raising=False)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        from vaara.cage.kata import KataDriver
+        d = KataDriver(engine="docker")
+        assert d._kata.binary == "kata-runtime" and d.upstream_version() == "kata 3.12.0"
+
+    def test_selinux_label_refusal_names_the_option(self, tmp_path):
+        # runsc under podman on an SELinux-enforcing host (Rocky 9.8, 28.10)
+        engine = tmp_path / "podman"
+        engine.write_text("#!/bin/sh\necho 'Error: OCI runtime error: runsc: FetchSpec failed: "
+                          "reading spec: SELinux is not supported: system_u:system_r:container_t:s0' >&2\n"
+                          "exit 126\n")
+        engine.chmod(engine.stat().st_mode | stat.S_IXUSR)
+        from vaara.cage.gvisor import GVisorDriver
+        with pytest.raises(CageError) as err:
+            GVisorDriver(engine=str(engine), runsc="/nonexistent/runsc").start(["agent"], None, image="i")
+        msg = str(err.value)
+        assert "SELinux is not supported" in msg            # the runtime's own words stay
+        assert "--security-opt label=disable" in msg        # and the way out is named
+        assert "without an SELinux label" in msg            # with what it costs
+
+    def test_other_engine_errors_are_unchanged(self, tmp_path):
+        engine = tmp_path / "podman"
+        engine.write_text("#!/bin/sh\necho 'Error: image not known' >&2\nexit 125\n")
+        engine.chmod(engine.stat().st_mode | stat.S_IXUSR)
+        from vaara.cage.gvisor import GVisorDriver
+        with pytest.raises(CageError) as err:
+            GVisorDriver(engine=str(engine), runsc="/nonexistent/runsc").start(["agent"], None, image="i")
+        assert "label=disable" not in str(err.value)
+
     def test_policy_file_is_refused(self, fake, tmp_path):
         engine, _ = fake("docker", [])
         from vaara.cage.gvisor import GVisorDriver
         with pytest.raises(CageError, match="--image"):
             GVisorDriver(engine=engine).start(["agent"], tmp_path / "p.json", image="i")
+
+    def test_podman_only_host_uses_podman(self, fake, tmp_path, monkeypatch):
+        # RHEL and SLES ship podman and no docker: the default engine is the
+        # one on PATH, not a docker that is not there.
+        engine, _ = fake("podman", [])
+        monkeypatch.delenv("VAARA_CAGE_ENGINE", raising=False)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        from vaara.cage.gvisor import GVisorDriver
+        from vaara.cage.kata import KataDriver
+        assert GVisorDriver()._engine.path() == engine
+        assert KataDriver()._engine.path() == engine
+
+    def test_docker_wins_when_both_are_there(self, fake, tmp_path, monkeypatch):
+        fake("podman", [])
+        docker, _ = fake("docker", [])
+        monkeypatch.delenv("VAARA_CAGE_ENGINE", raising=False)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        from vaara.cage.gvisor import GVisorDriver
+        assert GVisorDriver()._engine.path() == docker
+
+    def test_neither_engine_names_both(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("VAARA_CAGE_ENGINE", raising=False)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        from vaara.cage.gvisor import GVisorDriver
+        with pytest.raises(CageError, match="docker: not found; install docker or podman"):
+            GVisorDriver()._engine.path()
 
 
 # ── microsandbox ───────────────────────────────────────────────────────
@@ -430,13 +523,23 @@ class TestFirecracker:
                        cage.UPSTREAM_ENV: "firecracker_v1.10.1", cage.NAME_ENV: "vm1"}
         assert cage.declared(env).driver == "firecracker"
 
-    def test_api_status(self, tmp_path):
-        """A fake Firecracker API on a unix socket."""
+    @pytest.mark.parametrize("declared", [True, False])
+    def test_api_status(self, tmp_path, declared):
+        """A fake Firecracker API on a unix socket. The status carries the
+        digest the launch handed the guest (the one every receipt from inside
+        carries), and the API's own view of the configuration beside it; a
+        microVM Vaara did not launch has no given digest and reports the API's
+        view (28.10: status reported only the API's view, so it never matched
+        the receipts of a real Firecracker 1.17 launch)."""
         import socket as _socket
         from vaara.cage.firecracker import FirecrackerDriver
         # A short directory: macOS caps a unix socket path at 104 bytes.
         run = Path(tempfile.mkdtemp(prefix="fc", dir="/tmp" if os.name == "posix" else None))
         sock_path = run / "vm2.firecracker.sock"
+        given = "sha256:" + "ab" * 32
+        vm_config = {"boot-source": {"boot_args": "console=ttyS0 vaara.cage=firecracker "
+                                     f"vaara.cage.digest={given} vaara.cage.name=vm2"
+                                     if declared else "console=ttyS0"}, "logger": None}
         server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         server.bind(str(sock_path)); server.listen(2)
         stop = threading.Event()
@@ -455,7 +558,7 @@ class TestFirecracker:
                         body = json.dumps({"id": "vm2", "state": "Running",
                                            "vmm_version": "1.10.1", "app_name": "Firecracker"})
                     elif line.startswith("GET /vm/config"):
-                        body = json.dumps({"boot-source": {"boot_args": "x"}, "logger": None})
+                        body = json.dumps(vm_config)
                     else:
                         body = ""
                     conn.sendall((f"HTTP/1.1 {'204 No Content' if not body else '200 OK'}\r\n"
@@ -468,7 +571,10 @@ class TestFirecracker:
             state = d.enforcement_state("vm2")
             assert state.confirmed and state.basis == "api_status"
             assert state.upstream == "firecracker 1.10.1"
-            assert state.config_digest.startswith("sha256:")
+            from vaara.cage._cli import digest_json
+            active = digest_json(vm_config)
+            assert state.detail["active_digest"] == active
+            assert state.config_digest == (given if declared else active)
         finally:
             stop.set(); t.join(timeout=2); server.close()
             shutil.rmtree(run, ignore_errors=True)

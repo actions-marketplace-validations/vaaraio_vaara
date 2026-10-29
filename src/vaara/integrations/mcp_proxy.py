@@ -119,6 +119,26 @@ _REQUEST_INTENT: contextvars.ContextVar[str] = contextvars.ContextVar(
 _safe_log = log_safe
 
 
+def _json_type_name(value: Any) -> str:
+    """The JSON type of a decoded value, for refusal reasons."""
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if value is None:
+        return "null"
+    return "object" if isinstance(value, dict) else type(value).__name__
+
+
+def _outcome_state(exc: BaseException) -> str:
+    """The trail state an upstream exception names; unclassified is unobserved."""
+    return getattr(exc, "outcome_state", "unobserved")
+
+
 def _outcome_description(status: str, **fields: Any) -> str:
     """The outcome description: one JSON object, so a reader can parse it."""
     return json.dumps({"status": status, **fields}, sort_keys=True)
@@ -1400,13 +1420,31 @@ class VaaraMCPProxy:
         return {**response, "result": new_result}
 
     def _handle_tools_call(self, request: dict) -> dict:
-        params = request.get("params") or {}
-        if not isinstance(params, dict):
+        # MCP declares params and params.arguments objects. Anything else is
+        # refused here, never read as {} and forwarded: the gates would score
+        # an empty call while the server ran the original. Absent or null
+        # arguments stay {} (a tool with no inputs). Refused in shadow mode
+        # too, since there is no faithful call to record as having proceeded.
+        params = request.get("params")
+        if params is None:
             params = {}
+        arguments = params.get("arguments") if isinstance(params, dict) else None
+        if not isinstance(params, dict) or not isinstance(arguments, (dict, type(None))):
+            bad, value = ("params", params) if not isinstance(params, dict) else ("arguments", arguments)
+            tool_name = params.get("name", "") if isinstance(params, dict) else ""
+            if not isinstance(tool_name, str):
+                tool_name = ""
+            reason = f"Invalid params: '{bad}' must be an object, got {_json_type_name(value)}"
+            self._record_perimeter_audit(
+                self._agent_id_default, tool_name, {}, "deny", reason,
+                policy_id="mcp_params_shape",
+                violation_type="invalid_params",
+                enforcement="could_block",
+            )
+            logger.warning("tools/call refused: %s (%s)", reason, _safe_log(tool_name))
+            return self._error_response(request.get("id"), -32602, reason)
         tool_name = params.get("name", "")
-        arguments = params.get("arguments", {}) or {}
-        if not isinstance(arguments, dict):
-            arguments = {}
+        arguments = arguments or {}
         # Which gates ran, in the order they ran. The sequence here is a
         # property of the code and was previously only knowable by reading
         # it: a reader of the record could not tell a gate that passed from
@@ -1810,15 +1848,17 @@ class VaaraMCPProxy:
         # every path keeps the evidence trail complete with no orphans.
         outcome_severity = 1.0
         outcome_description = ""
+        outcome_state: Optional[str] = None
         try:
             upstream_response = self._upstream.request(request)
             outcome_severity = self._severity_from_response(upstream_response)
             if outcome_severity > 0.0:
                 outcome_description = _outcome_description("failed")
         except Exception as exc:
-            # The request raised, so no reply was read. The receipt below keeps
-            # its closed status set (errored); the trail is where the three
-            # cases are told apart.
+            # The request raised, so no reply was read. The trail tells the
+            # three cases apart; the receipt below says unobserved for the one
+            # where the call may have run, and errored for not_sent and failed.
+            outcome_state = _outcome_state(exc)
             self._record_unanswered(str(getattr(result, "action_id", None) or ""), exc)
             raise
         finally:
@@ -1836,6 +1876,7 @@ class VaaraMCPProxy:
                     upstream_name=upstream_name,
                     tenant_id=_REQUEST_TENANT.get(),
                     task_id=_related_task_id(params),
+                    outcome_state=outcome_state,
                 )
         self._harvest_origin(tool_name, upstream_response,
                              str(getattr(result, "action_id", None) or ""))
@@ -1874,7 +1915,7 @@ class VaaraMCPProxy:
         closed at the neutral 0.5 severity, as an aborted stream is: the
         scorer is not told it failed. Failures here are logged and swallowed.
         """
-        state = getattr(exc, "outcome_state", "unobserved")
+        state = _outcome_state(exc)
         try:
             self._pipeline.report_outcome(
                 action_id=action_id,

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Iterator, Optional
@@ -32,6 +33,14 @@ from vaara.cage.driver import CageError, CageLaunch
 _SINCE = re.compile(r"^(\d{4}-\d\d-\d\dT[^ ]+)\s(.*)$")
 
 
+def _default_engine() -> str:
+    """docker when it is on PATH, else podman when that is (RHEL and SLES ship
+    podman only), else docker, so the not-found message names the usual one."""
+    if shutil.which("docker"):
+        return "docker"
+    return "podman" if shutil.which("podman") else "docker"
+
+
 class ContainerEngineDriver:
     """Base for a runtime run through docker or podman."""
 
@@ -41,10 +50,14 @@ class ContainerEngineDriver:
 
     def __init__(self, engine: Optional[str] = None, runtime: Optional[str] = None,
                  timeout: float = 300.0) -> None:
-        self._engine = Tool("engine", engine or os.environ.get("VAARA_CAGE_ENGINE") or "docker",
+        self._engine = Tool("engine", engine or os.environ.get("VAARA_CAGE_ENGINE") or _default_engine(),
                             "VAARA_CAGE_ENGINE", "install docker or podman", timeout)
         if runtime:
             self.runtime = runtime
+
+    def explain(self, message: str) -> str:
+        """A launch error as the operator should read it; a runtime adds what it knows."""
+        return message
 
     # Subclasses say how the runtime itself reports its version.
     def upstream_version(self) -> str:  # pragma: no cover - overridden
@@ -74,7 +87,10 @@ class ContainerEngineDriver:
         for key, value in environ_for(state).items():
             args += ["-e", f"{key}={value}"]
         args += [image, *agent]
-        container_id = self._engine.run(*args).strip()
+        try:
+            container_id = self._engine.run(*args).strip()
+        except CageError as exc:
+            raise CageError(self.explain(str(exc))) from None
         return CageLaunch(driver=self.name, name=launch_name,
                           state=self.enforcement_state(launch_name),
                           detail={"container_id": container_id, "request": request})
@@ -102,10 +118,13 @@ class ContainerEngineDriver:
                       if str(e).startswith(DIGEST_ENV + "=")), "")
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", given):
             given = ""  # not a digest this record may carry; the engine view stands
+        runtime = host.get("Runtime", "")
+        if runtime in ("", "oci") and data.get("OCIRuntime"):
+            runtime = data["OCIRuntime"]  # podman: HostConfig says "oci", this names the runtime
         return {
             "name": name, "id": data.get("Id", ""),
             "status": state.get("Status", ""), "running": bool(state.get("Running")),
-            "exit_code": state.get("ExitCode"), "runtime": host.get("Runtime", ""),
+            "exit_code": state.get("ExitCode"), "runtime": runtime,
             "image": config.get("Image", ""), "cmd": config.get("Cmd"),
             "config_digest": given,
             "active_digest": digest_json({"HostConfig": host, "Config": config}),

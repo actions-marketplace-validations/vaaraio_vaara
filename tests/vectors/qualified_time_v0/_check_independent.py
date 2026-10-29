@@ -10,13 +10,15 @@ For each committed record it reproduces the verdict:
    SHA-256, as ``sha256:<hex>``. The proof's ``recordDigest`` must equal it, so
    a proof stapled to mutated bytes fails.
 2. **Imprint.** Parse the RFC 3161 token, require its message imprint to equal
-   that digest, and require the SignedAttributes message-digest to equal the
-   hash of the TSTInfo content.
+   that digest, require the SignedAttributes message-digest to equal the
+   hash of the TSTInfo content, and require exactly one content-type signed
+   attribute naming id-ct-TSTInfo (RFC 5652 5.3, RFC 3161 2.4.2).
 3. **Signature.** Verify the TSA's signature over the SignedAttributes under
    the certificate the token carries.
 4. **Qualified.** The attested time is qualified only if the signer certificate
-   is directly issued by the CA pinned in ``trusted_ca.pem``; otherwise the
-   token is valid but self-asserted.
+   is directly issued by the CA pinned in ``trusted_ca.pem`` and is a TSA
+   certificate (RFC 3161 section 2.3: one critical extended key usage holding
+   id-kp-timeStamping only); otherwise the token is valid but self-asserted.
 
 Verdicts (``ok`` and ``qualified``) are compared against ``expected.json``.
 Exit 0 means every case matched. Run:
@@ -42,9 +44,11 @@ try:
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.x509 import (
+        ExtendedKeyUsage,
         load_der_x509_certificate,
         load_pem_x509_certificate,
     )
+    from cryptography.x509.oid import ExtendedKeyUsageOID
 except ModuleNotFoundError as exc:  # pragma: no cover - base install
     print(
         "SKIP: qualified_time_v0 needs an optional dependency not installed: "
@@ -55,6 +59,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - base install
 
 HERE = Path(__file__).resolve().parent
 COMPARE = ("ok", "qualified")
+ID_CT_TSTINFO = "1.2.840.113549.1.9.16.1.4"
 
 
 def _record_digest(record: dict) -> str:
@@ -88,10 +93,16 @@ def _signer_cert_after_verify(token_der: bytes, expected_digest: bytes):
 
     signer_info = signed_data["signer_infos"][0]
     md_attr = None
+    content_types = []
     for attr in signer_info["signed_attrs"]:
-        if attr["type"].native == "message_digest":
+        if attr["type"].native == "message_digest" and md_attr is None:
             md_attr = attr["values"][0].native
-            break
+        elif attr["type"].native == "content_type":
+            content_types.extend(v.dotted for v in attr["values"])
+    # RFC 5652 5.3: one content-type attribute, one value, naming the
+    # eContentType; RFC 3161 2.4.2 fixes that to id-ct-TSTInfo.
+    if content_types != [ID_CT_TSTINFO]:
+        raise ValueError("signed content-type attribute is not id-ct-TSTInfo")
     if md_attr != hashlib.sha256(tst_bytes).digest():
         raise ValueError("SignedAttributes digest does not cover the TSTInfo")
 
@@ -124,6 +135,15 @@ def _match_signer_cert(signed_data):
     raise ValueError("cannot disambiguate the signer certificate")
 
 
+def _is_tsa_certificate(cert) -> bool:
+    """RFC 3161 2.3: exactly one critical EKU, id-kp-timeStamping alone."""
+    try:
+        ext = cert.extensions.get_extension_for_class(ExtendedKeyUsage)
+    except Exception:  # noqa: BLE001 - absent EKU is not a TSA certificate
+        return False
+    return ext.critical and list(ext.value) == [ExtendedKeyUsageOID.TIME_STAMPING]
+
+
 def evaluate(record: dict, trusted_ca) -> dict:
     ep = record.get("existenceProof")
     if not isinstance(ep, dict):
@@ -148,7 +168,7 @@ def evaluate(record: dict, trusted_ca) -> dict:
     qualified = False
     try:
         signer_cert.verify_directly_issued_by(trusted_ca)
-        qualified = True
+        qualified = _is_tsa_certificate(signer_cert)
     except Exception:  # noqa: BLE001 - not issued by the pinned CA
         qualified = False
     return {"ok": True, "qualified": qualified}
