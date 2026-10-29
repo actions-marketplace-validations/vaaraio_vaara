@@ -98,17 +98,16 @@ After a session, query the audit database:
 sqlite3 /path/to/vaara_audit.db ".dump audit_records" | head -40
 ```
 
-Each tool call produces a hash-chained sequence of records. A typical session against an ABAP read tool produces:
+Each allowed tool call produces four hash-chained records:
 
 - An `action_requested` record naming the upstream tool (e.g., `getObjectSource`), agent_id, parameters, and base risk score.
 - A `risk_scored` record with the conformal interval and the contributing expert signals.
 - A `decision_made` record with `ALLOW` / `DENY` / `ESCALATE` and the reason.
-- An `action_executed` or `action_blocked` record depending on the decision.
 - An `outcome_recorded` record after the upstream returns, carrying the severity signal back to the scorer.
 
-Escalations to a human reviewer (Article 14) produce additional `escalation_sent` and `escalation_resolved` records on top of this sequence. The chain integrity (each record links to the previous via SHA-256) makes the trail tamper-evident.
+A denied call is answered with the block reason at `decision_made` and is never forwarded to the upstream.
 
-See [`audit_sample.jsonl`](audit_sample.jsonl) in this directory for a real session capture (populated when the demo runs end-to-end against a SAP system).
+Escalations to a human reviewer (Article 14) produce additional `escalation_sent` and `escalation_resolved` records on top of this sequence. The chain integrity (each record links to the previous via SHA-256) makes the trail tamper-evident.
 
 ## Customising policy
 
@@ -127,16 +126,16 @@ After the audit DB has captured live activity:
 ```bash
 vaara compliance report --db /path/to/vaara_audit.db --format json
 vaara compliance report --db /path/to/vaara_audit.db --format pdf
-vaara trail export --db /path/to/vaara_audit.db
+vaara trail export --db /path/to/vaara_audit.db --out trail.zip --key signing.pem
 ```
 
-The PDF output is the format a Notified Body or internal compliance auditor reads. The `trail export` produces a Sigstore-signed envelope suitable for regulator handoff.
+The PDF output is the format a Notified Body or internal compliance auditor reads. `trail export` writes a zip signed with your Ed25519 key, which an auditor can verify offline.
 
 ## Troubleshooting
 
 - **The proxy hangs on startup.** The upstream MCP server is probably failing its initialize handshake. Check the proxy's stderr. The upstream's stderr is forwarded through. Common cause: missing SAP credentials in env.
 - **Every tool call is blocked.** Default fail-closed policy. Define a policy file, or tune for your specific tool catalog.
-- **Audit DB grows quickly.** Each tool call writes 4 records. Use `vaara audit purge --before <date>` to prune old records (the chain integrity is preserved across pruning).
+- **Audit DB grows quickly.** Each tool call writes 4 records. `vaara trail rotate --db ./mcp_audit.db --out archive.zip --key signing.pem --retention-days 180 --all-tenants` exports the trail to a signed archive, verifies it, then deletes records older than the retention period. The live trail then begins at the retention boundary: its first surviving record points at a predecessor that is only in the archive, so keep the archive.
 
 ## The same pattern in front of any MCP server
 

@@ -132,6 +132,30 @@ def _with_rails_log(options: Any) -> Any:
     return options
 
 
+def _response_text(response: Any) -> str:
+    """The bot's reply as text.
+
+    Called with ``messages`` and ``options``, ``LLMRails.generate`` returns a
+    ``GenerationResponse`` whose ``response`` is a list of message dicts, not
+    a string. The last assistant message is the reply.
+    """
+    if isinstance(response, str):
+        return response
+    body = (
+        response.get("response") if isinstance(response, dict)
+        else getattr(response, "response", None)
+    )
+    if isinstance(response, dict) and body is None:
+        body = response.get("content")
+    if isinstance(body, str):
+        return body
+    if isinstance(body, list):
+        for message in reversed(body):
+            if isinstance(message, dict) and message.get("role") in (None, "assistant", "bot"):
+                return str(message.get("content") or "")
+    return ""
+
+
 def parse_generation_response(
     response: Any,
     *,
@@ -152,7 +176,10 @@ def parse_generation_response(
 
     activated = getattr(log, "activated_rails", None)
     if activated is None and isinstance(log, dict):
-        activated = log.get("activated_rails") or []
+        activated = log.get("activated_rails")
+    # generation options always ask for activated_rails. A response without
+    # the list was not read; an empty list is a run where no rail fired.
+    understood = activated is not None
     activated = activated or []
 
     cats: list[FindingCategory] = []
@@ -166,6 +193,7 @@ def parse_generation_response(
         categories=cats,
         raw=raw,
         scanned_role=scanned_role,
+        understood=understood,
     )
 
 
@@ -198,11 +226,7 @@ class NemoGuardrailsAdapter:
         """
         kwargs["options"] = _with_rails_log(kwargs.get("options"))
         response = self._rails.generate(messages=messages, **kwargs)
-        text = response if isinstance(response, str) else (
-            getattr(response, "response", None)
-            or (response.get("response") if isinstance(response, dict) else "")
-            or ""
-        )
+        text = _response_text(response)
         finding = parse_generation_response(response, scanned_role="response")
         return text, finding
 

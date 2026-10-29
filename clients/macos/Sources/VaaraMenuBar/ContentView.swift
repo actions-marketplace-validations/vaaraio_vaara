@@ -5,6 +5,9 @@
 import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
+#if canImport(Shared)
+import Shared
+#endif
 
 extension GateState {
     var color: Color {
@@ -83,8 +86,9 @@ struct ContentView: View {
     @State private var screen: Screen = .overview
     @State private var selectedAgent: AgentSummary?
     @State private var discoveredCount: Int?
+    @State private var openReceipt: ReceiptEntry?
 
-    enum Screen { case overview, settings, history, setup, anchor }
+    enum Screen { case overview, settings, history, receipts, setup, anchor }
     @State private var engine = SetupScanner.engineStatus()
     @State private var clients: [MCPClient] = SetupScanner.scan()
     @State private var installing = false
@@ -122,6 +126,7 @@ struct ContentView: View {
                 case .overview: overview
                 case .settings: settings
                 case .history:  historyView
+                case .receipts: receiptsView
                 case .setup:    setupView
                 case .anchor:   anchorView
                 }
@@ -258,6 +263,117 @@ struct ContentView: View {
         }
     }
 
+    // MARK: receipts — the engine's signed receipt for each decision,
+    // verified by this app's own code (Shared/DecisionReceipt.swift)
+
+    private var receiptsView: some View {
+        Group {
+            if let entry = openReceipt {
+                receiptDetail(entry)
+            } else {
+                let entries = model.receipts()
+                if entries.isEmpty {
+                    VStack(spacing: 10) {
+                        Text("No decision receipts beside the watched trails.")
+                            .font(.system(size: 12))
+                            .foregroundStyle(p.ghost)
+                        Text("The engine signs a receipt for every decision when\n`vaara[attestation]` is installed.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(p.ghost)
+                            .multilineTextAlignment(.center)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 36)
+                } else {
+                    FittingScrollView(cap: 560) {
+                        VStack(alignment: .leading, spacing: 0) {
+                            let bad = entries.filter { !$0.check.ok }.count
+                            sectionLabel(bad == 0
+                                         ? "\(entries.count) RECEIPTS, ALL VERIFIED"
+                                         : "\(entries.count) RECEIPTS, \(bad) FAILED")
+                            ForEach(entries) { entry in
+                                Button { openReceipt = entry } label: {
+                                    ReceiptRow(entry: entry, p: p)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(.vertical, 8)
+                    }
+                }
+            }
+        }
+    }
+
+    private func receiptDetail(_ entry: ReceiptEntry) -> some View {
+        let r = entry.receipt, c = entry.check
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Button { openReceipt = nil } label: {
+                    Image(systemName: "chevron.left").font(.system(size: 11))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(p.faint)
+                Text("\(r.decision.uppercased())  \(r.tool)")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(p.ink)
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer()
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                checkLine("Signature (ES256, key \(r.keyId))", c.signature)
+                checkLine("Evidence matches evidenceRef digest", c.evidence)
+                checkLine(c.trail == nil ? "Trail record not checked (trail unreadable)"
+                                         : "Record \(r.recordId.prefix(8)) is on the trail with this hash",
+                          c.trail)
+                if !c.detail.isEmpty {
+                    Text(c.detail)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(GateState.red.color)
+                }
+            }
+            Text("\(r.decidedAt)  risk \(r.riskScore)  agent \(r.agent)")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(p.faint)
+            if !r.reason.isEmpty {
+                Text(r.reason)
+                    .font(.system(size: 11))
+                    .foregroundStyle(p.faint)
+                    .lineLimit(3)
+            }
+            ScrollView {
+                Text(r.prettyJSON)
+                    .font(.system(size: 9.5, design: .monospaced))
+                    .foregroundStyle(p.ghost)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(height: 200)
+            HStack(spacing: 14) {
+                Button("Export…") { model.exportReceipt(entry) }
+                Button("Show in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([r.url])
+                }
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 12))
+            .foregroundStyle(p.ink.opacity(0.8))
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func checkLine(_ label: String, _ ok: Bool?) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: ok == nil ? "minus.circle" : ok! ? "checkmark.seal.fill" : "xmark.octagon.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(ok == nil ? p.ghost : ok! ? GateState.green.color : GateState.red.color)
+            Text(label)
+                .font(.system(size: 11))
+                .foregroundStyle(p.ink)
+        }
+    }
+
     // MARK: header — the state, stated once, calmly
 
     private var header: some View {
@@ -268,12 +384,15 @@ struct ContentView: View {
                 .shadow(color: model.state.color.opacity(0.55), radius: 6)
                 .offset(y: -1)
             VStack(alignment: .leading, spacing: 3) {
-                Text(model.state.label)
+                // A trail the app cannot read is its own headline. It used to
+                // render as "Allowed" over an empty feed.
+                Text(model.trailFault == nil ? model.state.label : "Trail unreadable")
                     .font(.system(size: 24, weight: .light))
                     .foregroundStyle(p.ink)
-                Text(model.state.detail)
+                Text(model.trailFault ?? model.state.detail)
                     .font(.system(size: 12))
                     .foregroundStyle(p.faint)
+                    .lineLimit(2)
             }
             Spacer()
         }
@@ -479,9 +598,11 @@ struct ContentView: View {
                             .font(.system(size: 11))
                             .foregroundStyle(p.ghost)
                     }
-                    Text("Governs AI-bound traffic from Safari, Mail and every "
-                         + "WKWebView app. macOS asks for approval in System "
-                         + "Settings > General > Login Items & Extensions.")
+                    Text("Allows or refuses AI-bound connections by hostname from "
+                         + "Safari, Mail and WKWebView apps, once loaded. macOS loads it "
+                         + "only from a build signed with a Developer ID, then asks for "
+                         + "approval in System Settings > General > Login Items & "
+                         + "Extensions. It sees network connections only.")
                         .font(.system(size: 10))
                         .foregroundStyle(p.ghost)
                 }
@@ -576,11 +697,19 @@ struct ContentView: View {
                         }
                         .pickerStyle(.segmented)
                         .labelsHidden()
+                        // Name what each level hides. "Everything else keeps
+                        // its defaults" was true and useless: it did not say
+                        // that a protection picker exists, so an operator on
+                        // Basic wondering why every call escalated had no way
+                        // to know the control was one click away.
                         Text(model.config.user_level == "basic"
-                             ? "The essentials. Everything else keeps its defaults."
+                             ? "The essentials. Protection presets, the fade "
+                               + "window and the menu bar graph are on Professional."
                              : model.config.user_level == "professional"
-                             ? "Adds thresholds and tuning."
-                             : "Adds multiple trails and every control.")
+                             ? "Adds protection presets and tuning. The approvals "
+                               + "folder, the popup style and multiple trails are "
+                               + "on Enterprise."
+                             : "Every control.")
                             .font(.system(size: 10.5))
                             .foregroundStyle(p.ghost)
                     }
@@ -661,18 +790,31 @@ struct ContentView: View {
                     }
                 }
 
-                // Row 4: graph toggle (pro)  |  GOVERN WHAT (enterprise)
+                // Row 4: MENU BAR ICON + graph toggle (pro)  |  GOVERN WHAT (enterprise)
                 GridRow {
-                    if pro {
-                        Toggle(isOn: $model.config.menubar_graph) {
-                            Text("Activity graph in the menu bar")
-                                .font(.system(size: 13)).foregroundStyle(p.ink)
+                    VStack(alignment: .leading, spacing: 8) {
+                        sectionLabelPlain("MENU BAR ICON")
+                        Picker("", selection: $model.config.menubar_icon) {
+                            Text("Colour").tag("color")
+                            Text("Mono").tag("mono")
                         }
-                        .toggleStyle(.switch)
-                        .controlSize(.mini)
-                        .tint(model.state.color)
-                    } else {
-                        Spacer().gridCellUnsizedAxes(.vertical)
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        Text(model.config.menubar_icon == "mono"
+                             ? "Black or white to match the bar. A hollow dot "
+                               + "means escalate, a filled one means deny."
+                             : "The mark in the gate's colour.")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(p.ghost)
+                        if pro {
+                            Toggle(isOn: $model.config.menubar_graph) {
+                                Text("Activity graph in the menu bar")
+                                    .font(.system(size: 13)).foregroundStyle(p.ink)
+                            }
+                            .toggleStyle(.switch)
+                            .controlSize(.mini)
+                            .tint(model.state.color)
+                        }
                     }
 
                     if enterprise {
@@ -680,22 +822,36 @@ struct ContentView: View {
                             VStack(alignment: .leading, spacing: 8) {
                                 ForEach(model.config.db_paths, id: \.self) { path in
                                     HStack {
-                                        Text(path)
-                                            .font(.system(size: 11, design: .monospaced))
-                                            .foregroundStyle(p.faint)
-                                            .lineLimit(1)
-                                            .truncationMode(.head)
-                                        Spacer()
-                                        if model.config.db_paths.count > 1 {
-                                            Button {
-                                                model.removeSource(path)
-                                            } label: {
-                                                Image(systemName: "xmark")
-                                                    .font(.system(size: 8, weight: .medium))
+                                        Circle()
+                                            .fill(model.trailFaults[path] == nil
+                                                  ? GateState.green.color : GateState.red.color)
+                                            .frame(width: 6, height: 6)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(path)
+                                                .font(.system(size: 11, design: .monospaced))
+                                                .foregroundStyle(p.faint)
+                                                .lineLimit(1)
+                                                .truncationMode(.head)
+                                            if let note = model.trailFaults[path] ?? model.trailNotes[path] {
+                                                Text(note)
+                                                    .font(.system(size: 10))
+                                                    .foregroundStyle(model.trailFaults[path] == nil
+                                                                     ? p.ghost : GateState.red.color)
+                                                    .lineLimit(2)
                                             }
-                                            .buttonStyle(.plain)
-                                            .foregroundStyle(p.ghost)
                                         }
+                                        Spacer()
+                                        // Any source can go, including the last
+                                        // one: the engine config and discovery
+                                        // bring the real trail back on launch.
+                                        Button {
+                                            model.removeSource(path)
+                                        } label: {
+                                            Image(systemName: "xmark")
+                                                .font(.system(size: 8, weight: .medium))
+                                        }
+                                        .buttonStyle(.plain)
+                                        .foregroundStyle(p.ghost)
                                     }
                                 }
                                 HStack(spacing: 14) {
@@ -722,38 +878,34 @@ struct ContentView: View {
                     }
                 }
 
-                // Row 5: WEBKIT GOVERNANCE  |  status
+                // Row 5: SAFARI  |  network filter status
+                //
+                // WebKit traffic is governed by the network filter and by
+                // nothing else. This row used to carry its own toggle, bound
+                // to `config.webkitGovernance`, which no code path reads, and
+                // it showed a green "Active" from that flag alone. With no
+                // filter installed that was a status display failing open.
+                // The dot and text now come from the same system probe as the
+                // NETWORK FILTER row, so the two can never disagree.
                 GridRow {
                     VStack(alignment: .leading, spacing: 8) {
-                        sectionLabelPlain("WEBKIT GOVERNANCE")
-                        Toggle(isOn: $model.config.webkitGovernance) {
-                            Text("Govern WebKit actions")
-                                .font(.system(size: 13)).foregroundStyle(p.ink)
-                        }
-                        .toggleStyle(.switch)
-                        .controlSize(.mini)
-                        .tint(model.state.color)
-                        Text("Intercepts AI traffic from Safari, Mail, and all "
-                             + "WebKit-based apps. Requires Network Extension.")
+                        sectionLabelPlain("SAFARI")
+                        Text("An agent that drives Safari through its MCP "
+                             + "server (safaridriver --mcp) is governed by "
+                             + "vaara-mcp-proxy. The hostname filter for Safari, "
+                             + "Mail and WebKit apps works only in a build with "
+                             + "a signed system extension; the dot shows whether "
+                             + "it is loaded.")
                             .font(.system(size: 9))
                             .foregroundStyle(p.ghost)
                     }
 
                     VStack(alignment: .leading, spacing: 8) {
-                        if model.config.webkitGovernance {
-                            HStack(spacing: 6) {
-                                Circle().fill(Color.green).frame(width: 7, height: 7)
-                                Text("Active")
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(p.ghost)
-                            }
-                        } else {
-                            HStack(spacing: 6) {
-                                Circle().fill(Color.gray).frame(width: 7, height: 7)
-                                Text("Inactive")
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(p.ghost)
-                            }
+                        HStack(spacing: 6) {
+                            Circle().fill(filterDotColor).frame(width: 7, height: 7)
+                            Text(systemExtension.state == .active ? "Active" : "Not active")
+                                .font(.system(size: 11))
+                                .foregroundStyle(p.ghost)
                         }
                     }
                 }
@@ -1106,6 +1258,7 @@ struct ContentView: View {
         HStack(spacing: 14) {
             footerTab("Now", .overview)
             footerTab("History", .history)
+            footerTab("Receipts", .receipts)
             footerTab("Anchor", .anchor)
             footerTab("Setup", .setup)
             footerTab("Settings", .settings)
@@ -1133,6 +1286,7 @@ struct ContentView: View {
         Button(label) {
             withAnimation(.easeInOut(duration: 0.15)) {
                 selectedAgent = nil
+                openReceipt = nil
                 screen = target
             }
         }
@@ -1173,6 +1327,43 @@ private struct AgentRow: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 7)
+    }
+}
+
+private struct ReceiptRow: View {
+    let entry: ReceiptEntry
+    let p: Palette
+
+    private var color: Color {
+        switch entry.receipt.decision {
+        case "block":    return GateState.red.color
+        case "escalate": return GateState.yellow.color
+        default:         return GateState.green.color
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: entry.check.ok ? "checkmark.seal.fill" : "xmark.octagon.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(entry.check.ok ? GateState.green.color : GateState.red.color)
+                .help(entry.check.ok ? "Verified" : entry.check.detail)
+            Text(entry.receipt.decision)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(color)
+                .frame(width: 58, alignment: .leading)
+            Text(entry.receipt.tool)
+                .font(.system(size: 12))
+                .foregroundStyle(p.ink)
+                .lineLimit(1).truncationMode(.middle)
+            Spacer()
+            Text(String(entry.receipt.decidedAt.dropFirst(11).prefix(8)))
+                .font(.system(size: 10.5, design: .monospaced))
+                .foregroundStyle(p.ghost)
+        }
+        .contentShape(Rectangle())
+        .padding(.horizontal, 20)
+        .padding(.vertical, 6)
     }
 }
 

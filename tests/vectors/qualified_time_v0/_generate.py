@@ -30,7 +30,7 @@ from asn1crypto import x509 as asn1_x509
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from vaara.attestation.receipt import (
     attach_existence_proof,
@@ -59,9 +59,10 @@ def _ca(cn: str):
     return key, cert
 
 
-def _tsa_issued_by(ca_key, ca_cert, cn: str):
+def _tsa_issued_by(ca_key, ca_cert, cn: str, eku=(ExtendedKeyUsageOID.TIME_STAMPING,)):
+    """Issue a TSA certificate; ``eku=None`` leaves out the extended key usage."""
     key = ec.generate_private_key(ec.SECP256R1())
-    cert = (
+    builder = (
         x509.CertificateBuilder()
         .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)]))
         .issuer_name(ca_cert.subject)
@@ -69,12 +70,17 @@ def _tsa_issued_by(ca_key, ca_cert, cn: str):
         .serial_number(x509.random_serial_number())
         .not_valid_before(datetime.datetime(2020, 1, 1))
         .not_valid_after(datetime.datetime(2035, 1, 1))
-        .sign(ca_key, hashes.SHA256())
     )
+    if eku is not None:
+        builder = builder.add_extension(x509.ExtendedKeyUsage(list(eku)), critical=True)
+    cert = builder.sign(ca_key, hashes.SHA256())
     return key, cert.public_bytes(serialization.Encoding.DER)
 
 
-def _issue_token(digest: bytes, key, cert_der: bytes) -> bytes:
+def _issue_token(
+    digest: bytes, key, cert_der: bytes, content_type_attr: str | None = "tst_info"
+) -> bytes:
+    """Sign a token; ``content_type_attr=None`` leaves out the content-type attribute."""
     cert_asn1 = asn1_x509.Certificate.load(cert_der)
     tst = tsp.TSTInfo({
         "version": 1,
@@ -87,13 +93,16 @@ def _issue_token(digest: bytes, key, cert_der: bytes) -> bytes:
         "gen_time": GEN_TIME,
     })
     tst_der = tst.dump()
-    attrs = cms.CMSAttributes([
-        cms.CMSAttribute({"type": "content_type", "values": ["tst_info"]}),
-        cms.CMSAttribute({
-            "type": "message_digest",
-            "values": [hashlib.sha256(tst_der).digest()],
-        }),
-    ])
+    attr_list = []
+    if content_type_attr is not None:
+        attr_list.append(
+            cms.CMSAttribute({"type": "content_type", "values": [content_type_attr]})
+        )
+    attr_list.append(cms.CMSAttribute({
+        "type": "message_digest",
+        "values": [hashlib.sha256(tst_der).digest()],
+    }))
+    attrs = cms.CMSAttributes(attr_list)
     signature = key.sign(attrs.dump(), ec.ECDSA(hashes.SHA256()))
     signer_info = cms.SignerInfo({
         "version": "v1",
@@ -183,6 +192,31 @@ def main() -> int:
         ),
     })
 
+    # signer issued by the pinned CA but carries no extended key usage: the CA
+    # may issue other certificates, so this one cannot qualify a time.
+    no_eku_key, no_eku_der = _tsa_issued_by(
+        trusted_ca_key, trusted_ca_cert, "Pinned CA, no EKU", eku=None
+    )
+    cases.append({
+        "name": "unqualified_signer_without_eku",
+        "record": attach_existence_proof(
+            _record("tool:search"), tsa_url="local",
+            transport=_minter(no_eku_key, no_eku_der),
+        ),
+    })
+
+    # signer issued by the pinned CA for code signing, not timestamping.
+    cs_key, cs_der = _tsa_issued_by(
+        trusted_ca_key, trusted_ca_cert, "Pinned CA, code signing",
+        eku=(ExtendedKeyUsageOID.CODE_SIGNING,),
+    )
+    cases.append({
+        "name": "unqualified_signer_wrong_eku",
+        "record": attach_existence_proof(
+            _record("tool:fetch"), tsa_url="local", transport=_minter(cs_key, cs_der)
+        ),
+    })
+
     # token timestamps a different value, then stapled to this record.
     base = _record("tool:list")
     wrong = _issue_token(hashlib.sha256(b"not the record").digest(), tsa_key, tsa_der)
@@ -210,6 +244,28 @@ def main() -> int:
     raw[-1] ^= 0xFF
     malformed["existenceProof"]["token"] = base64.b64encode(bytes(raw)).decode("ascii")
     cases.append({"name": "neg_malformed_token", "record": malformed})
+
+    # A token signed by the pinned TSA over the right digest, but whose signed
+    # content-type attribute names id-data, or is missing. RFC 5652 5.3 makes
+    # the attribute mandatory and RFC 3161 2.4.2 fixes it to id-ct-TSTInfo, so
+    # the signature does not cover a TSTInfo and the token is not evidence.
+    for name, sub, ct in (
+        ("neg_content_type_not_tstinfo", "tool:move", "data"),
+        ("neg_content_type_missing", "tool:copy", None),
+    ):
+        base = _record(sub)
+        digest = existence_record_digest(base)
+        token = _issue_token(
+            bytes.fromhex(digest.split(":", 1)[1]), tsa_key, tsa_der, content_type_attr=ct
+        )
+        stapled = dict(base)
+        stapled["existenceProof"] = {
+            "backend": "rfc3161-eidas-qualified",
+            "hashAlgorithm": "sha256",
+            "recordDigest": digest,
+            "token": base64.b64encode(token).decode("ascii"),
+        }
+        cases.append({"name": name, "record": stapled})
 
     # Ground truth: the reference verifier, pinning the trusted-list CA. The
     # independent checker must reproduce exactly these verdicts.

@@ -9,7 +9,7 @@ declares, which is where the disagreements were:
 
 * ``OutcomeRequest`` declared ``description`` where the server takes
   ``notes``, and the server model is ``extra="forbid"``, so the documented
-  call was a 422;
+  call was a validation error;
 * ``reportOutcome`` was typed as returning ``{ok: true}`` from an endpoint
   that answers 204 with no body;
 * ``ScoreRequest`` had no ``tenant_id``, so a TypeScript caller could not
@@ -45,7 +45,7 @@ CLIENT_TS = Path(__file__).resolve().parents[1] / "clients" / "ts" / "src" / "cl
 
 def _interface_fields(name: str) -> set[str]:
     """Field names declared on a TypeScript interface in types.ts."""
-    source = TYPES_TS.read_text()
+    source = TYPES_TS.read_text(encoding="utf-8")
     match = re.search(
         rf"export interface {name} \{{(.*?)\n\}}", source, re.DOTALL,
     )
@@ -68,7 +68,7 @@ def test_outcome_request_field_names_match_the_server():
         S.OutcomeRequest.model_fields
     ), (
         "types.ts declares a field OutcomeRequest does not accept; the model "
-        "is extra=forbid, so sending it is a 422"
+        "is extra=forbid, so sending it is a 400 invalid_request"
     )
 
 
@@ -100,7 +100,7 @@ def test_the_documented_outcome_call_is_accepted(client):
     for optional in fields - {"action_id", "outcome_severity"}:
         payload[optional] = "it went fine"
     response = client.post("/v1/score/outcome", json=payload)
-    assert response.status_code != 422, response.text
+    assert response.status_code == 204, response.text
 
 
 def test_a_scored_request_with_a_tenant_is_accepted(client):
@@ -142,7 +142,7 @@ def test_risk_block_declares_every_field_the_server_sends(client):
 
 def test_report_outcome_is_not_typed_as_returning_a_body():
     """/v1/score/outcome answers 204; the client returned undefined as {ok:true}."""
-    source = CLIENT_TS.read_text()
+    source = CLIENT_TS.read_text(encoding="utf-8")
     signature = re.search(r"async reportOutcome\([^)]*\):\s*([^{]+)\{", source)
     assert signature, "client.ts has no reportOutcome"
     assert "ok: true" not in signature.group(1), (
@@ -173,7 +173,7 @@ def test_openapi_yaml_matches_the_server_models(name):
     yaml = pytest.importorskip("yaml")
 
     spec = yaml.safe_load(
-        (Path(__file__).resolve().parents[1] / "docs" / "openapi.yaml").read_text()
+        (Path(__file__).resolve().parents[1] / "docs" / "openapi.yaml").read_text(encoding="utf-8")
     )
     documented = set(
         (spec["components"]["schemas"][name].get("properties") or {})
@@ -186,10 +186,10 @@ def test_openapi_yaml_matches_the_server_models(name):
 
 
 def test_every_path_the_client_calls_exists_on_the_server(client):
-    paths = set(re.findall(r'"(/v1/[^"`]*)"', CLIENT_TS.read_text()))
+    paths = set(re.findall(r'"(/v1/[^"`]*)"', CLIENT_TS.read_text(encoding="utf-8")))
     paths |= {
         p.replace("${encodeURIComponent(actionId)}", "{action_id}")
-        for p in re.findall(r"`(/v1/[^`]*)`", CLIENT_TS.read_text())
+        for p in re.findall(r"`(/v1/[^`]*)`", CLIENT_TS.read_text(encoding="utf-8"))
     }
     served = set(client.app.openapi()["paths"])
     assert paths <= served, f"client calls routes the server does not serve: {paths - served}"

@@ -1,0 +1,147 @@
+[
+  {
+    "record_id": "51c1ac82-16af-5f4a-a6c6-36e833eb7684",
+    "action_id": "a7c6852a-b19b-5b26-a5ae-7dff1438928b",
+    "event_type": "action_requested",
+    "timestamp": 1780000006.0,
+    "agent_id": "agent:vector",
+    "tool_name": "tx.transfer",
+    "data": {
+      "parameters": {
+        "amount": 50000,
+        "to": "acct:9"
+      },
+      "arguments_salt": "373b6418a4a6d093ad685137692b5ed7",
+      "arguments_commitment": "sha256:5d3910b8bc13b361f29c71d70106d3828df4be3777c0f1a375299267fc29fff0",
+      "context": {},
+      "action_category": "financial",
+      "reversibility": "irreversible",
+      "blast_radius": "shared",
+      "urgency": "irrevocable",
+      "base_risk_score": 0.875,
+      "agent_confidence": null,
+      "session_id": "",
+      "parent_action_id": null,
+      "sequence_position": 0
+    },
+    "regulatory_articles": [
+      {
+        "domain": "eu_ai_act",
+        "article": "Article 12(1)",
+        "requirement": "Automatic recording of events (logging capabilities)",
+        "how_satisfied": "Every action request is recorded with full context before processing"
+      },
+      {
+        "domain": "dora",
+        "article": "Article 10(1)",
+        "requirement": "Mechanisms to promptly detect anomalous activities, including ICT-related incidents",
+        "how_satisfied": "All agent actions are logged as events for incident detection"
+      }
+    ],
+    "previous_hash": "",
+    "record_hash": "af4d707df8fc7230a772141670b3e3a17e633395c906340f6e605eaa9ec1e7d9",
+    "system_operation": "logging_intake",
+    "data_usage": "tool_args+context",
+    "decision_making": "n/a",
+    "limitations": null,
+    "tenant_id": "",
+    "chain_version": 2
+  },
+  {
+    "record_id": "a4f16a67-ab60-573a-9f1f-6acb3c4f2a2e",
+    "action_id": "a7c6852a-b19b-5b26-a5ae-7dff1438928b",
+    "event_type": "risk_scored",
+    "timestamp": 1780000007.0,
+    "agent_id": "agent:vector",
+    "tool_name": "tx.transfer",
+    "data": {
+      "point_estimate": 0.5,
+      "conformal_lower": 0.4,
+      "conformal_upper": 0.6,
+      "signals": {},
+      "calibration_size": 0,
+      "effective_alpha": 0.1,
+      "bucket_category": null
+    },
+    "regulatory_articles": [
+      {
+        "domain": "eu_ai_act",
+        "article": "Article 9(2)(a)",
+        "requirement": "Risk management system shall identify and analyse known and reasonably foreseeable risks",
+        "how_satisfied": "Adaptive risk scoring with conformal prediction intervals quantifies risk for every action"
+      },
+      {
+        "domain": "eu_ai_act",
+        "article": "Article 9(6)",
+        "requirement": "High-risk AI systems shall be tested to identify the most appropriate and targeted risk management measures",
+        "how_satisfied": "Conformal calibration provides distribution-free coverage guarantees on risk estimates"
+      }
+    ],
+    "previous_hash": "af4d707df8fc7230a772141670b3e3a17e633395c906340f6e605eaa9ec1e7d9",
+    "record_hash": "4efb7ad315eb8313f527d4920529898137c884f3304adbb52c276e04bd42eb6c",
+    "system_operation": "scoring",
+    "data_usage": "tool_args+history+policy",
+    "decision_making": "heuristic_score",
+    "limitations": null,
+    "tenant_id": "",
+    "chain_version": 2
+  },
+  {
+    "record_id": "10c8057c-2e76-58a7-be03-5858611468b6",
+    "action_id": "a7c6852a-b19b-5b26-a5ae-7dff1438928b",
+    "event_type": "action_blocked",
+    "timestamp": 1780000008.0,
+    "agent_id": "agent:vector",
+    "tool_name": "tx.transfer",
+    "data": {
+      "decision": "deny",
+      "reason": "vector: policy returned deny",
+      "risk_score": 0.5,
+      "policy_id": "scorer:_FixedScorer",
+      "violation_type": "risk_threshold",
+      "policy_digest": "sha256:dbb9e45494afea14faf18f61fc29821a4d011d1d980f85e8ac4d0e681b3ebcdd",
+      "policy_state": {
+        "schema": "vaara.engine-policy/v0",
+        "vaara": "0.0.0+vectors",
+        "enforce": true,
+        "scorer": {
+          "scorer": "_FixedScorer"
+        },
+        "authority": {
+          "budget": 3.0,
+          "low": 1.0,
+          "half_life_s": 3600.0,
+          "floor": 0.3,
+          "enabled": true
+        }
+      },
+      "enforcement": "could_block",
+      "cage": {
+        "driver": "none",
+        "confirmed": false
+      }
+    },
+    "regulatory_articles": [
+      {
+        "domain": "eu_ai_act",
+        "article": "Article 9(5)(a)",
+        "requirement": "Elimination or reduction of identified risks as far as technically feasible through adequate design and development",
+        "how_satisfied": "High-risk actions are automatically blocked with full audit trail"
+      },
+      {
+        "domain": "dora",
+        "article": "Article 9(1)",
+        "requirement": "Continuous monitoring and control of ICT systems, with security tools, policies and procedures that minimise ICT risk",
+        "how_satisfied": "Automated blocking of high-risk actions with full incident trail"
+      }
+    ],
+    "previous_hash": "4efb7ad315eb8313f527d4920529898137c884f3304adbb52c276e04bd42eb6c",
+    "record_hash": "99eadae9c7b44873622c9cf7ed400d367ca6eaa16539702fa952f43d6d5f2f10",
+    "system_operation": "blocking",
+    "data_usage": "risk_score+thresholds",
+    "decision_making": "threshold_match",
+    "limitations": null,
+    "tenant_id": "",
+    "chain_version": 2
+  }
+]

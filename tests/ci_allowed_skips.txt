@@ -1,0 +1,45 @@
+# Skip reasons the CI `tests` matrix may print. The matrix installs the base
+# package plus fastapi, uvicorn and httpx and nothing else, on purpose, so a
+# test that needs another extra skips here and runs in the job that installs
+# it (signing extras, adapter, framework, guardrail and llm-guard contracts,
+# classifier).
+#
+# One Python regular expression per line, matched against the reason pytest
+# prints after `SKIPPED [n] path:line: `. A skip whose reason matches none of
+# these fails the job: it means a test stopped running and nothing said so.
+could not import '(rfc8785|yaml|cbor2|asn1crypto|rebuff|joblib|dilithium_py|PIL\.Image|pycose)'
+attestation extra not installed
+the attestation extra
+record digest needs the attestation extra
+qualified existence proof needs the timeanchor extra
+tsa check needs the timeanchor extra
+AdversarialClassifier requires vaara\[ml\] extras
+(trained|stacked) gate needs the ml extra
+mc dropout gate needs torch
+reportlab not installed
+^pip install (rebuff|openai-agents|langchain-core|google-cloud-modelarmor|boto3|azure-ai-contentsafety|guardrails-ai|nemoguardrails|crewai|llm-guard)$
+^proxy deps not installed$
+(inference-proxy|console) deps not installed: no rfc8785
+rfc8785 not installed in this environment
+pq_hybrid_v0 needs an optional dependency not installed
+pq extra not installed
+^environment skips \d+ suites against \d+ on the page
+^no case file: the harness ships without one
+^tomllib is Python 3\.11\+$
+^examples need rich$
+^no Codex binary$
+^no Gemini CLI binary$
+^no Copilot CLI binary$
+^no Claude Code binary$
+^the OS layer end-to-end test runs in the os-layer-e2e job$
+# The CDDL schema check needs the cddl tool (cargo install cddl); no CI job
+# installs it yet, so it runs on a developer machine before a draft commit.
+^the cddl tool is not installed$
+# The matrix checks out a shallow clone; the one test that reads a historical
+# tree skips there and runs wherever the full history is checked out.
+^shallow clone cannot see the tree at that commit$
+# A documented Python block that imports a third-party package (a guardrail
+# SDK, langchain_core, numpy, dilithium_py) runs in the job that installs it;
+# here it is compiled and skipped. A missing vaara module still fails.
+^docs/[\w.]+\.md under '[^']+' needs \w+, not installed here$
+^vaara(\.\w+)+ needs \w+, an extra not installed here$

@@ -1,6 +1,6 @@
 {
-  "version": "0.1",
-  "description": "Layer-1 regex deny patterns for the Vaara Claude Code plugin. Covers shell and web input plus file-mutation tools (Write, Edit, NotebookEdit), so persistence and remote-code paths are caught on the file surface as well as the shell surface.",
+  "version": "0.3",
+  "description": "Layer-1 regex deny patterns for the Vaara plugin. Covers shell and web input, file mutation (Write, Edit, NotebookEdit), and the agent's meta-actions: subagent spawn (Agent, Task, Workflow), scheduling (CronCreate), remote execution (RemoteTrigger), cross-session messaging (SendMessage) and writes to the harness's own configuration. Rules with match_any fire on any call to the tool; unless_env names a variable that, set to 1, lifts the rule for a deliberate exception. Rules with any_field false only apply by tool name; their pattern reads a specific field and means nothing over arbitrary arguments. The PreToolUse and PostToolUse matchers are a catch-all: enumerating tool names missed the subagent tool when it was renamed to Agent, and missed Read, CronDelete, TaskStop, ExitWorktree and ReadMcpResourceTool besides. An unnamed tool is now seen and recorded rather than invisible, and the rules decide. The cost is a trail row for every tool call, read-only ones included.",
   "rules": [
     {
       "id": "ssrf_cloud_metadata_ipv4",
@@ -83,6 +83,7 @@
         "command"
       ],
       "pattern": "\\brm\\s+(-[rRf]+|--recursive|--force)[^|;]*\\s+/(\\s|$|;|&|\\|)",
+      "shell_syntax": true,
       "message": "rm -rf / or equivalent \u2014 non-recoverable filesystem destruction."
     },
     {
@@ -174,8 +175,33 @@
       "fields": [
         "file_path"
       ],
-      "pattern": "\\.git/hooks/(pre-commit|post-commit|pre-push|post-checkout|post-merge|prepare-commit-msg)",
+      "pattern": "\\.git/hooks/(applypatch-msg|pre-applypatch|post-applypatch|pre-commit|pre-merge-commit|prepare-commit-msg|commit-msg|post-commit|pre-rebase|post-checkout|post-merge|pre-push|pre-receive|update|proc-receive|post-receive|post-update|reference-transaction|push-to-checkout|pre-auto-gc|post-rewrite|sendemail-validate|fsmonitor-watchman|p4-changelist|p4-prepare-changelist|p4-post-changelist|p4-pre-submit|post-index-change)$",
       "message": "Write to a git hook - executes on ordinary git commands and rides the repo to other machines."
+    },
+    {
+      "id": "git_config_file_write",
+      "tools": [
+        "Write",
+        "Edit"
+      ],
+      "fields": [
+        "file_path"
+      ],
+      "pattern": "(^|/)(\\.git/config(\\.worktree)?|\\.gitconfig|\\.config/git/config)$",
+      "unless_env": "VAARA_ALLOW_GIT_EXEC_CONFIG",
+      "message": "Write to a git config file - core.fsmonitor, core.pager, diff and filter drivers set there run on ordinary git commands. Set VAARA_ALLOW_GIT_EXEC_CONFIG=1 for a deliberate edit."
+    },
+    {
+      "id": "git_exec_config_shell",
+      "tools": [
+        "Bash"
+      ],
+      "fields": [
+        "command"
+      ],
+      "pattern": "(^|[\\s;&|(])git(?:\\s+(?:-C|--git-dir|--work-tree|-c)(?:\\s+|=)\\S+)*(?:\\s+-c\\s*(?i:core\\.(?:fsmonitor|pager|editor|sshcommand|hookspath|askpass|gitproxy)|diff\\.external|sequence\\.editor|pager\\.[\\w.-]+|(?:diff|merge|filter)\\.[^\\s.=]+\\.(?:command|textconv|driver|clean|smudge|process)|uploadpack\\.packobjectshook)=(?!(?:cat|less|more|true|false|:|/dev/null)(?:[\\s\\\"';&|)]|$))|\\s+config(?:\\s+--(?:local|global|system|worktree)|\\s+(?:-f|--file)(?:\\s+|=)\\S+)*(?:\\s+(?:set|--add|--replace-all))?(?:\\s+--(?:local|global|system|worktree)|\\s+(?:-f|--file)(?:\\s+|=)\\S+)*\\s+[\\\"']?(?i:core\\.(?:fsmonitor|pager|editor|sshcommand|hookspath|askpass|gitproxy)|diff\\.external|sequence\\.editor|pager\\.[\\w.-]+|(?:diff|merge|filter)\\.[^\\s.=]+\\.(?:command|textconv|driver|clean|smudge|process)|uploadpack\\.packobjectshook)[\\\"']?\\s+(?![\\\"']?(?:cat|less|more|true|false|:|/dev/null)(?:[\\s\\\"';&|)]|$))\\S)|(>>?|\\btee(\\s+-a)?|\\bsed\\s+-i\\S*|\\bln\\s+-\\S*s\\S*)[^|;&\\n]*\\.git/(config\\b|hooks/)",
+      "unless_env": "VAARA_ALLOW_GIT_EXEC_CONFIG",
+      "message": "Sets a git config key that runs a program (core.fsmonitor, core.pager, core.editor, core.sshCommand, core.hooksPath, diff and filter drivers) or writes into .git/config or .git/hooks - it executes on ordinary git commands. Set VAARA_ALLOW_GIT_EXEC_CONFIG=1 for a deliberate change."
     },
     {
       "id": "cron_persistence_write",
@@ -228,7 +254,7 @@
         "new_string",
         "new_source"
       ],
-      "pattern": "(bash\\s+-i\\s*>&\\s*/dev/tcp/|nc\\s+(-[a-z]*e[a-z]*\\s+)|socket\\.socket\\([^)]*\\)[\\s\\S]{0,120}connect\\()",
+      "pattern": "(bash\\s+-i\\s*>&\\s*/dev/tcp/|nc\\s+(-[a-z]*e[a-z]*\\s+)|socket\\.socket\\([^)]*\\)[\\s\\S]{0,200}connect\\([\\s\\S]{0,300}(dup2\\(|pty\\.spawn\\(|std(in|out|err)\\s*=\\s*\\w+(\\.fileno\\(\\))?\\s*[,)]))",
       "message": "File content contains a reverse-shell pattern - hands an outside party an interactive session."
     },
     {
@@ -254,6 +280,315 @@
       ],
       "pattern": "/etc/(shadow|gshadow|passwd|sudoers)(\\.d/[^/]*)?$",
       "message": "Write to a system credential or privilege file - changes who can log in or escalate."
+    },
+    {
+      "id": "agent_spawn",
+      "tools": [
+        "Agent",
+        "Task"
+      ],
+      "match_any": true,
+      "unless_env": "VAARA_ALLOW_SPAWN",
+      "message": "Subagent spawn. Operator policy is no subagents; set VAARA_ALLOW_SPAWN=1 for a named job."
+    },
+    {
+      "id": "workflow_fanout",
+      "tools": [
+        "Workflow"
+      ],
+      "match_any": true,
+      "unless_env": "VAARA_ALLOW_SPAWN",
+      "message": "Workflow fan-out spawns many agents in one call; set VAARA_ALLOW_SPAWN=1 for a named job."
+    },
+    {
+      "id": "remote_trigger_execute",
+      "tools": [
+        "RemoteTrigger"
+      ],
+      "fields": [
+        "action"
+      ],
+      "pattern": "^(create|update|run|create_webhook_trigger)$",
+      "unless_env": "VAARA_ALLOW_REMOTE",
+      "message": "Creates or runs a cloud agent: remote execution and data egress. Set VAARA_ALLOW_REMOTE=1 to permit.",
+      "any_field": false
+    },
+    {
+      "id": "cron_durable_job",
+      "tools": [
+        "CronCreate"
+      ],
+      "fields": [
+        "durable"
+      ],
+      "pattern": "^true$",
+      "unless_env": "VAARA_ALLOW_SCHEDULE",
+      "message": "A durable scheduled job survives the session. Set VAARA_ALLOW_SCHEDULE=1 to permit; session-only jobs pass.",
+      "any_field": false
+    },
+    {
+      "id": "cross_session_message",
+      "tools": [
+        "SendMessage"
+      ],
+      "fields": [
+        "to"
+      ],
+      "pattern": "^(?!main$).+",
+      "unless_env": "VAARA_ALLOW_XSESSION",
+      "message": "Message to another agent or session leaves the governed session. Set VAARA_ALLOW_XSESSION=1 to permit.",
+      "any_field": false
+    },
+    {
+      "id": "shell_upload_egress",
+      "tools": [
+        "Bash"
+      ],
+      "fields": [
+        "command"
+      ],
+      "pattern": "\\b(curl|wget)\\b(?=[^|]*\\s(?:-d|--data(?:-\\w+)?|--upload-file|-T|-F|--form|--json)\\b)(?=[^|]*https?://(?!localhost|127\\.|0\\.0\\.0\\.0|\\[::1\\]))",
+      "message": "Outbound upload to a remote host from the shell."
+    },
+    {
+      "id": "shell_copy_egress",
+      "tools": [
+        "Bash"
+      ],
+      "fields": [
+        "command"
+      ],
+      "pattern": "\\b(scp|rsync|sftp)\\b[^|\\n]*\\s(?:[^\\s@]+@)?[^\\s/@:][^\\s:]*:(?!//)",
+      "shell_syntax": true,
+      "message": "Copy to a remote host from the shell."
+    },
+    {
+      "id": "trail_file_write",
+      "tools": [
+        "Write",
+        "Edit",
+        "NotebookEdit"
+      ],
+      "fields": [
+        "file_path",
+        "notebook_path"
+      ],
+      "pattern": "(^|/)\\.vaara/(.*/)?([^/]*\\.db(-wal|-shm|-journal)?$|receipts/|keys/|sources\\.json$|session-receipts\\.jsonl$)|(^|/)vaara_audit\\.db(-wal|-shm|-journal)?$",
+      "unless_env": "VAARA_ALLOW_TRAIL_EDIT",
+      "message": "Writes Vaara's own evidence: a trail database, a signed receipt, the receipt signing key or the trail index. An agent that can rewrite the record of what it did is not governed by it. Set VAARA_ALLOW_TRAIL_EDIT=1 for a deliberate edit."
+    },
+    {
+      "id": "trail_shell_tamper",
+      "tools": [
+        "Bash"
+      ],
+      "fields": [
+        "command"
+      ],
+      "pattern": "(^|[\\s;&|(])(sed\\s+-i|tee|cp|mv|rm|rmdir|unlink|shred|chmod|chown|chattr|truncate|ln|install|rsync|dd)\\b(?=[^|\\n]*(?:\\.vaara(?:/(?:[^\\s'\"|;&<>()]*/)?(?:[^\\s'\"|;&<>()]*\\.db(?:-wal|-shm|-journal)?|receipts|keys|trail|llm-proxy|claude-code|proxy|sources\\.json|session-receipts\\.jsonl|\\*)(?=[/\\s'\"|;&<>)]|$)|/?(?=[\\s'\"|;&<>)]|$))|(?:^|[/\\s'\"=])vaara_audit\\.db(?:-wal|-shm|-journal)?(?=[\\s'\"|;&<>)]|$)))|>+\\s*['\\\"]?[^\\s'\"|;&<>()]*(?:\\.vaara(?:/(?:[^\\s'\"|;&<>()]*/)?(?:[^\\s'\"|;&<>()]*\\.db(?:-wal|-shm|-journal)?|receipts|keys|trail|llm-proxy|claude-code|proxy|sources\\.json|session-receipts\\.jsonl|\\*)(?=[/\\s'\"|;&<>)]|$)|/?(?=[\\s'\"|;&<>)]|$))|(?:^|[/\\s'\"=])vaara_audit\\.db(?:-wal|-shm|-journal)?(?=[\\s'\"|;&<>)]|$))|\\bfind\\b(?=[^|\\n]*(?:\\.vaara(?:/(?:[^\\s'\"|;&<>()]*/)?(?:[^\\s'\"|;&<>()]*\\.db(?:-wal|-shm|-journal)?|receipts|keys|trail|llm-proxy|claude-code|proxy|sources\\.json|session-receipts\\.jsonl|\\*)(?=[/\\s'\"|;&<>)]|$)|/?(?=[\\s'\"|;&<>)]|$))|(?:^|[/\\s'\"=])vaara_audit\\.db(?:-wal|-shm|-journal)?(?=[\\s'\"|;&<>)]|$)))(?=[^|\\n]*\\s-(delete|exec)\\b)",
+      "unless_env": "VAARA_ALLOW_TRAIL_EDIT",
+      "message": "Deletes, moves, overwrites or truncates Vaara's trail, receipts or signing key from the shell. Set VAARA_ALLOW_TRAIL_EDIT=1 for a deliberate edit."
+    },
+    {
+      "id": "trail_sql_tamper",
+      "tools": [
+        "Bash"
+      ],
+      "fields": [
+        "command"
+      ],
+      "pattern": "(?i)\\b(sqlite3|python3?|perl|ruby|node)\\b(?=[^|\\n]*(?:\\.vaara(?:/(?:[^\\s'\"|;&<>()]*/)?(?:[^\\s'\"|;&<>()]*\\.db(?:-wal|-shm|-journal)?|receipts|keys|trail|llm-proxy|claude-code|proxy|sources\\.json|session-receipts\\.jsonl|\\*)(?=[/\\s'\"|;&<>)]|$)|/?(?=[\\s'\"|;&<>)]|$))|(?:^|[/\\s'\"=])vaara_audit\\.db(?:-wal|-shm|-journal)?(?=[\\s'\"|;&<>)]|$)))(?=[^|\\n]*(\\b(delete\\s+from|update\\s+\\w+\\s+set|drop\\s+(table|trigger|index|view)|insert\\s+(or\\s+\\w+\\s+)?into|replace\\s+into|alter\\s+table|writable_schema|vacuum)\\b|['\\\"]([rwax]b?\\+|[wax][bt]?\\+?)['\\\"]|mode\\s*=\\s*['\\\"][wax+]|write|truncate|unlink|rmtree|shutil|os\\.(remove|rename|replace)))",
+      "unless_env": "VAARA_ALLOW_TRAIL_EDIT",
+      "message": "Rewrites Vaara's trail through SQL or an interpreter: deletes, updates or drops records, or opens the database for writing. Reading the trail is allowed. Set VAARA_ALLOW_TRAIL_EDIT=1 for a deliberate edit."
+    },
+    {
+      "id": "trail_signing_key_read",
+      "tools": [
+        "Read",
+        "ReadMcpResourceTool",
+        "ReadMcpResourceDirTool"
+      ],
+      "fields": [
+        "file_path",
+        "uri"
+      ],
+      "pattern": "(^|/)\\.vaara/(.*/)?keys/[^/]+(?<!\\.pub)\\.(pem|key)$",
+      "unless_env": "VAARA_ALLOW_SECRET_READ",
+      "message": "Reads a key Vaara signs with (decision receipts, human approvals). Whoever holds it can sign receipts the engine never issued or approvals no human gave. Set VAARA_ALLOW_SECRET_READ=1 for a deliberate read."
+    },
+    {
+      "id": "trail_signing_key_shell_read",
+      "tools": [
+        "Bash"
+      ],
+      "fields": [
+        "command"
+      ],
+      "pattern": "\\b(cat|less|more|head|tail|base64|xxd|od|hexdump|strings|openssl|scp|curl|python3?|perl|ruby|node)\\b(?=[^|\\n]*\\.vaara/([^\\s'\"|;&<>()]*/)?keys/[^\\s'\"|;&<>()]*(?<!\\.pub)\\.(pem|key))",
+      "unless_env": "VAARA_ALLOW_SECRET_READ",
+      "message": "Reads or sends a key Vaara signs with (decision receipts, human approvals), from the shell. Set VAARA_ALLOW_SECRET_READ=1 for a deliberate read."
+    },
+    {
+      "id": "approval_file_write",
+      "tools": [
+        "Write",
+        "Edit",
+        "NotebookEdit"
+      ],
+      "fields": [
+        "file_path",
+        "notebook_path"
+      ],
+      "pattern": "(^|/)\\.vaara/approvals/",
+      "unless_env": "VAARA_ALLOW_APPROVAL_EDIT",
+      "message": "Writes into Vaara's approvals directory, where a human's answer to an escalated action lands. An agent that writes there is answering its own escalation. Set VAARA_ALLOW_APPROVAL_EDIT=1 for a deliberate edit."
+    },
+    {
+      "id": "approval_shell_write",
+      "tools": [
+        "Bash"
+      ],
+      "fields": [
+        "command"
+      ],
+      "pattern": "(^|[\\s;&|(])(sed\\s+-i|tee|cp|mv|rm|unlink|touch|ln|install|rsync|dd|chmod|chown|truncate)\\b(?=[^|\\n]*\\.vaara/approvals(?=[/\\s'\"|;&<>)*]|$))|>+\\s*['\\\"]?[^\\s'\"|;&<>()]*\\.vaara/approvals(?=[/\\s'\"|;&<>)*]|$)|\\b(python3?|perl|ruby|node)\\b(?=[^|\\n]*\\.vaara/approvals(?=[/\\s'\"|;&<>)*]|$))(?=[^|\\n]*(['\\\"]([rwax]b?\\+|[wax][bt]?\\+?)['\\\"]|mode\\s*=\\s*['\\\"][wax+]|write|unlink|rename|replace|shutil))",
+      "unless_env": "VAARA_ALLOW_APPROVAL_EDIT",
+      "message": "Writes, moves or removes a file in Vaara's approvals directory from the shell. Set VAARA_ALLOW_APPROVAL_EDIT=1 for a deliberate edit."
+    },
+    {
+      "id": "harness_config_write",
+      "tools": [
+        "Write",
+        "Edit",
+        "NotebookEdit"
+      ],
+      "fields": [
+        "file_path",
+        "notebook_path"
+      ],
+      "pattern": "(^|/)(\\.claude\\.json|\\.claude/(settings(\\.local)?\\.json|hooks/|skills/|agents/|plugins/|scheduled_tasks\\.json|CLAUDE\\.md)|\\.claude-plugin/|\\.vaara/(config\\.json|claude-code/)|\\.mcp\\.json$|\\.config/opencode/(opencode\\.jsonc?|plugins?/)|\\.opencode/plugins?/|\\.cursor/(hooks\\.json|hooks/|mcp\\.json)|\\.codex/(hooks\\.json|config\\.toml)|\\.gemini/settings\\.json|\\.copilot/(hooks/|config\\.json|settings(\\.local)?\\.json|mcp-config\\.json)|\\.github/(hooks|copilot)/)",
+      "unless_env": "VAARA_ALLOW_HARNESS_EDIT",
+      "message": "Writes the agent harness configuration (hooks, skills, settings, MCP). Set VAARA_ALLOW_HARNESS_EDIT=1 for a deliberate edit."
+    },
+    {
+      "id": "harness_config_shell_write",
+      "tools": [
+        "Bash"
+      ],
+      "fields": [
+        "command"
+      ],
+      "pattern": "(^|[\\s;&|])(sed\\s+-i|tee|cp|mv|rm|chmod|truncate|>+)[^|\\n]*(\\.claude\\.json|\\.claude/(settings(\\.local)?\\.json|hooks/|skills/|agents/|plugins/|scheduled_tasks\\.json|CLAUDE\\.md)|\\.claude-plugin/|\\.vaara/config|\\.mcp\\.json|\\.config/opencode/(opencode\\.jsonc?|plugins?/)|\\.opencode/plugins?/|\\.cursor/(hooks\\.json|hooks/|mcp\\.json)|\\.codex/(hooks\\.json|config\\.toml)|\\.gemini/settings\\.json|\\.copilot/(hooks/|config\\.json|settings(\\.local)?\\.json|mcp-config\\.json)|\\.github/(hooks|copilot)/)",
+      "unless_env": "VAARA_ALLOW_HARNESS_EDIT",
+      "message": "Rewrites the agent harness configuration from the shell. Set VAARA_ALLOW_HARNESS_EDIT=1 for a deliberate edit."
+    },
+    {
+      "id": "secret_material_read",
+      "tools": [
+        "Read",
+        "ReadMcpResourceTool",
+        "ReadMcpResourceDirTool"
+      ],
+      "fields": [
+        "file_path",
+        "uri"
+      ],
+      "pattern": "(^|/)\\.env(\\.[A-Za-z0-9_-]+)?$|(^|/)\\.ssh/id_[A-Za-z0-9_]+$|(^|/)id_rsa$|/\\.vaara/llm-proxy/seal\\.json$|(^|/)\\.aws/credentials$|(^|/)\\.netrc$|(^|/)\\.git-credentials$",
+      "unless_env": "VAARA_ALLOW_SECRET_READ",
+      "message": "Read of credential material (dotenv, private key, seal file, cloud or git credentials). Reading is not a mutation, so no other rule covers it. Set VAARA_ALLOW_SECRET_READ=1 for a deliberate read."
+    },
+    {
+      "id": "schedule_removal",
+      "tools": [
+        "CronDelete"
+      ],
+      "match_any": true,
+      "unless_env": "VAARA_ALLOW_SCHEDULE",
+      "message": "Deletes a scheduled job. Removing the operator's own sweep subtracts oversight, which the spawn-shaped rules do not cover. Set VAARA_ALLOW_SCHEDULE=1."
+    },
+    {
+      "id": "background_task_stop",
+      "tools": [
+        "TaskStop"
+      ],
+      "match_any": true,
+      "unless_env": "VAARA_ALLOW_SPAWN",
+      "message": "Stops a running background task or teammate. Same shape as deleting a schedule: it removes a watcher. Set VAARA_ALLOW_SPAWN=1."
+    },
+    {
+      "id": "worktree_discard_changes",
+      "tools": [
+        "ExitWorktree"
+      ],
+      "fields": [
+        "discard_changes"
+      ],
+      "pattern": "^true$",
+      "unless_env": "VAARA_ALLOW_DISCARD",
+      "message": "Removes a worktree and discards uncommitted work by explicit flag. A removal without the flag refuses on its own and is not denied here. Set VAARA_ALLOW_DISCARD=1.",
+      "any_field": false
+    },
+    {
+      "id": "skill_spawns_subagent",
+      "tools": [
+        "Skill"
+      ],
+      "fields": [
+        "skill"
+      ],
+      "pattern": "(^|:)(wiki-ingest|wiki-lint|dispatching-parallel-agents|subagent-driven-development)$",
+      "unless_env": "VAARA_ALLOW_SPAWN",
+      "message": "This skill runs in a subagent, so it spawns without a call to Agent, Task or Workflow. The list is named by the operator, not detected from the call. Set VAARA_ALLOW_SPAWN=1.",
+      "any_field": false
+    },
+    {
+      "id": "interpreter_config_write",
+      "tools": [
+        "Bash"
+      ],
+      "fields": [
+        "command"
+      ],
+      "pattern": "\\b(python3?|perl|ruby|node|install|dd)\\b(?=[^|\\n]*(?:\\.claude\\.json|\\.claude/(?:settings|hooks/|skills/|agents/|plugins/|scheduled_tasks|CLAUDE\\.md)|\\.vaara/config|\\.config/opencode/(?:opencode\\.jsonc?|plugins?/)|\\.opencode/plugins?/|\\.cursor/(?:hooks\\.json|hooks/|mcp\\.json)|\\.codex/(?:hooks\\.json|config\\.toml)|\\.gemini/settings\\.json))(?=[^|\\n]*(?:['\\\"](?:[rwax]b?\\+|[wax][bt]?\\+?)['\\\"]|mode\\s*=\\s*['\\\"][wax+]|write|truncate|unlink|rmtree|shutil|os\\.(?:remove|rename|replace)))",
+      "unless_env": "VAARA_ALLOW_HARNESS_EDIT",
+      "message": "An interpreter writes the harness or governance configuration. The shell rule names sed, tee, cp, mv, rm, chmod, truncate and redirection; python, perl, ruby, node, install and dd write the same file through none of them. Set VAARA_ALLOW_HARNESS_EDIT=1."
+    },
+    {
+      "id": "shell_netcat_egress",
+      "tools": [
+        "Bash"
+      ],
+      "fields": [
+        "command"
+      ],
+      "pattern": "(?:(?<![\\\\\\w])|(?:^|(?<=[\\s;&|(`]))\\\\)(ncat|netcat|socat)\\b|(?:(?<![\\\\\\w])|(?:^|(?<=[\\s;&|(`]))\\\\)nc\\s+(?:-[A-Za-z]+\\s+)*[A-Za-z0-9_.\\-]+\\s+\\d{1,5}\\b",
+      "shell_syntax": true,
+      "unless_env": "VAARA_ALLOW_EGRESS",
+      "message": "netcat or socat moves bytes to a remote host without curl or wget. Set VAARA_ALLOW_EGRESS=1."
+    },
+    {
+      "id": "interpreter_network_egress",
+      "tools": [
+        "Bash"
+      ],
+      "fields": [
+        "command"
+      ],
+      "pattern": "\\b(python3?|perl|ruby|node)\\b(?=[^|\\n]*(?:urlopen|urllib(?!\\.(?:parse|error)\\b)(?!\\s+import\\s+(?:parse|error)\\b(?!\\s*,))|requests\\.(?:post|put|get)|http\\.client|socket\\.socket|net\\.connect|fetch\\())",
+      "unless_env": "VAARA_ALLOW_EGRESS",
+      "message": "An interpreter one-liner opens an outbound connection. No shell rule reads inside a -c string. Set VAARA_ALLOW_EGRESS=1."
+    },
+    {
+      "id": "interactive_shell_session",
+      "tools": [
+        "Bash"
+      ],
+      "fields": [
+        "command"
+      ],
+      "pattern": "(?:^|;|&&|\\|\\|)\\s*(?:exec\\s+|sudo\\s+(?:-[A-Za-z]+\\s+)*|env\\s+(?:[A-Za-z_]\\w*=\\S*\\s+)*)*(?:\\S*/)?(?:(?:ba|z|da|k|mk|fi|c|tc|y)?sh|python[0-9.]*|ipython[0-9]*|node(?:js)?|bun|deno|ruby|irb|perl|php|lua|julia|tmux|screen|script|su)(?:\\s+(?:-[ilsuqEB]+|--(?:login|norc|noprofile|interactive|posix|quiet)|-))*\\s*$|^\\s*sudo\\s+-[is]\\s*$|^\\s*ssh(?:\\s+-[A-Za-z]+)*\\s+[\\w.@-]+\\s*$",
+      "unless_env": "VAARA_ALLOW_INTERACTIVE_SHELL",
+      "message": "Starts a bare interactive shell or interpreter. Codex types into a running session through write_stdin, which runs no hook, so nothing typed there could be checked or recorded. Run the command itself instead. Set VAARA_ALLOW_INTERACTIVE_SHELL=1 to allow."
     }
   ]
 }

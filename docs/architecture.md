@@ -34,6 +34,26 @@ Control it with `--stacked warn` (default), `--stacked fail` to refuse to start,
 
 Process lifetime differs between the two. Under stdio, the proxy starts the upstream MCP server as a child process, since owning the pipe is what makes the traffic readable. The upstream's lifetime is therefore bound to the proxy's, and a proxy that exits takes the MCP server down with it. A hook has no such relationship. On clients that offer one, the hook is the smaller commitment.
 
+## Delegated grants
+
+An action can run under a capability grant (`intercept(capabilities=...)`) and name the action that delegated to it (`parent_action_id`). The pipeline then checks that the child's grant allows no more than the parent's, and denies a broadening grant whatever its risk score.
+
+The grant is written into the action's `action_requested` record. The pipeline keeps recent grants in memory, and when the parent is not there (evicted, or recorded by another process such as an earlier hook call) it reads the parent's grant from the trail, within the same tenant. When the parent cannot be found:
+
+| Parent | Decision |
+|---|---|
+| Not on the trail in this tenant (an invented id, another tenant's action) | Denied, `violation_type` `privilege_attenuation`, `unavailable_input` `parent_grant` |
+| On the trail, grant unreadable (cut at the size cap, or does not parse) | Denied the same way |
+| On the trail, ran under no grant | Not denied on this ground; there is no bound to exceed |
+
+`InterceptionPipeline(unknown_parent="allow")` lets the first case through to the scorer, for a deployment whose parents run behind another gate. The setting is in the decision state the record digests.
+
+A child that presents no grant and names a parent that ran under one has no bound, so it would exceed its parent's. It is denied with `violation_type` `privilege_attenuation` and `attenuation` `{status: violated, reason: child_without_grant}`. `InterceptionPipeline(grantless_child="allow")` lets it through to the scorer, marked `unverified`, and is in the digested decision state the same way. A child with no grant under a parent with none, or under a parent not found, is decided as before and carries no `attenuation` mark; one under a parent whose recorded grant does not parse is denied as above.
+
+Every decision on an action that carries a grant and names a parent, or that carries none under a granted parent, says what the check found, as `attenuation` on the decision record: `status` `held`, `violated` or `unverified`, with `reason` when it did not hold, and `source` (`memory` or `trail`) when the parent grant was found. A check that could not run is on the record, not silent.
+
+The pipeline check depends on the trail it can read. The credential gateway does not: it verifies each call against the signed grant the call presents, so a call outside its grant is refused there whatever the pipeline decided.
+
 ## External time anchor
 
 The hash chain proves order and integrity but not *when* it existed: every timestamp comes from your own clock, so a compromised signing key could in principle be used to forge a backdated chain. Vaara can anchor the current chain head to an external RFC 3161 Time-Stamp Authority, the standard behind eIDAS qualified electronic timestamps. The authority signs the chain head and the time, so the chain's existence is provable against a clock you do not control. Verification is offline.
@@ -49,6 +69,6 @@ from vaara.audit.timeanchor import RFC3161TimeAnchorClient
 trail.anchor_head(RFC3161TimeAnchorClient("https://freetsa.org/tsr"))
 ```
 
-The anchor also folds into the one-command regulator package: `vaara trail export-article12 --anchor-tsa https://freetsa.org/tsr` writes the timestamp beside the signed trail as Article 19 existence-in-time evidence, and `vaara trail verify-anchor --zip <package>.zip` checks it offline.
+The anchor also folds into the one-command regulator package: `vaara trail export-article12 --anchor-tsa https://freetsa.org/tsr` writes the timestamp beside the signed trail as Article 19 existence-in-time evidence, and `vaara trail verify-anchor --zip <package>.zip` checks it offline; add `--tsa-cert` or `--tsa-issuer` to hold it to the authority you trust, otherwise it reports the time as unpinned.
 
 The same command folds cross-org handoffs and confidential-VM enforcement evidence into the package as verified sidecars (`--handoffs ./handoffs --enforcements ./enforced`); an attachment that does not verify fails the export, so the package never ships evidence it cannot back. It is a more complete pack, not a certificate. See [verifying-evidence.md](verifying-evidence.md).

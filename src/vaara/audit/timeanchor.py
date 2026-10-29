@@ -57,6 +57,10 @@ _INSTALL_HINT = (
 # digest, so sha256 is the natural default.
 _DIGEST_LEN = {"sha256": 32, "sha384": 48, "sha512": 64}
 
+# id-ct-TSTInfo (RFC 3161 2.4.2): the content type a token's signed
+# content-type attribute must name.
+_ID_CT_TSTINFO = "1.2.840.113549.1.9.16.1.4"
+
 
 class TimeAnchorError(Exception):
     """Anchoring or anchor verification failed."""
@@ -87,6 +91,47 @@ def _signed_payload_digest(receipt: dict) -> bytes:
 def anchored_digest(receipt: dict) -> str:
     """The ``anchoredDigest`` a conforming anchor must carry for this receipt."""
     return "sha256:" + _signed_payload_digest(receipt).hex()
+
+
+#: Domain separation for the blinded anchor methods, so a blinded imprint can
+#: never collide with a digest computed for any other purpose in this tree.
+ANCHOR_BLIND_LABEL = b"vaara/anchor-blind/v1"
+
+#: Salt width. 32 bytes because a salt narrow enough to enumerate is not a salt.
+SALT_LEN = 32
+
+
+def new_anchor_salt() -> bytes:
+    """A fresh blinding salt from the system CSPRNG."""
+    return secrets.token_bytes(SALT_LEN)
+
+
+def blinded_anchor_digest(payload_digest: bytes, salt: bytes) -> bytes:
+    """What a blinded anchor sends the TSA instead of the receipt's own digest.
+
+    An unblinded anchor hands the authority exactly the value the receipt then
+    publishes in ``anchoredDigest``. A TSA keeps a log, every request in it sits
+    behind a customer account, and a log that is sold, breached or subpoenaed
+    lets whoever holds it match its entries against any corpus of published
+    receipts. Anchoring ``sha256(label || salt || payload_digest)`` and carrying
+    the salt in the anchor removes that match: the value the TSA holds appears
+    nowhere else.
+
+    The property is narrow and stated that way on purpose. Anyone given the
+    receipt holds the salt too and can still link it to the log entry, because
+    that is exactly what verification requires. What changes is that the log
+    alone is no longer enough.
+    """
+    if not isinstance(salt, (bytes, bytearray)) or len(salt) != SALT_LEN:
+        raise TimeAnchorError(
+            f"anchor salt must be {SALT_LEN} bytes, got "
+            f"{len(salt) if isinstance(salt, (bytes, bytearray)) else type(salt).__name__}"
+        )
+    if not isinstance(payload_digest, (bytes, bytearray)) or len(payload_digest) != 32:
+        raise TimeAnchorError("payload digest must be a 32-byte sha256 digest")
+    return hashlib.sha256(
+        ANCHOR_BLIND_LABEL + bytes(salt) + bytes(payload_digest)
+    ).digest()
 
 
 def _require_deps() -> None:
@@ -256,6 +301,28 @@ def _cert_der(cert_bytes: bytes) -> bytes:
     return cert.public_bytes(serialization.Encoding.DER)
 
 
+def _require_timestamping_purpose(signer_cert: Any) -> None:
+    """Refuse a signer certificate that is not an RFC 3161 TSA certificate."""
+    from cryptography import x509
+    from cryptography.x509.oid import ExtendedKeyUsageOID
+
+    try:
+        ext = signer_cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage)
+    except x509.ExtensionNotFound:
+        raise TimeAnchorError(
+            "token signer certificate has no extended key usage; RFC 3161 "
+            "requires id-kp-timeStamping, so the timestamp is not trusted"
+        ) from None
+    purposes = list(ext.value)
+    if purposes != [ExtendedKeyUsageOID.TIME_STAMPING] or not ext.critical:
+        raise TimeAnchorError(
+            "token signer certificate is not a TSA certificate: RFC 3161 requires "
+            "one critical extended key usage holding id-kp-timeStamping only "
+            f"(found {[p.dotted_string for p in purposes]}, "
+            f"critical={ext.critical}); the timestamp is not trusted"
+        )
+
+
 def verify_timestamp_token(
     token_der: bytes,
     expected_digest: bytes,
@@ -284,6 +351,11 @@ def verify_timestamp_token(
     by that exact CA certificate. TSA signer certificates rotate while the
     issuing CA is the stable entry on a trusted list, so this is the pin that
     survives rotation. Both pins may be given; each is enforced.
+
+    With either pin the signer certificate must also be a TSA certificate as
+    RFC 3161 section 2.3 defines it: one critical extended key usage holding
+    id-kp-timeStamping and nothing else. A pinned CA may issue certificates for
+    other purposes, and none of those may mint a trusted time.
     """
     _require_deps()
     try:
@@ -324,10 +396,28 @@ def verify_timestamp_token(
     signer_info = signed_data["signer_infos"][0]
     digest_alg = signer_info["digest_algorithm"]["algorithm"].native
     md_attr = None
+    ct_attrs = []
     for attr in signer_info["signed_attrs"]:
-        if attr["type"].native == "message_digest":
+        kind = attr["type"].native
+        if kind == "message_digest" and md_attr is None:
             md_attr = attr["values"][0].native
-            break
+        elif kind == "content_type":
+            ct_attrs.append(attr)
+    # RFC 5652 5.3 and RFC 3161 2.4.2: the content-type signed attribute is
+    # mandatory, single-valued, and names the eContentType, id-ct-TSTInfo.
+    # Without it the TSA's signature does not say what kind of content it
+    # covers.
+    if len(ct_attrs) != 1 or len(ct_attrs[0]["values"]) != 1:
+        raise TimeAnchorError(
+            "token signed attributes must carry exactly one content-type "
+            f"attribute with one value (found {len(ct_attrs)})"
+        )
+    ct_oid = ct_attrs[0]["values"][0].dotted
+    if ct_oid != _ID_CT_TSTINFO:
+        raise TimeAnchorError(
+            f"token signed content-type attribute names {ct_oid}, not "
+            f"id-ct-TSTInfo ({_ID_CT_TSTINFO})"
+        )
     if md_attr is None:
         raise TimeAnchorError("token signed attributes lack a message_digest")
     h = hashes.Hash(_hash_for(digest_alg))
@@ -359,6 +449,8 @@ def verify_timestamp_token(
                 "token signer certificate was not issued by the pinned trusted "
                 f"CA; the timestamp is not independently trusted ({exc})"
             ) from exc
+    if trusted_signer_cert is not None or trusted_issuer_cert is not None:
+        _require_timestamping_purpose(signer_cert)
 
     gen_time = tst_info["gen_time"].native
     if gen_time.tzinfo is None:
@@ -372,6 +464,10 @@ Transport = Callable[[str, bytes, float], bytes]
 
 
 def _urllib_transport(url: str, der_request: bytes, timeout: float) -> bytes:
+    # An endpoint can be prefilled from a downloaded trusted list, so refuse
+    # anything but http(s) rather than let urllib open a file: URL.
+    if not url.startswith(("https://", "http://")):
+        raise TimeAnchorError(f"TSA URL must be http or https: {url!r}")
     req = urllib.request.Request(
         url,
         data=der_request,
@@ -382,7 +478,7 @@ def _urllib_transport(url: str, der_request: bytes, timeout: float) -> bytes:
         method="POST",
     )
     # URL is operator-supplied TSA configuration, not attacker-controlled.
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310  # nosec B310
         return resp.read()
 
 
@@ -452,11 +548,18 @@ def _digest_bytes(chain_head_hash: str, hash_algorithm: str) -> bytes:
     return digest
 
 
-def verify_anchor(anchor: TimeAnchor) -> datetime:
+def verify_anchor(
+    anchor: TimeAnchor,
+    *,
+    trusted_signer_cert: Optional[bytes] = None,
+    trusted_issuer_cert: Optional[bytes] = None,
+) -> datetime:
     """Verify an anchor's token attests its own ``chain_head_hash``.
 
     Returns the attested UTC time. Does not check the hash belongs to a given
-    chain; use :func:`verify_anchor_over_records` for that.
+    chain; use :func:`verify_anchor_over_records` for that. The two pins are
+    passed to :func:`verify_timestamp_token`; without them the time is
+    asserted by the certificate carried in the token.
     """
     _require_deps()
     import base64
@@ -465,17 +568,30 @@ def verify_anchor(anchor: TimeAnchor) -> datetime:
     except Exception as exc:
         raise TimeAnchorError(f"anchor token_b64 is not valid base64: {exc}") from exc
     digest = _digest_bytes(anchor.chain_head_hash, anchor.hash_algorithm)
-    return verify_timestamp_token(token_der, digest, hash_algorithm=anchor.hash_algorithm)
+    return verify_timestamp_token(
+        token_der,
+        digest,
+        hash_algorithm=anchor.hash_algorithm,
+        trusted_signer_cert=trusted_signer_cert,
+        trusted_issuer_cert=trusted_issuer_cert,
+    )
 
 
-def verify_anchor_over_records(anchor: TimeAnchor, record_hashes: list[str]) -> datetime:
+def verify_anchor_over_records(
+    anchor: TimeAnchor,
+    record_hashes: list[str],
+    *,
+    trusted_signer_cert: Optional[bytes] = None,
+    trusted_issuer_cert: Optional[bytes] = None,
+) -> datetime:
     """Verify an anchor binds to an actual record in a chain.
 
     ``record_hashes`` is the ordered list of ``record_hash`` values from the
     trail. Confirms the record at ``anchor.chain_position`` has exactly
     ``anchor.chain_head_hash``, then verifies the token over it. This proves
-    the chain (and every execution record up to that position) existed at the
-    attested time. Returns the attested UTC time.
+    the chain (and every execution record up to that position) existed no
+    later than the attested time. Returns the attested UTC time. The pins are
+    those of :func:`verify_timestamp_token`.
     """
     pos = anchor.chain_position
     if pos < 0 or pos >= len(record_hashes):
@@ -488,13 +604,22 @@ def verify_anchor_over_records(anchor: TimeAnchor, record_hashes: list[str]) -> 
             f"anchor chain_position {pos} does not match the trail "
             "(anchor refers to a different or rewritten chain)"
         )
-    return verify_anchor(anchor)
+    return verify_anchor(
+        anchor,
+        trusted_signer_cert=trusted_signer_cert,
+        trusted_issuer_cert=trusted_issuer_cert,
+    )
 
 
 __all__ = [
+    "ANCHOR_BLIND_LABEL",
+    "SALT_LEN",
     "TimeAnchor",
     "TimeAnchorError",
     "RFC3161TimeAnchorClient",
+    "anchored_digest",
+    "blinded_anchor_digest",
+    "new_anchor_salt",
     "build_timestamp_request",
     "extract_token_from_response",
     "verify_timestamp_token",

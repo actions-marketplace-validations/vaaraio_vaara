@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import hashlib
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from vaara.attestation._attest_canonical import canonical_json
@@ -69,15 +69,23 @@ class ContiguityReport:
     """The result of checking one coverage boundary for gaps.
 
     ``ok`` is true only when the held records form a contiguous ``0..expected-1``
-    run with consistent running counts and no duplicates. ``missing_seqs`` names
-    the gaps; ``expected`` is the count the latest receipt asserts exists, so a
-    short set reports the tail it is missing.
+    run with consistent running counts and no duplicates. It says the held set
+    agrees with itself, not that the run is whole: a tail removed before the set
+    was held leaves nothing to see unless a seal was held (``sealed``) or an
+    external anchor was checked, and this check reads no anchor. ``missing_seqs``
+    names the gaps; ``expected`` is the count the latest receipt asserts exists,
+    so a short set reports the tail it is missing.
 
     ``worst_case_class`` is the ``maxClass`` a sealing record carried, when one
     did: the highest action class the boundary authorized. A dropped record took
     its own contents with it, so the most a gap could have hidden is an action of
     this class. It lets a holder bound a gap's worst case from the held set
     alone, with no issuer. ``None`` when no seal named a class.
+
+    ``duplicates`` names each seq held more than once and what was found there:
+    ``fork`` when the records differ, ``replay`` when every copy is the same
+    record. Both fail the set; the kind tells a holder whether the issuer kept
+    two histories or a record was handed over twice.
     """
 
     boundary_id: str
@@ -88,15 +96,19 @@ class ContiguityReport:
     count_mismatches: list[dict[str, int]]
     ok: bool
     worst_case_class: Optional[str] = None
+    sealed: bool = False
+    duplicates: list[dict[str, Any]] = field(default_factory=list)
 
     def gap_report(self) -> str:
         """A short human-readable verdict naming any gaps."""
         if self.ok:
             if self.expected == 0:
                 return f"boundary {self.boundary_id!r}: no completeness asserted"
+            seal = "seal held" if self.sealed else "no seal held"
             return (
-                f"boundary {self.boundary_id!r}: complete, {self.present} receipt(s), "
-                f"seq 0..{self.expected - 1} contiguous"
+                f"boundary {self.boundary_id!r}: consistent, {self.present} receipt(s), "
+                f"seq 0..{self.expected - 1} contiguous, "
+                f"highest count held {self.expected}, {seal}, no anchor checked"
             )
         lines = [f"boundary {self.boundary_id!r}: INCOMPLETE"]
         lines.append(
@@ -109,8 +121,9 @@ class ContiguityReport:
                     f"  gap worst-case: action class up to "
                     f"{self.worst_case_class!r} may be unrecorded"
                 )
-        if self.duplicate_seqs:
-            lines.append(f"  duplicate seq: {_compact(self.duplicate_seqs)}")
+        for dup in self.duplicates:
+            what = "different records" if dup["kind"] == "fork" else "same record"
+            lines.append(f"  duplicate seq: {dup['seq']} ({what})")
         for mm in self.count_mismatches:
             lines.append(
                 f"  count mismatch at seq {mm['seq']}: "
@@ -135,22 +148,68 @@ def _compact(seqs: list[int]) -> str:
     return ", ".join(out)
 
 
+def completeness_from_execution_receipts(
+    receipts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project execution receipts into the shape ``verify_contiguity`` reads.
+
+    The two halves of the pair carry their completeness block in different
+    places, for reasons that belong to each format. An authorization receipt
+    puts it in the evidence document, whose digest the signed record pins. An
+    execution receipt has no evidence document, so the block rides in
+    ``receiptAsserted``, the issuer block, and is covered by the signature
+    directly.
+
+    Rather than teach the checker two shapes, this lifts the execution block to
+    where the checker already looks. ``verify_contiguity`` stays as it is, seal
+    handling and all.
+
+    Receipts with no completeness block are skipped rather than counted as gaps.
+    A receipt minted before the field existed is not evidence that a receipt is
+    missing, and treating it as one would report every historical run as broken.
+
+    The caller is expected to have verified each receipt's signature first. This
+    reads the blocks as given; an unverified receipt's sequence number is a
+    claim, not a fact.
+    """
+    out: list[dict[str, Any]] = []
+    for r in receipts:
+        if not isinstance(r, dict):
+            continue
+        asserted = r.get("receiptAsserted")
+        if not isinstance(asserted, dict):
+            continue
+        block = asserted.get("completeness")
+        if isinstance(block, dict):
+            # The whole receipt rides along so two different receipts at one
+            # seq read as a fork and a copy of one as a replay.
+            out.append({"completeness": block, "receipt": r})
+    return out
+
+
 def _completeness_records(
-    evidence_records: list[dict[str, Any]], boundary_id: Optional[str]
-) -> tuple[str, list[dict[str, Any]]]:
+    evidence_records: list[dict[str, Any]],
+    boundary_id: Optional[str],
+    records: Optional[list[Any]] = None,
+) -> tuple[str, list[tuple[dict[str, Any], Any]]]:
     """Select the completeness blocks for one boundary and resolve its id.
 
+    Each block comes paired with the record it was read from (``records[i]``
+    when given, else the evidence record itself), which decides fork or replay.
     Raises ``ValueError`` if no boundary is given and the records span more than
     one, since the caller must say which boundary they mean.
     """
-    blocks = [
-        ev["completeness"]
-        for ev in evidence_records
+    wholes = evidence_records if records is None else records
+    pairs = [
+        (ev["completeness"], whole)
+        for ev, whole in zip(evidence_records, wholes)
         if isinstance(ev, dict) and isinstance(ev.get("completeness"), dict)
     ]
     if boundary_id is not None:
-        return boundary_id, [b for b in blocks if b.get("boundaryId") == boundary_id]
-    boundaries = {b.get("boundaryId") for b in blocks}
+        return boundary_id, [
+            (b, w) for b, w in pairs if b.get("boundaryId") == boundary_id
+        ]
+    boundaries = {b.get("boundaryId") for b, _ in pairs}
     boundaries.discard(None)
     if len(boundaries) > 1:
         raise ValueError(
@@ -158,12 +217,30 @@ def _completeness_records(
             f"({sorted(str(b) for b in boundaries)}); pass boundary_id"
         )
     resolved = next(iter(boundaries)) if boundaries else ""
-    return str(resolved), blocks
+    return str(resolved), pairs
+
+
+def _duplicate_kinds(pairs: list[tuple[dict[str, Any], Any]]) -> list[dict[str, Any]]:
+    """Name each seq held more than once: ``fork`` or ``replay``.
+
+    Copies are compared as canonical JSON, so the same record re-serialized with
+    other whitespace or key order is still the same record. Any two copies that
+    differ make the seq a fork, even beside an exact copy.
+    """
+    by_seq: dict[int, list[bytes]] = {}
+    for block, whole in pairs:
+        by_seq.setdefault(int(block["seq"]), []).append(canonical_json(whole))
+    return [
+        {"seq": seq, "kind": "replay" if len(set(copies)) == 1 else "fork"}
+        for seq, copies in sorted(by_seq.items())
+        if len(copies) > 1
+    ]
 
 
 def verify_contiguity(
     evidence_records: list[dict[str, Any]],
     boundary_id: Optional[str] = None,
+    records: Optional[list[Any]] = None,
 ) -> ContiguityReport:
     """Check a set of authorization-evidence records for gaps under one boundary.
 
@@ -173,8 +250,9 @@ def verify_contiguity(
 
     A receipt is missing when its ``seq`` does not appear and the latest
     ``runningCount`` says it should. ``runningCount`` must equal ``seq + 1`` for
-    every held record, or the count itself is inconsistent. The report is
-    self-contained evidence of completeness or of the specific receipts absent.
+    every held record, or the count itself is inconsistent. A failing report
+    names the specific receipts absent. A passing one says the held set is
+    consistent with itself; it does not say nothing was cut off the end.
 
     An optional sealing block (``{"sealed": True, "total": N}``) finalizes a run
     and lets a dropped tail be caught; without it, dropping the last record(s)
@@ -184,8 +262,16 @@ def verify_contiguity(
     ``maxClass`` is read off the evidence as given and is unsigned on its own; it
     is trustworthy only if the caller has verified each receipt's signature and
     ``evidence_binding_ok`` (see ``enforce_on_sealed_class``).
+
+    Two records at one ``seq`` fail the set. ``records``, when given, is the
+    whole receipt each evidence record came from, index for index; the report
+    then names a seq ``fork`` when those receipts differ and ``replay`` when
+    they are the same receipt. Without it the evidence records are compared.
     """
-    boundary, blocks = _completeness_records(evidence_records, boundary_id)
+    if records is not None and len(records) != len(evidence_records):
+        raise ValueError("records must pair one to one with evidence_records")
+    boundary, pairs = _completeness_records(evidence_records, boundary_id, records)
+    blocks = [b for b, _ in pairs]
     # A sealing block (``{"sealed": True, "total": N}``) pins the run length
     # independently of the held decision records. It is optional and additive: a
     # stream carrying only ``{seq, runningCount}`` blocks behaves exactly as
@@ -193,7 +279,9 @@ def verify_contiguity(
     # though the dropped records took their own ``seq`` with them. A suffix that
     # also suppresses the seal stays outside held-set-alone detection; an
     # external anchor (e.g. an rfc3161 timestamp over the run) closes that.
-    seq_blocks = [b for b in blocks if not b.get("sealed")]
+    seq_pairs = [(b, w) for b, w in pairs if not b.get("sealed")]
+    seq_blocks = [b for b, _ in seq_pairs]
+    sealed = any(b.get("sealed") for b in blocks)
     sealed_total = max(
         (int(b["total"]) for b in blocks if b.get("sealed")), default=0
     )
@@ -222,6 +310,7 @@ def verify_contiguity(
             count_mismatches=[],
             ok=(sealed_total == 0),
             worst_case_class=worst_case_class,
+            sealed=sealed,
         )
 
     seqs = [int(b["seq"]) for b in seq_blocks]
@@ -235,6 +324,7 @@ def verify_contiguity(
 
     seq_counts = Counter(seqs)
     duplicate_seqs = sorted(s for s, n in seq_counts.items() if n > 1)
+    duplicates = _duplicate_kinds(seq_pairs)
     missing_seqs = sorted(set(range(expected)) - set(seqs))
     count_mismatches = [
         {"seq": int(b["seq"]), "runningCount": int(b["runningCount"])}
@@ -258,6 +348,8 @@ def verify_contiguity(
         count_mismatches=count_mismatches,
         ok=ok,
         worst_case_class=worst_case_class,
+        sealed=sealed,
+        duplicates=duplicates,
     )
 
 

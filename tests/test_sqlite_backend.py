@@ -1,5 +1,6 @@
 """Tests for the SQLite audit backend."""
 
+import contextlib
 import multiprocessing
 import tempfile
 from pathlib import Path
@@ -19,15 +20,21 @@ from vaara.taxonomy.actions import (
 )
 
 
+def _max_seq(backend) -> int:
+    """The highest seq in the file, read straight off the table."""
+    return backend._conn.execute("SELECT COALESCE(MAX(seq), -1) FROM audit_records").fetchone()[0]
+
+
 @pytest.fixture
+
 def db_path():
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         path = Path(f.name)
     yield path
-    path.unlink(missing_ok=True)
-    # Clean WAL files
-    Path(str(path) + "-wal").unlink(missing_ok=True)
-    Path(str(path) + "-shm").unlink(missing_ok=True)
+    # Windows keeps a file a test left open; the temp directory takes it later.
+    for leftover in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm")):
+        with contextlib.suppress(PermissionError):
+            leftover.unlink(missing_ok=True)
 
 
 def _append_from_child(db_path: str, label: str, count: int) -> None:
@@ -179,7 +186,7 @@ class TestSQLiteBackend:
             export_path = db_path.with_suffix(".jsonl")
             count = backend.export_jsonl(export_path)
             assert count == 3
-            lines = export_path.read_text().strip().split("\n")
+            lines = export_path.read_text(encoding="utf-8").strip().split("\n")
             assert len(lines) == 3
             export_path.unlink(missing_ok=True)
 
@@ -406,6 +413,10 @@ class TestSkeletonRecordsCounter:
         assert len(per_row) == CORRUPT_ROW_LOG_LIMIT
         assert len(summary) == 1
         assert "12" in summary[0].getMessage()   # the total is not lost
+        # The summary once sent the operator to `vaara verify-chain`, which
+        # does not exist. It points at the chain check that does run.
+        assert "verify-chain" not in summary[0].getMessage()
+        assert reloaded._load_verdict.error    # and that check does flag them
 
     def test_query_corrupt_row_logging_is_capped(
         self, db_path, sample_action_type, caplog
@@ -729,6 +740,141 @@ class TestAppendPathUsesTheSeqIndex:
             assert reopened.load_trail().verify_chain() is None
         finally:
             reopened.close()
+
+
+def _fork_v6_trail(db_path, action_type, records=3):
+    """A v6 trail holding two records at its last seq, the way the llm-proxy
+    trail was found on 23.9: same seq, same parent, written by two writers
+    that did not share a lock."""
+    import sqlite3
+
+    backend = SQLiteAuditBackend(db_path)
+    trail = backend.load_trail()
+    for i in range(records):
+        trail.record_action_requested(ActionRequest(
+            agent_id=f"a{i}", tool_name="tx.transfer", action_type=action_type,
+        ))
+    backend.close()
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("DROP INDEX idx_seq")
+    conn.execute("CREATE INDEX idx_seq ON audit_records(seq)")
+    top = conn.execute("SELECT MAX(seq) FROM audit_records").fetchone()[0]
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(audit_records)")]
+    row = dict(zip(cols, conn.execute(
+        "SELECT * FROM audit_records WHERE seq = ?", (top,)).fetchone()))
+    row["record_id"] = row["record_id"] + "-fork"
+    conn.execute(
+        f"INSERT INTO audit_records ({', '.join(row)}) "
+        f"VALUES ({', '.join('?' for _ in row)})", list(row.values()))
+    conn.execute("UPDATE audit_meta SET value='6' WHERE key='schema_version'")
+    conn.commit()
+    conn.close()
+    return top
+
+
+class TestSeqIsUnique:
+    """Two records at one seq is a fork. The trail must refuse the second
+    write rather than store it; a fork already on disk is kept as evidence."""
+
+    def _raw_insert_at(self, db_path, seq):
+        import sqlite3
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                "INSERT INTO audit_records (record_id, action_id, event_type, "
+                "timestamp, agent_id, tool_name, seq) "
+                "VALUES (?, 'x', 'action_requested', 0, 'a', 't', ?)",
+                (f"raw-{seq}", seq),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_fresh_trail_refuses_a_second_record_at_a_seq(self, db_path, sample_action_type):
+        import sqlite3
+
+        backend = SQLiteAuditBackend(db_path)
+        trail = backend.load_trail()
+        trail.record_action_requested(ActionRequest(
+            agent_id="a", tool_name="tx.transfer", action_type=sample_action_type,
+        ))
+        top = _max_seq(backend)
+        backend.close()
+        with pytest.raises(sqlite3.IntegrityError):
+            self._raw_insert_at(db_path, top)
+
+    def test_clean_v6_trail_migrates_to_a_unique_seq(self, db_path, sample_action_type):
+        import sqlite3
+
+        backend = SQLiteAuditBackend(db_path)
+        trail = backend.load_trail()
+        trail.record_action_requested(ActionRequest(
+            agent_id="a", tool_name="tx.transfer", action_type=sample_action_type,
+        ))
+        backend._conn.execute("DROP INDEX idx_seq")
+        backend._conn.execute("CREATE INDEX idx_seq ON audit_records(seq)")
+        backend._conn.execute(
+            "UPDATE audit_meta SET value='6' WHERE key='schema_version'")
+        backend.close()
+
+        reopened = SQLiteAuditBackend(db_path)
+        top = _max_seq(reopened)
+        indexes = {r[1]: r[2] for r in reopened._conn.execute(
+            "PRAGMA index_list(audit_records)")}
+        assert reopened.load_trail().verify_chain() is None
+        reopened.close()
+        assert indexes["idx_seq"] == 1
+        with pytest.raises(sqlite3.IntegrityError):
+            self._raw_insert_at(db_path, top)
+
+    def test_forked_trail_opens_keeps_the_fork_and_constrains_new_writes(
+        self, db_path, sample_action_type
+    ):
+        import sqlite3
+
+        fork_seq = _fork_v6_trail(db_path, sample_action_type)
+        reopened = SQLiteAuditBackend(db_path)
+        try:
+            at_fork = reopened._conn.execute(
+                "SELECT COUNT(*) FROM audit_records WHERE seq = ?", (fork_seq,)
+            ).fetchone()[0]
+            assert at_fork == 2, "the fork is evidence and must stay on disk"
+            trail = reopened.load_trail()
+            assert trail.verify_chain() is not None, "a fork still reads as broken"
+            trail.record_action_requested(ActionRequest(
+                agent_id="b", tool_name="tx.transfer", action_type=sample_action_type,
+            ))
+            assert _max_seq(reopened) == fork_seq + 1
+        finally:
+            reopened.close()
+        with pytest.raises(sqlite3.IntegrityError):
+            self._raw_insert_at(db_path, fork_seq + 1)
+
+    def test_salvage_keeps_a_fork_and_the_constraint_above_it(
+        self, db_path, sample_action_type
+    ):
+        import sqlite3
+
+        from vaara.audit.sqlite_backend import _salvage
+
+        fork_seq = _fork_v6_trail(db_path, sample_action_type)
+        SQLiteAuditBackend(db_path).close()     # migrate to v7 first
+        report = _salvage(db_path, "test")
+        assert report.method == "salvage", report
+        conn = sqlite3.connect(str(db_path))
+        try:
+            at_fork = conn.execute(
+                "SELECT COUNT(*) FROM audit_records WHERE seq = ?", (fork_seq,)
+            ).fetchone()[0]
+            names = {r[1] for r in conn.execute("PRAGMA index_list(audit_records)")}
+        finally:
+            conn.close()
+        assert at_fork == 2
+        assert {"idx_seq", "idx_seq_after_fork"} <= names
+        self._raw_insert_at(db_path, fork_seq + 1)
+        with pytest.raises(sqlite3.IntegrityError):
+            self._raw_insert_at(db_path, fork_seq + 1)
 
 
 class TestConcurrentProcessAppend:

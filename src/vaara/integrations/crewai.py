@@ -56,6 +56,7 @@ from vaara.integrations.langchain import (
     ToolExecutionBlocked,
 )
 from vaara.pipeline import InterceptionPipeline
+from vaara.scorer.adaptive import DEFAULT_THRESHOLD_ALLOW, DEFAULT_THRESHOLD_DENY
 
 logger = logging.getLogger(__name__)
 
@@ -85,14 +86,14 @@ class VaaraCrewGovernance:
         CrewAI uses LangChain tools internally, so we reuse the
         LangChain tool wrapper.
         """
-        from vaara.integrations.langchain import vaara_wrap_tool
+        from vaara.integrations.langchain import _wrap_tool
 
         wrapped = []
         for tool in tools:
             wrapped.append(
-                vaara_wrap_tool(
-                    tool, self.pipeline, agent_id=agent_id,
-                    block_on_escalate=self.block_on_escalate,
+                _wrap_tool(
+                    tool, self.pipeline, agent_id, self.block_on_escalate,
+                    via_func=_is_crewai_function_tool(tool),
                 )
             )
         return wrapped
@@ -290,8 +291,8 @@ class VaaraGovernance:
         self,
         *,
         boundary_id_for: Optional[Callable[[Any], Optional[str]]] = None,
-        threshold_allow: float = 0.4,
-        threshold_deny: float = 0.7,
+        threshold_allow: float = DEFAULT_THRESHOLD_ALLOW,
+        threshold_deny: float = DEFAULT_THRESHOLD_DENY,
     ) -> None:
         self._boundary_id_for = boundary_id_for
         self._threshold_allow = threshold_allow
@@ -581,6 +582,15 @@ def _params_hash(tool_input: Any) -> str:
     except (TypeError, ValueError):
         canonical = json.dumps(repr(tool_input), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _is_crewai_function_tool(tool: Any) -> bool:
+    """A CrewAI ``Tool``, the class ``@tool`` returns. Its ``run`` calls
+    ``func`` directly rather than ``_run``, so it is wrapped at ``func``."""
+    for cls in type(tool).__mro__:
+        if cls.__name__ == "Tool" and cls.__module__.startswith("crewai."):
+            return hasattr(tool, "func")
+    return False
 
 
 def _looks_errored(context: Any) -> bool:

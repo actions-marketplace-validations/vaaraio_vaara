@@ -65,12 +65,20 @@ from vaara.attestation.iap import (
 )
 from vaara.attestation.transparency_log import (
     ConsistencyProof,
+    ConsistencyVerdict,
     InProcessTransparencyLog,
     InclusionProof,
     LogEntry,
     TransparencyLogError,
     verify_consistency,
     verify_inclusion,
+)
+from vaara.attestation._sev_snp_chain import (
+    SEVSNPChainVerdict,
+    fetch_amd_cert_chain,
+    fetch_vcek,
+    parse_certificate_table,
+    verify_sev_snp_chain,
 )
 from vaara.attestation.tee import (
     MockSEVSNPAttester,
@@ -101,6 +109,7 @@ from vaara.attestation.tool_call_attestation import (
     parse_attestation as sep2787_parse_attestation,
     verify_attestation as sep2787_verify_attestation,
 )
+from vaara.attestation._decision_emit import build_decision_basis
 from vaara.attestation.receipt import (
     ENFORCEMENT_SCHEMA,
     BackLink,
@@ -167,6 +176,7 @@ __all__ = [
     "EnforcementVerdict",
     "ConformalExtension",
     "ConsistencyProof",
+    "ConsistencyVerdict",
     "EnvelopeError",
     "EvidenceBundle",
     "ExecutionReceipt",
@@ -211,6 +221,7 @@ __all__ = [
     "bind_overt_envelope_to_report_data",
     "bind_record_to_report_data",
     "build_bundle_document",
+    "build_decision_basis",
     "build_handoff",
     "canonical_cbor",
     "check_receipt_revocation",
@@ -249,4 +260,9 @@ __all__ = [
     "verify_receipt_signature",
     "verify_s3p_attestation",
     "verify_sev_snp_report_signature",
+    "SEVSNPChainVerdict",
+    "fetch_amd_cert_chain",
+    "fetch_vcek",
+    "parse_certificate_table",
+    "verify_sev_snp_chain",
 ]

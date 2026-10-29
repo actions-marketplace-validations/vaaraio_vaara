@@ -9,11 +9,14 @@ zero dependencies, and the gate cleans up its own files whatever happens.
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
 from pathlib import Path
 
-from vaara.approvals import request_approval
+import pytest
+
+from vaara.approvals import approval_key_path, decision_mac, request_approval, write_decision
 
 
 def _respond(approvals_dir: Path, decision: str, captured: dict) -> threading.Thread:
@@ -24,11 +27,9 @@ def _respond(approvals_dir: Path, decision: str, captured: dict) -> threading.Th
         while time.monotonic() < deadline:
             requests = list(approvals_dir.glob("*.request.json"))
             if requests:
-                captured.update(json.loads(requests[0].read_text()))
+                captured.update(json.loads(requests[0].read_text(encoding="utf-8")))
                 action_id = requests[0].name.removesuffix(".request.json")
-                (approvals_dir / f"{action_id}.decision.json").write_text(
-                    json.dumps({"decision": decision, "decided_at": time.time()})
-                )
+                write_decision(action_id, decision, approvals_dir=approvals_dir)
                 return
             time.sleep(0.02)
 
@@ -118,11 +119,9 @@ def test_watcher_never_sees_a_half_written_request(tmp_path):
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
                 for req in d.glob("*.request.json"):
-                    seen.append(req.read_text())
+                    seen.append(req.read_text(encoding="utf-8"))
                     action_id = req.name.removesuffix(".request.json")
-                    (d / f"{action_id}.decision.json").write_text(
-                        json.dumps({"decision": "approve", "decided_at": time.time()})
-                    )
+                    write_decision(action_id, "approve", approvals_dir=d)
                     return
 
         thread = threading.Thread(target=watch, daemon=True)
@@ -138,3 +137,166 @@ def test_watcher_never_sees_a_half_written_request(tmp_path):
     assert empty_reads == 0, (
         f"a watcher read an empty request file {empty_reads} time(s) in 40 requests"
     )
+
+
+def _answer_with(approvals_dir: Path, make) -> threading.Thread:
+    """A watcher that writes whatever ``make(action_id, request)`` returns."""
+
+    def responder() -> None:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            for req in approvals_dir.glob("*.request.json"):
+                action_id = req.name.removesuffix(".request.json")
+                body = make(action_id, json.loads(req.read_text(encoding="utf-8")))
+                (approvals_dir / f"{action_id}.decision.json").write_text(json.dumps(body))
+                return
+            time.sleep(0.02)
+
+    thread = threading.Thread(target=responder, daemon=True)
+    thread.start()
+    return thread
+
+
+def test_unsigned_approval_is_not_consent(tmp_path):
+    """Any process of the user can write a decision file; that alone is not an approval."""
+    approvals = tmp_path / "approvals"
+    _answer_with(approvals, lambda a, r: {"decision": "approve", "decided_at": time.time()})
+    assert request_approval("act-u", "t", "r", approvals_dir=approvals, timeout=0.6) == "timeout"
+
+
+def test_approval_signed_with_another_key_is_not_consent(tmp_path):
+    approvals = tmp_path / "approvals"
+    other = bytes(32)
+    _answer_with(approvals, lambda a, r: {
+        "decision": "approve", "mac": decision_mac(other, a, r["nonce"], "approve")})
+    assert request_approval("act-k", "t", "r", approvals_dir=approvals, timeout=0.6) == "timeout"
+
+
+def test_a_signed_decision_does_not_answer_a_later_request(tmp_path):
+    """The nonce binds a decision to one request: an old approval cannot be replayed."""
+    approvals = tmp_path / "approvals"
+    request_approval("warmup", "t", "r", approvals_dir=approvals, timeout=0.05)
+    key = bytes.fromhex(approval_key_path(approvals).read_text(encoding="utf-8"))
+    _answer_with(approvals, lambda a, r: {
+        "decision": "approve", "mac": decision_mac(key, a, "an-earlier-nonce", "approve")})
+    assert request_approval("act-r", "t", "r", approvals_dir=approvals, timeout=0.6) == "timeout"
+
+
+def test_a_signed_approve_cannot_be_turned_into_another_decision(tmp_path):
+    approvals = tmp_path / "approvals"
+    request_approval("warmup", "t", "r", approvals_dir=approvals, timeout=0.05)
+    key = bytes.fromhex(approval_key_path(approvals).read_text(encoding="utf-8"))
+    _answer_with(approvals, lambda a, r: {
+        "decision": "approve", "mac": decision_mac(key, a, r["nonce"], "deny")})
+    assert request_approval("act-s", "t", "r", approvals_dir=approvals, timeout=0.6) == "timeout"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows files have no POSIX mode bits")
+def test_key_is_created_private_beside_the_approvals_dir(tmp_path):
+    approvals = tmp_path / "approvals"
+    request_approval("a", "t", "r", approvals_dir=approvals, timeout=0.05)
+    key = approval_key_path(approvals)
+    assert key == tmp_path / "keys" / "approval-hmac.key"
+    assert len(bytes.fromhex(key.read_text(encoding="utf-8"))) == 32
+    assert key.stat().st_mode & 0o777 == 0o600
+
+
+def test_write_decision_refuses_without_a_request(tmp_path):
+    approvals = tmp_path / "approvals"
+    request_approval("a", "t", "r", approvals_dir=approvals, timeout=0.05)
+    assert write_decision("nothing-pending", "approve", approvals_dir=approvals) is False
+
+
+def test_mac_matches_the_shared_vectors():
+    """The app signs with its own code (ApprovalSigning.swift) against these same vectors."""
+    doc = json.loads((Path(__file__).parent / "fixtures" / "approval_v1" / "vectors.json").read_text(encoding="utf-8"))
+    key = bytes.fromhex(doc["key_hex"])
+    assert len(doc["cases"]) >= 4
+    for case in doc["cases"]:
+        assert decision_mac(key, case["action_id"], case["nonce"], case["decision"]) == case["mac"]
+
+
+# ---------------------------------------------------------------------------
+# vaara-approval/v2: the decision MAC binds the call's arguments.
+# ---------------------------------------------------------------------------
+
+from vaara.approvals import parameters_digest  # noqa: E402
+
+
+def test_v2_mac_differs_from_v1_and_names_the_digest():
+    key = bytes(range(32))
+    v1 = decision_mac(key, "a", "n", "approve")
+    v2 = decision_mac(key, "a", "n", "approve", parameters_sha256="0" * 64)
+    assert v1 != v2
+    assert v2 != decision_mac(key, "a", "n", "approve", parameters_sha256="1" * 64)
+
+
+def test_approval_with_parameters_is_signed_over_their_digest(tmp_path):
+    captured: dict = {}
+    params = {"command": "make release", "cwd": "/repo"}
+    thread = _respond(tmp_path, "approve", captured)
+    result = request_approval("act-p", "Bash", "destructive", approvals_dir=tmp_path,
+                              timeout=30, parameters=params)
+    thread.join(timeout=30)
+    assert result == "approve"
+    assert result.parameters_sha256 == parameters_digest(params)
+    assert captured["parameters_sha256"] == parameters_digest(params)
+
+
+def test_approval_without_parameters_carries_no_binding(tmp_path):
+    thread = _respond(tmp_path, "approve", {})
+    result = request_approval("act-np", "t", "r", approvals_dir=tmp_path, timeout=30)
+    thread.join(timeout=30)
+    assert result == "approve"
+    assert result.parameters_sha256 is None
+
+
+def test_approval_signed_over_other_arguments_is_not_consent(tmp_path):
+    """A human who approved different arguments did not approve this call."""
+    approvals = tmp_path / "approvals"
+    request_approval("warmup", "t", "r", approvals_dir=approvals, timeout=0.05)
+    key = bytes.fromhex(approval_key_path(approvals).read_text(encoding="utf-8"))
+    other = parameters_digest({"amount": 10})
+    _answer_with(approvals, lambda a, r: {
+        "decision": "approve",
+        "mac": decision_mac(key, a, r["nonce"], "approve", parameters_sha256=other)})
+    assert request_approval("act-o", "pay", "r", approvals_dir=approvals, timeout=0.6,
+                            parameters={"amount": 10000}) == "timeout"
+
+
+def test_v1_decision_still_answers_a_request_with_parameters(tmp_path):
+    """Surfaces that sign v1 (the macOS app today) keep working, unbound."""
+    approvals = tmp_path / "approvals"
+    request_approval("warmup", "t", "r", approvals_dir=approvals, timeout=0.05)
+    key = bytes.fromhex(approval_key_path(approvals).read_text(encoding="utf-8"))
+    _answer_with(approvals, lambda a, r: {
+        "decision": "approve", "mac": decision_mac(key, a, r["nonce"], "approve")})
+    result = request_approval("act-v1", "pay", "r", approvals_dir=approvals, timeout=5,
+                              parameters={"amount": 10})
+    assert result == "approve"
+    assert result.parameters_sha256 is None
+
+
+def test_write_decision_refuses_a_request_whose_arguments_were_edited(tmp_path):
+    """The surface signs what it shows; shown arguments that no longer match
+    the recorded digest are refused rather than signed."""
+    approvals = tmp_path / "approvals"
+    request_approval("warmup", "t", "r", approvals_dir=approvals, timeout=0.05)
+    (approvals / "act-e.request.json").write_text(json.dumps({
+        "action_id": "act-e", "tool_name": "pay", "reason": "r",
+        "requested_at": time.time(), "nonce": "n1",
+        "parameters": {"amount": 10},
+        "parameters_sha256": parameters_digest({"amount": 10000}),
+    }), encoding="utf-8")
+    assert write_decision("act-e", "approve", approvals_dir=approvals) is False
+    assert not (approvals / "act-e.decision.json").exists()
+
+
+def test_v2_mac_matches_the_shared_vectors():
+    doc = json.loads((Path(__file__).parent / "fixtures" / "approval_v2" / "vectors.json").read_text(encoding="utf-8"))
+    key = bytes.fromhex(doc["key_hex"])
+    assert len(doc["cases"]) >= 3
+    for case in doc["cases"]:
+        assert parameters_digest(case["parameters"]) == case["parameters_sha256"]
+        assert decision_mac(key, case["action_id"], case["nonce"], case["decision"],
+                            parameters_sha256=case["parameters_sha256"]) == case["mac"]

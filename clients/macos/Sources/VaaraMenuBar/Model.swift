@@ -8,7 +8,66 @@
 import AppKit
 import Foundation
 import SQLite3
+import UniformTypeIdentifiers
 import UserNotifications
+#if canImport(Shared)
+import Shared
+#endif
+
+/// Where the `.vaara` tree of the engine this app watches actually sits.
+///
+/// Every engine path used to be built from the native home directory, which
+/// is right only when the engine runs on the same side of the filesystem as
+/// the app. It often does not. A Claude Code session inside a container sees
+/// the home directory the container mounts, so this app wrote settings into
+/// `/Users/<you>/.vaara` while the engine read them from the mount, and the
+/// two trees never met. Approval requests raised by the engine never reached
+/// the notch, and thresholds set in this UI never reached the scorer. Neither
+/// side reported a fault, because from each side its own tree looked fine.
+///
+/// Resolution order: the `VAARA_HOME` environment variable, then the
+/// `vaara_home` key in this app's own settings, then the native home, which
+/// is the behaviour every existing install already has.
+///
+/// This app's own `menubar.json` is deliberately not routed through here. It
+/// is the app's settings file, the app runs natively, and it is the file that
+/// would carry `vaara_home`, so it cannot live at a location it defines.
+enum VaaraHome {
+    /// Set from `Config.vaara_home` once settings are loaded. The
+    /// environment variable still wins, so a launch context can override a
+    /// stored setting without editing the file.
+    static var configured: String?
+
+    /// The directory `.vaara` sits in. Not `.vaara` itself.
+    static var root: URL {
+        let env = ProcessInfo.processInfo.environment["VAARA_HOME"] ?? ""
+        for candidate in [env, configured ?? ""] {
+            let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            let url = URL(
+                fileURLWithPath: (trimmed as NSString).expandingTildeInPath,
+                isDirectory: true)
+            // Accept either the tree that holds `.vaara` or `.vaara` itself.
+            // Both readings are natural, and picking one silently would put
+            // the app one directory away from the engine with no message.
+            return url.lastPathComponent == ".vaara"
+                ? url.deletingLastPathComponent()
+                : url
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+    }
+
+    /// The `.vaara` directory itself.
+    static var directory: URL {
+        root.appendingPathComponent(".vaara")
+    }
+
+    /// `<root>/.vaara/<component>`. The only way this app should name a path
+    /// under the engine's tree.
+    static func path(_ component: String) -> URL {
+        directory.appendingPathComponent(component)
+    }
+}
 
 enum GateState: String {
     case green, yellow, red
@@ -30,6 +89,14 @@ enum GateState: String {
     }
 }
 
+/// A decision receipt read from beside a trail and what verifying it found.
+struct ReceiptEntry: Identifiable {
+    let receipt: DecisionReceipt
+    let check: ReceiptCheck
+    let trailPath: String
+    var id: String { receipt.id }
+}
+
 struct DecisionEvent: Identifiable {
     let id: String         // "<db path>#<seq>", unique across sources
     let seq: Int64
@@ -45,6 +112,11 @@ struct PendingApproval: Identifiable, Equatable {
     let toolName: String
     let reason: String
     let requestedAt: Date
+    /// The call's arguments as the human reads them (ApprovalOperation).
+    /// Empty when the request carries none.
+    var operation: String = ""
+    /// parameters_sha256 from the request: the digest of exactly what runs.
+    var operationSHA256: String = ""
     var id: String { actionID }
 }
 
@@ -86,13 +158,25 @@ struct PresetStats {
 }
 
 struct Config: Codable {
-    var db_paths: [String] = [
+    /// The trail the first plugin builds wrote, before the engine moved to
+    /// ~/.vaara/trail/audit.db. Kept as a name so a saved config still
+    /// carrying it can be dropped when the file is gone, not shown as a fault.
+    static let legacyTrail =
         NSString(string: "~/.vaara/claude-code/audit.db").expandingTildeInPath
-    ]
+
+    /// Empty by default. Sources come from the engine's own config
+    /// (`trail_db` in ~/.vaara/config.json, `audit_db` in the plugin config)
+    /// and from discovery under ~/.vaara; explicit adds and removes persist.
+    var db_paths: [String] = []
     var alert_window_minutes: Int = 5
     var notifications: Bool = true
     var appearance: String = "dark"       // dark | light
     var menubar_graph: Bool = true        // activity sparkline next to the mark
+    /// "color": the mark in the gate's colour (green, yellow, red).
+    /// "mono": a template glyph the menu bar tints black or white to match
+    /// its own appearance, like every other status item; the gate then
+    /// shows as a dot on the mark (none, hollow, filled).
+    var menubar_icon: String = "color"
     /// Which decisions raise a system notification:
     /// "off" | "deny" (denials only) | "interventions" (denials + escalations)
     var notify_on: String = "interventions"
@@ -107,7 +191,13 @@ struct Config: Codable {
     /// (e.g. when the notch is hidden via BetterDisplay and the OS reports
     /// no safe area).
     var approval_style: String = "auto"
+    /// Kept so existing menubar.json files round-trip. Nothing reads it: the
+    /// WebKit row shows the network filter's real state instead.
     var webkitGovernance: Bool = false
+    /// Where the engine's `.vaara` tree is, when it is not this user's home.
+    /// nil means the native home, which is every install that has never had
+    /// to think about it. See `VaaraHome` for why this exists.
+    var vaara_home: String?
 
     // Tolerate configs written before a field existed, including the
     // Python proto's single db_path key, which migrates into db_paths.
@@ -126,6 +216,7 @@ struct Config: Codable {
         notifications = try c.decodeIfPresent(Bool.self, forKey: .notifications) ?? base.notifications
         appearance = try c.decodeIfPresent(String.self, forKey: .appearance) ?? base.appearance
         menubar_graph = try c.decodeIfPresent(Bool.self, forKey: .menubar_graph) ?? base.menubar_graph
+        menubar_icon = try c.decodeIfPresent(String.self, forKey: .menubar_icon) ?? base.menubar_icon
         // Migrate the old bool: false means off, true keeps the default.
         if let mode = try c.decodeIfPresent(String.self, forKey: .notify_on) {
             notify_on = mode
@@ -136,11 +227,13 @@ struct Config: Codable {
         approvals_dir = try c.decodeIfPresent(String.self, forKey: .approvals_dir)
         approval_style = try c.decodeIfPresent(String.self, forKey: .approval_style) ?? base.approval_style
         webkitGovernance = try c.decodeIfPresent(Bool.self, forKey: .webkitGovernance) ?? base.webkitGovernance
+        vaara_home = try c.decodeIfPresent(String.self, forKey: .vaara_home)
     }
 
     enum CodingKeys: String, CodingKey {
-        case db_paths, alert_window_minutes, notifications, appearance, menubar_graph
+        case db_paths, alert_window_minutes, notifications, appearance, menubar_graph, menubar_icon
         case notify_on, user_level, approvals_dir, approval_style, webkitGovernance
+        case vaara_home
         case legacy_db_path = "db_path"
     }
 
@@ -151,10 +244,15 @@ struct Config: Codable {
         try c.encode(notifications, forKey: .notifications)
         try c.encode(appearance, forKey: .appearance)
         try c.encode(menubar_graph, forKey: .menubar_graph)
+        try c.encode(menubar_icon, forKey: .menubar_icon)
         try c.encode(notify_on, forKey: .notify_on)
         try c.encode(user_level, forKey: .user_level)
         try c.encodeIfPresent(approvals_dir, forKey: .approvals_dir)
         try c.encode(approval_style, forKey: .approval_style)
+        // Both of these were decoded and never written, so the WebKit toggle
+        // and the Vaara home reverted to their defaults on the next load.
+        try c.encode(webkitGovernance, forKey: .webkitGovernance)
+        try c.encodeIfPresent(vaara_home, forKey: .vaara_home)
         // Keep the Python proto readable from the same file.
         if let first = db_paths.first {
             try c.encode(first, forKey: .legacy_db_path)
@@ -216,9 +314,28 @@ final class GateModel: ObservableObject {
     /// How far back an agent still counts as "running" (seconds).
     static let runningWindow: Double = 15 * 60
 
+    /// Trails that failed to open or to answer a query, keyed by path, with
+    /// what SQLite said. Non-empty means the gate cannot vouch for the feed
+    /// and the header goes red. Cleared per path on the next clean read.
+    @Published var trailFaults: [String: String] = [:]
+    /// What the last integrity check or repair did to each trail.
+    @Published var trailNotes: [String: String] = [:]
+    /// The one line the header shows when a trail is faulted.
+    var trailFault: String? {
+        guard let first = trailFaults.sorted(by: { $0.key < $1.key }).first
+        else { return nil }
+        return "\((first.key as NSString).lastPathComponent): \(first.value)"
+    }
+    /// Never repair the same file more often than this (seconds).
+    private static let healInterval: Double = 60
+    private var lastHeal: [String: Date] = [:]
+
     private var cursors: [String: Int64] = [:]
+    /// Last agent_seen record read per trail (`vaara scan --watch`).
+    private var agentCursors: [String: Int64] = [:]
     private var handledApprovals = Set<String>()
     private var timer: Timer?
+
     /// Where approval requests are watched. Defaults to ~/.vaara/approvals
     /// (matching the hook), overridable in config for bridge/multi-machine
     /// setups where the governed engine writes elsewhere.
@@ -226,18 +343,30 @@ final class GateModel: ObservableObject {
         if let custom = config.approvals_dir, !custom.isEmpty {
             return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath)
         }
-        return FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".vaara/approvals")
+        return VaaraHome.path("approvals")
     }
 
     func start() {
         guard timer == nil else { return }   // idempotent: never double-start
-        for path in config.db_paths { cursors[path] = maxSeq(path) }  // start at now
-        // Auto-add every Vaara trail under ~/.vaara on launch, so a normal
-        // user never has to hunt for or hand-add the audit DB. The default
-        // claude-code trail plus any MCP-proxy or older-install trails all
-        // light up on open. Explicit adds/removes still stick via config.
-        discoverTrails()
+        // A config saved by an older build carries the legacy plugin trail
+        // whether or not it exists. Drop it when the file is gone so it does
+        // not read as a fault on a box that never had it.
+        if !FileManager.default.fileExists(atPath: Config.legacyTrail) {
+            config.db_paths.removeAll { $0 == Config.legacyTrail }
+        }
+        // The engine says where it writes. That is the first source, ahead
+        // of discovery, so a trail_db outside ~/.vaara is watched too.
+        for path in engineTrailPaths() { addSource(path) }
+        for path in config.db_paths {
+            checkTrail(path)
+            cursors[path] = maxSeq(path)  // start at now
+        }
+        // An engine that lists its trails in sources.json has said where
+        // everything is. Walking ~/.vaara stays only for an older engine that
+        // writes no such file.
+        if !FileManager.default.fileExists(atPath: sourcesURL.path) {
+            discoverTrails()
+        }
         UNUserNotificationCenter.current()
             .requestAuthorization(options: [.alert, .sound]) { _, _ in }
         // Register in .common modes, not the default .scheduledTimer mode.
@@ -256,7 +385,47 @@ final class GateModel: ObservableObject {
     func addSource(_ path: String) {
         guard !config.db_paths.contains(path) else { return }
         config.db_paths.append(path)
+        checkTrail(path)
         cursors[path] = maxSeq(path)
+    }
+
+    /// Where the engine says the trail is: `trail_db` in the unified
+    /// ~/.vaara/config.json (written by `vaara init` / discovery) and
+    /// `audit_db` in the plugin config (what the hook runner reads). Only
+    /// paths that exist; a named-but-missing trail is the engine's problem
+    /// to report, not a source to watch.
+    func engineTrailPaths() -> [String] {
+        var out: [String] = listedTrails()
+        for (url, key) in [(unifiedConfigURL, "trail_db"), (pluginConfigURL, "audit_db")] {
+            guard let data = try? Data(contentsOf: url),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let raw = obj[key] as? String, !raw.isEmpty
+            else { continue }
+            let path = (raw as NSString).expandingTildeInPath
+            if FileManager.default.fileExists(atPath: path), !out.contains(path) {
+                out.append(path)
+            }
+        }
+        return out
+    }
+
+    /// The trails in the engine's sources.json that exist on this machine.
+    func listedTrails() -> [String] {
+        guard let data = try? Data(contentsOf: sourcesURL),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let entries = obj["sources"] as? [[String: Any]]
+        else { return [] }
+        let fm = FileManager.default
+        return entries.compactMap { $0["trail"] as? String }.compactMap { path in
+            if fm.fileExists(atPath: path) { return path }
+            // The engine wrote its own absolute path. When it runs in a VM or
+            // container with a shared home, this Mac sees the same file under
+            // its own ~/.vaara.
+            guard let r = path.range(of: "/.vaara/") else { return nil }
+            let local = VaaraHome.directory.appendingPathComponent(
+                String(path[r.upperBound...])).path
+            return fm.fileExists(atPath: local) ? local : nil
+        }
     }
 
     /// Scan ~/.vaara for SQLite files that hold a Vaara trail
@@ -265,20 +434,58 @@ final class GateModel: ObservableObject {
     /// installs write their own DBs; this is how they get found.
     @discardableResult
     func discoverTrails() -> Int {
-        let root = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".vaara")
+        // The enumerator does not follow a symlink at its root: it lists the
+        // link, not the directory, and finds nothing. ~/.vaara is a symlink
+        // wherever the engine runs in a VM or container whose home is shared.
         guard let walker = FileManager.default.enumerator(
-            at: root, includingPropertiesForKeys: nil,
+            at: VaaraHome.directory.resolvingSymlinksInPath(),
+            includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles]) else { return 0 }
         var added = 0
         for case let url as URL in walker {
             guard url.pathExtension == "db",
                   !config.db_paths.contains(url.path),
                   isVaaraTrail(url.path) else { continue }
+            guard let newest = newestRecord(url.path),
+                  Date().timeIntervalSince(newest) < Self.staleTrailSeconds
+            else {
+                // A trail nothing has written to in months is a leftover from
+                // an older install, and auto-adding it put a July file in the
+                // list beside the live one. Watching the dead one is what made
+                // the app look broken while it was working. Still addable by
+                // hand: this decides what appears unasked, not what is allowed.
+                continue
+            }
             addSource(url.path)
             added += 1
         }
         return added
+    }
+
+    /// How quiet a discovered trail has to be before it stops arriving on its
+    /// own. Long enough that a machine left off over a holiday still finds its
+    /// own trail on the next launch.
+    static let staleTrailSeconds: TimeInterval = 30 * 24 * 60 * 60
+
+    /// When the newest record in this trail was written, or nil when the file
+    /// holds no records or cannot be read.
+    private func newestRecord(_ path: String) -> Date? {
+        // `withDB` is itself optional-returning, so this nests: the outer nil
+        // is "could not open", the inner is "opened, no usable timestamp".
+        // Both mean the same thing here.
+        let opened: Double?? = withDB(path) { db -> Double? in
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(
+                    db, "SELECT MAX(timestamp) FROM audit_records",
+                    -1, &stmt, nil) == SQLITE_OK,
+                  sqlite3_step(stmt) == SQLITE_ROW,
+                  sqlite3_column_type(stmt, 0) != SQLITE_NULL
+            else { return nil }
+            return sqlite3_column_double(stmt, 0)
+        }
+        guard let epoch = opened ?? nil, epoch > 0 else { return nil }
+        return Date(timeIntervalSince1970: epoch)
     }
 
     private func isVaaraTrail(_ path: String) -> Bool {
@@ -296,9 +503,21 @@ final class GateModel: ObservableObject {
     func removeSource(_ path: String) {
         config.db_paths.removeAll { $0 == path }
         cursors[path] = nil
+        agentCursors[path] = nil
+        trailFaults[path] = nil
+        trailNotes[path] = nil
+        lastHeal[path] = nil
     }
 
     private func poll() {
+        // A trail the engine starts writing after launch appears here on its
+        // own: sources.json changes, and its new entries are watched.
+        let stamp = (try? FileManager.default.attributesOfItem(
+            atPath: sourcesURL.path)[.modificationDate]) as? Date
+        if stamp != sourcesStamp {
+            sourcesStamp = stamp
+            for path in listedTrails() { addSource(path) }
+        }
         for path in config.db_paths {
             let since = cursors[path] ?? maxSeq(path)
             for event in newDecisions(path, sinceSeq: since) {
@@ -307,10 +526,19 @@ final class GateModel: ObservableObject {
                 notify(event)
             }
         }
+        // `vaara scan --watch` records every agent that starts. One that
+        // Vaara does not govern is worth a notification of its own.
+        for path in config.db_paths {
+            for seen in newAgentsSeen(path) where seen.state != "governed" {
+                notifyAgent(seen)
+            }
+        }
         feed.sort { $0.timestamp > $1.timestamp }
         if feed.count > 30 { feed.removeLast(feed.count - 30) }
         handlePendingApprovals()
-        state = overallState()
+        // A trail the gate cannot read outranks whatever the readable ones
+        // say: unknown evidence is not a green light.
+        state = trailFaults.isEmpty ? overallState() : .red
         agents = agentSummaries()
         activePreset = readPluginPreset()
         enforcementMode = readPluginMode()
@@ -378,7 +606,9 @@ final class GateModel: ObservableObject {
 
     /// Write custom thresholds; the plugin applies them over the preset.
     func setCustomThresholds(escalate: Double, deny: Double) {
-        let e = max(0, min(escalate, 1)), d = max(e, min(deny, 1))
+        // Deny must sit strictly above escalate: the engine rejects an equal
+        // pair and falls back to its defaults, preset included.
+        let e = max(0, min(escalate, 0.99)), d = max(e + 0.01, min(deny, 1))
         writePluginConfig(key: "thresholds",
                           value: ["escalate": e, "deny": d])
         customThresholds = [e, d]
@@ -403,24 +633,211 @@ final class GateModel: ObservableObject {
     /// it sees every committed row. If the file is genuinely not writable, we
     /// fall back to a plain read-only open (better a slightly stale view than
     /// none).
+    ///
+    /// Every failure is recorded in `trailFaults`. Before this, an open or a
+    /// query that failed came back as nil and every caller folded that into
+    /// an empty result, so a corrupt trail and a quiet one rendered the same
+    /// green empty feed. A gate that cannot read its evidence must say so.
+    ///
+    /// Only a WAL trail is opened read-write. A trail in rollback-journal mode
+    /// is opened read-only, because its writer may sit on another machine
+    /// whose file locks this app cannot see: an engine in a VM writing over
+    /// virtiofs uses DELETE journalling, and to this app its open journal
+    /// looks hot. A read-write connection rolls a hot journal back into the
+    /// file, query_only or not, and the writer's commit then lands on a torn
+    /// database. A second opener that cannot see the writer's locks corrupts
+    /// the file this way in a Linux repro (vfs=unix-none); read-only does not.
     private func withDB<T>(_ path: String, _ body: (OpaquePointer) -> T) -> T? {
         var db: OpaquePointer?
-        var flags: Int32 = SQLITE_OPEN_READWRITE
-        if sqlite3_open_v2(path, &db, flags, nil) != SQLITE_OK {
+        var flags: Int32 = isWALFile(path) ? SQLITE_OPEN_READWRITE : SQLITE_OPEN_READONLY
+        if flags == SQLITE_OPEN_READWRITE, sqlite3_open_v2(path, &db, flags, nil) != SQLITE_OK {
             if db != nil { sqlite3_close(db); db = nil }
             flags = SQLITE_OPEN_READONLY
+        }
+        if flags == SQLITE_OPEN_READONLY {
             guard sqlite3_open_v2(path, &db, flags, nil) == SQLITE_OK else {
+                let msg = db.map { String(cString: sqlite3_errmsg($0)) } ?? "cannot open"
                 if db != nil { sqlite3_close(db) }
+                fault(path, FileManager.default.fileExists(atPath: path)
+                      ? msg : "trail file not found")
                 return nil
             }
         }
-        guard let db else { return nil }
+        guard let db else { fault(path, "cannot open"); return nil }
         defer { sqlite3_close(db) }
         if flags == SQLITE_OPEN_READWRITE {
             sqlite3_exec(db, "PRAGMA query_only = ON", nil, nil, nil)
         }
         sqlite3_busy_timeout(db, 2000)
-        return body(db)
+        let result = body(db)
+        // The body's prepare/step guards bail without a message; the
+        // connection still remembers why. Anything past DONE is a fault.
+        let rc = sqlite3_errcode(db) & 0xff
+        // Read-only meeting a journal it cannot roll back, or a held lock:
+        // a writer is mid-transaction. Not a fault; the next poll reads it.
+        if flags == SQLITE_OPEN_READONLY, rc == SQLITE_READONLY || rc == SQLITE_BUSY {
+            return nil
+        }
+        if rc != SQLITE_OK, rc != SQLITE_ROW, rc != SQLITE_DONE {
+            fault(path, String(cString: sqlite3_errmsg(db)))
+            if rc == SQLITE_CORRUPT || rc == SQLITE_NOTADB { checkTrail(path) }
+            return nil
+        }
+        if trailFaults[path] != nil { trailFaults[path] = nil }
+        return result
+    }
+
+    /// Only watched sources carry faults. Discovery probes every .db under
+    /// ~/.vaara, and a stray non-SQLite file there is not a broken trail.
+    private func fault(_ path: String, _ message: String) {
+        guard config.db_paths.contains(path) else { return }
+        if trailFaults[path] != message { trailFaults[path] = message }
+    }
+
+    /// True when the database header says WAL: bytes 18 and 19 (file format
+    /// write and read versions) are 2. Anything else, including a file too
+    /// short to have a header, counts as rollback-journal.
+    func isWALFile(_ path: String) -> Bool {
+        guard let fh = FileHandle(forReadingAtPath: path) else { return false }
+        defer { try? fh.close() }
+        guard let head = try? fh.read(upToCount: 20), head.count == 20 else { return false }
+        let bytes = [UInt8](head)
+        return bytes[18] == 2 && bytes[19] == 2
+    }
+
+    /// `PRAGMA quick_check` on open and whenever a read reports corruption.
+    /// A failed check gets one `REINDEX`, since every corruption seen on this
+    /// trail so far was index-only (`wrong # of entries`) and the chain lives
+    /// in the rows, not the indexes. If the file is still bad after that, the
+    /// fault stays up and the note says what was tried. Throttled per file.
+    /// Only a WAL trail gets the REINDEX: a rollback-journal trail may have a
+    /// writer on another machine (see `withDB`), so it is checked read-only
+    /// and its repair is left to `vaara trail repair` on the writer's side.
+    @discardableResult
+    func checkTrail(_ path: String) -> Bool {
+        guard config.db_paths.contains(path) else { return false }
+        if let last = lastHeal[path], Date().timeIntervalSince(last) < Self.healInterval {
+            return trailFaults[path] == nil
+        }
+        lastHeal[path] = Date()
+        let wal = isWALFile(path)
+        var db: OpaquePointer?
+        let flags: Int32 = wal ? SQLITE_OPEN_READWRITE : SQLITE_OPEN_READONLY
+        guard sqlite3_open_v2(path, &db, flags, nil) == SQLITE_OK, let db else {
+            if db != nil { sqlite3_close(db) }
+            trailNotes[path] = wal ? "integrity check skipped: not writable"
+                                   : "integrity check skipped: cannot open"
+            return false
+        }
+        defer { sqlite3_close(db) }
+        sqlite3_busy_timeout(db, 5000)
+
+        func quickCheck() -> String {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(db, "PRAGMA quick_check", -1, &stmt, nil) == SQLITE_OK,
+                  sqlite3_step(stmt) == SQLITE_ROW,
+                  let text = sqlite3_column_text(stmt, 0)
+            else { return String(cString: sqlite3_errmsg(db)) }
+            return String(cString: text)
+        }
+
+        let first = quickCheck()
+        if first == "ok" {
+            // A trail can be perfectly intact and have nothing writing to it.
+            // Saying only "integrity ok" next to a file last touched in July
+            // is what let a dead source sit in the list looking healthy.
+            trailNotes[path] = staleNote(path) ?? "integrity ok"
+            return true
+        }
+        if !wal {
+            let rc = sqlite3_errcode(db) & 0xff
+            if rc == SQLITE_READONLY || rc == SQLITE_BUSY {
+                // A writer is mid-transaction; check again after the interval.
+                lastHeal[path] = nil
+                return trailFaults[path] == nil
+            }
+            trailNotes[path] = "integrity: \(first); not repaired here, run `vaara trail repair` where the engine runs"
+            fault(path, "corrupt: \(first)")
+            return false
+        }
+        if sqlite3_exec(db, "REINDEX", nil, nil, nil) != SQLITE_OK {
+            let msg = String(cString: sqlite3_errmsg(db))
+            trailNotes[path] = "integrity: \(first); reindex failed: \(msg)"
+            fault(path, "corrupt, repair failed: \(msg)")
+            return false
+        }
+        let second = quickCheck()
+        if second == "ok" {
+            trailNotes[path] = "repaired: \(first) -> ok after reindex"
+            trailFaults[path] = nil
+            return true
+        }
+        trailNotes[path] = "integrity still failing after reindex: \(second)"
+        fault(path, "corrupt: \(second)")
+        return false
+    }
+
+    /// "integrity ok, but nothing written since <date>", or nil when the
+    /// trail is live. Read by `checkTrail`, which otherwise reports only
+    /// whether the file is readable.
+    private func staleNote(_ path: String) -> String? {
+        guard let newest = newestRecord(path) else {
+            return "integrity ok, but the trail holds no records"
+        }
+        guard Date().timeIntervalSince(newest) >= Self.staleTrailSeconds else {
+            return nil
+        }
+        let when = DateFormatter()
+        when.dateStyle = .medium
+        when.timeStyle = .none
+        return "integrity ok, but nothing written since \(when.string(from: newest))"
+    }
+
+    struct AgentSeen { let agent: String; let state: String; let detail: String }
+
+    /// agent_seen records written since the last poll. The first read of a
+    /// trail only sets the cursor, so launching the app does not replay
+    /// every agent the watcher ever saw.
+    private func newAgentsSeen(_ path: String) -> [AgentSeen] {
+        guard let since = agentCursors[path] else {
+            agentCursors[path] = maxSeq(path)
+            return []
+        }
+        let rows: [(Int64, AgentSeen)] = withDB(path) { db in
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(db, """
+                SELECT seq, agent_id, data FROM audit_records
+                WHERE event_type = 'agent_seen' AND seq > ? ORDER BY seq
+                """, -1, &stmt, nil) == SQLITE_OK else { return [] }
+            sqlite3_bind_int64(stmt, 1, since)
+            var out: [(Int64, AgentSeen)] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let data = parseData(sqlite3_column_text(stmt, 2))
+                out.append((sqlite3_column_int64(stmt, 0), AgentSeen(
+                    agent: String(cString: sqlite3_column_text(stmt, 1)),
+                    state: data["state"] as? String ?? "",
+                    detail: data["detail"] as? String ?? "")))
+            }
+            return out
+        } ?? []
+        if let last = rows.last?.0 { agentCursors[path] = last }
+        return rows.map(\.1)
+    }
+
+    private func notifyAgent(_ seen: AgentSeen) {
+        guard config.notifications, config.notify_on != "off" else { return }
+        let content = UNMutableNotificationContent()
+        content.title = seen.state == "reachable"
+            ? "Vaara: \(seen.agent) started, not governed yet"
+            : "Vaara: ungoverned agent started"
+        content.subtitle = seen.agent
+        content.body = seen.detail
+        content.sound = .default
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: UUID().uuidString,
+                                  content: content, trigger: nil))
     }
 
     private func maxSeq(_ path: String) -> Int64 {
@@ -441,9 +858,12 @@ final class GateModel: ObservableObject {
         let data = parseData(sqlite3_column_text(stmt, 4))
         let decision = (data["decision"] as? String) ?? ""
         let verdict: String
+        // An escalation is two records, decision_made "escalate" and then
+        // escalation_sent for the same action. Only the decision is shown,
+        // or every escalation lands twice in the feed and the register.
         if eventType == "action_blocked" || decision == "deny" {
             verdict = "deny"
-        } else if eventType == "escalation_sent" || decision == "escalate" {
+        } else if decision == "escalate" {
             verdict = "escalate"
         } else if includeAllows && eventType == "decision_made" && decision == "allow" {
             verdict = "allow"
@@ -509,6 +929,89 @@ final class GateModel: ObservableObject {
             all.append(contentsOf: events)
         }
         return Array(all.sorted { $0.timestamp > $1.timestamp }.prefix(limit))
+    }
+
+    /// The signed decision receipts the engine wrote beside every watched
+    /// trail (`<trail dir>/receipts/`), newest first, each verified here with
+    /// the app's own code: signature, evidence digest, and the record the
+    /// trail holds.
+    func receipts(limit: Int = 100) -> [ReceiptEntry] {
+        var all: [ReceiptEntry] = []
+        let fm = FileManager.default
+        for path in config.db_paths {
+            let dir = URL(fileURLWithPath: path).deletingLastPathComponent()
+                .appendingPathComponent("receipts")
+            let pem = try? String(contentsOf: dir.appendingPathComponent("issuer-es256.pub.pem"),
+                                  encoding: .utf8)
+            // Day folders sort by name; newest day first, newest file first.
+            let days = ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? [])
+                .filter { $0.count == 10 && $0.hasPrefix("20") }
+                .sorted(by: >)
+            var loaded: [DecisionReceipt] = []
+            for day in days where loaded.count < limit {
+                let dayURL = dir.appendingPathComponent(day)
+                let files = ((try? fm.contentsOfDirectory(
+                    at: dayURL, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
+                    .filter { $0.pathExtension == "json" }
+                for url in files {
+                    if let r = try? DecisionReceipt(url: url) { loaded.append(r) }
+                }
+            }
+            let hashes = recordHashes(path, ids: loaded.map(\.recordId))
+            for r in loaded {
+                // nil = the trail could not be read; "" = it has no such record.
+                let stored: String? = hashes.map { table in table[r.recordId] ?? "" }
+                let check: ReceiptCheck
+                if let pem {
+                    check = r.verify(publicKeyPEM: pem, trailRecordHash: stored)
+                } else {
+                    check = ReceiptCheck(signature: false, evidence: false, trail: nil,
+                                         detail: "issuer key missing beside the receipts")
+                }
+                all.append(ReceiptEntry(receipt: r, check: check, trailPath: path))
+            }
+        }
+        return Array(all.sorted { $0.receipt.decidedAt > $1.receipt.decidedAt }.prefix(limit))
+    }
+
+    /// Record hashes for the given record ids, or nil when the trail is unreadable.
+    private func recordHashes(_ path: String, ids: [String]) -> [String: String]? {
+        guard !ids.isEmpty else { return [:] }
+        return withDB(path) { db -> [String: String] in
+            var out: [String: String] = [:]
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(
+                    db, "SELECT record_hash FROM audit_records WHERE record_id = ?",
+                    -1, &stmt, nil) == SQLITE_OK else { return out }
+            for id in ids {
+                sqlite3_reset(stmt)
+                sqlite3_bind_text(stmt, 1, id, -1,
+                                  unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+                if sqlite3_step(stmt) == SQLITE_ROW, let text = sqlite3_column_text(stmt, 0) {
+                    out[id] = String(cString: text)
+                }
+            }
+            return out
+        }
+    }
+
+    /// Save a copy of a receipt, with the issuer public key beside it, so it
+    /// verifies elsewhere (`vaara receipt verify-decision FILE --key KEY`).
+    func exportReceipt(_ entry: ReceiptEntry) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "vaara-receipt-\(entry.receipt.recordId).json"
+        panel.allowedContentTypes = [.json]
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let dest = panel.url else { return }
+        let fm = FileManager.default
+        try? fm.removeItem(at: dest)
+        try? fm.copyItem(at: entry.receipt.url, to: dest)
+        let key = entry.receipt.url.deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("issuer-es256.pub.pem")
+        let keyDest = dest.deletingPathExtension().appendingPathExtension("issuer-es256.pub.pem")
+        try? fm.removeItem(at: keyDest)
+        try? fm.copyItem(at: key, to: keyDest)
     }
 
     /// Recent interventions (deny/escalate) for one agent, newest first.
@@ -608,10 +1111,11 @@ final class GateModel: ObservableObject {
                     if acc[agent] == nil { acc[agent] = Acc() }
                     acc[agent]!.lastSeen = max(acc[agent]!.lastSeen, ts)
 
+                    // escalation_sent follows the decision_made "escalate"
+                    // it repeats; counting both counted each escalation twice.
                     let verdict: GateState?
                     switch eventType {
                     case "action_blocked":  verdict = .red
-                    case "escalation_sent": verdict = .yellow
                     case "decision_made":
                         switch (parseData(sqlite3_column_text(stmt, 2))["decision"] as? String) ?? "" {
                         case "deny":     verdict = .red
@@ -654,16 +1158,21 @@ final class GateModel: ObservableObject {
 
     // MARK: - Protection presets (the plugin's threshold profile)
 
-    private let pluginConfigURL = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".vaara/claude-code/config.json")
+    // Computed, not stored: `VaaraHome.configured` is set once settings load,
+    // which happens after this object exists. A stored `let` would freeze the
+    // native home in before the setting had been read.
+    private var pluginConfigURL: URL { VaaraHome.path("claude-code/config.json") }
 
     /// The unified engine config (auto-init / `vaara menu` own its
     /// shape). The GATE picker must flip BOTH files: writing only the
     /// plugin config left every non-hook runtime (proxy, llm-proxy,
     /// MCP server) on its previous mode — the settings UI then showed
     /// "Block" while the engine was observing.
-    private let unifiedConfigURL = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".vaara/config.json")
+    private var unifiedConfigURL: URL { VaaraHome.path("config.json") }
+    /// Every trail the engine writes, listed by the engine itself
+    /// (src/vaara/audit/sources.py). Replaces walking ~/.vaara for .db files.
+    private var sourcesURL: URL { VaaraHome.path("sources.json") }
+    private var sourcesStamp: Date?
 
     private func readPluginPreset() -> String {
         guard let data = try? Data(contentsOf: pluginConfigURL),
@@ -826,7 +1335,9 @@ final class GateModel: ObservableObject {
                 toolName: req["tool_name"] as? String ?? "?",
                 reason: req["reason"] as? String ?? "",
                 requestedAt: Date(timeIntervalSince1970:
-                    (req["requested_at"] as? Double) ?? Date().timeIntervalSince1970))
+                    (req["requested_at"] as? Double) ?? Date().timeIntervalSince1970),
+                operation: ApprovalOperation.render(req["parameters"]),
+                operationSHA256: req["parameters_sha256"] as? String ?? "")
             pendingApproval = pending
             NSApp.activate(ignoringOtherApps: true)
             return
@@ -835,15 +1346,27 @@ final class GateModel: ObservableObject {
 
     /// Write the human's decision for an escalated action. The blocked
     /// hook (or proxy) is polling for this file and proceeds or fails
-    /// closed the moment it lands. Approve is the only way through.
+    /// closed the moment it lands. Approve is the only way through, and only
+    /// signed: the gate ignores a decision without a valid `mac` (see
+    /// ApprovalSigning), so without the key or the request's nonce the
+    /// request times out, which the gate treats as a deny.
     func resolveApproval(_ actionID: String, approve: Bool) {
         handledApprovals.insert(actionID)
-        let payload: [String: Any] =
-            ["decision": approve ? "approve" : "deny",
+        let decision = approve ? "approve" : "deny"
+        var payload: [String: Any] =
+            ["decision": decision,
              "decided_at": Date().timeIntervalSince1970]
+        let request = approvalsDir.appendingPathComponent("\(actionID).request.json")
+        if let data = try? Data(contentsOf: request),
+           let req = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let nonce = req["nonce"] as? String,
+           let key = ApprovalSigning.loadKey(approvalsDir: approvalsDir) {
+            payload["mac"] = ApprovalSigning.mac(
+                key: key, actionID: actionID, nonce: nonce, decision: decision)
+        }
         if let data = try? JSONSerialization.data(withJSONObject: payload) {
             try? data.write(to: approvalsDir
-                .appendingPathComponent("\(actionID).decision.json"))
+                .appendingPathComponent("\(actionID).decision.json"), options: .atomic)
         }
         if pendingApproval?.actionID == actionID { pendingApproval = nil }
     }

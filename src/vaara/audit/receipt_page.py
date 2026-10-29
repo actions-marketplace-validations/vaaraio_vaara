@@ -44,10 +44,11 @@ def _esc(value: Any) -> str:
 
 
 def _scitt_detail(receipt: dict, anchor: dict) -> tuple[str, str, bool]:
-    """(status, detail line, verified_here) for a SCITT anchor.
+    """(status, detail line, verified_here) for a ``scitt`` anchor.
 
     Re-checks the inclusion proof against the receipt by recomputing the
-    Merkle root from (leaf, proof) — no key, no operator to trust.
+    Merkle root from (leaf, proof). The root itself is the log operator's
+    claim; the page has no independently held tree head, and says so.
     """
     from vaara.audit.scitt_anchor import ScittAnchorError, verify_scitt_anchor
     try:
@@ -56,7 +57,8 @@ def _scitt_detail(receipt: dict, anchor: dict) -> tuple[str, str, bool]:
         return f"INVALID: {exc}", "", True
     if result["verified"]:
         return ("verified",
-                f"leaf {result['leaf_index']} in tree of {result['tree_size']}",
+                f"leaf {result['leaf_index']} in tree of {result['tree_size']}; "
+                f"root {result['root']}",
                 True)
     return (f"INVALID: {result['status']}",
             f"leaf {result['leaf_index']}", True)
@@ -109,7 +111,7 @@ def _chain_steps(receipt: dict, digest_hex: str) -> list[tuple[str, str]]:
             continue
         method = anchor.get("method", "?")
         if method == "scitt":
-            steps.append(("SCITT transparency log",
+            steps.append(("scitt Merkle log",
                           f"leaf {anchor.get('leafIndex', '?')}"))
         else:
             steps.append((f"{method} anchor",
@@ -132,7 +134,12 @@ def render_receipt_page(receipt: dict, *, title: str | None = None) -> str:
             status, detail, verified = _scitt_detail(receipt, anchor)
             checked = ("inclusion proof re-checked by recomputation" if verified
                        else "status as recorded, not re-checked here")
-        elif method == "rfc3161-eidas-qualified":
+        elif method in ("rfc3161-eidas-qualified",
+                        "rfc3161-eidas-qualified-blinded"):
+            # The blinded method is the same qualified token over a salted
+            # digest (SPEC.md 4.1). It renders the same way, or a blinded
+            # anchor would drop to the generic branch and stop reading as
+            # qualified on the page a relying party is shown.
             status, detail, rechecked = _qualified_detail(receipt, anchor)
             checked = ("digest binding re-checked offline; the QTSP pin needs "
                        "the certificate held out of band, not re-checked here"
@@ -156,8 +163,10 @@ def render_receipt_page(receipt: dict, *, title: str | None = None) -> str:
         f'<div class="val">{_esc(value)}</div></div><div class="arrow">&#8595;</div>'
         for label, value in _chain_steps(receipt, digest_hex)
     )
-    final = "SCITT transparency log" if any(a.get("method") == "scitt" for a in anchors) else "witness anchors above"
-    chain_html += (f'<div class="step final"><div class="lbl">public witness</div>'
+    final = ("scitt log head, once a third party holds it"
+             if any(a.get("method") == "scitt" for a in anchors)
+             else "witness anchors above")
+    chain_html += (f'<div class="step final"><div class="lbl">witness</div>'
                    f'<div class="val">{_esc(final)}</div></div>')
 
     facts = [
@@ -178,8 +187,8 @@ def render_receipt_page(receipt: dict, *, title: str | None = None) -> str:
     page_title = title or f'{b["name"]} receipt evidence'
     has_scitt = any(a.get("method") == "scitt" for a in anchors)
     verify_cmds = _esc(
-        "vaara receipt anchor-scitt receipt.json  # add SCITT inclusion proof\n"
-        "vaara verify-bundle bundle.json           # full offline verification"
+        "vaara receipt verify-scitt receipt.json --head head.json  # anchor vs a published log head\n"
+        "vaara verify-bundle bundle.json                           # full offline verification"
     ) if has_scitt else _esc("vaara verify-bundle bundle.json")
 
     return f"""<!doctype html>

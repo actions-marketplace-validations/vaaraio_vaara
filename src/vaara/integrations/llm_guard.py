@@ -58,9 +58,9 @@ def parse_scan_result(
     """Parse an ``llm_guard.scan_prompt``/``scan_output`` result triple.
 
     A scanner is "triggered" when ``results_valid[name] is False``.
-    Score range is implementation-defined per scanner. LLM Guard
-    typically returns ``0.0`` for pass and a non-zero risk score on
-    failure.
+    LLM Guard 0.3 scores each scanner from -1.0 (clearly valid) to 1.0
+    (clearly invalid). Only a triggered scanner's score becomes the
+    category severity; a passing scanner is recorded at 0.
     """
     cats: list[FindingCategory] = []
     for raw_name, valid in (results_valid or {}).items():
@@ -86,11 +86,13 @@ def parse_scan_result(
     }
     if sanitized_text is not None:
         raw["sanitized_text_length"] = len(sanitized_text)
+    # No scanner result at all is not a pass: nothing was scanned.
     return build_finding(
         provider=_PROVIDER,
         categories=cats,
         raw=raw,
         scanned_role=scanned_role,
+        understood=bool(results_valid),
     )
 
 

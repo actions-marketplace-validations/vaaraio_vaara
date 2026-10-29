@@ -20,10 +20,10 @@ Signing modes and key auto-detection:
 ``"{upstream_name}"``.
 
 ``serverFingerprint`` starts as ``cmd:sha256:{hex}`` (SHA-256 of the upstream
-command string, computed at construction). The first ``tools/list`` response
-per upstream upgrades it to ``manifest:sha256:{hex}`` (SHA-256 of the
-canonical JSON of the effective tools array), binding the exact capability set
-the proxy presented to the agent.
+command string, computed at construction). Every complete ``tools/list``
+response per upstream replaces it with ``manifest:sha256:{hex}`` (SHA-256 of
+the canonical JSON of the effective tools array), binding the exact capability
+set the proxy last presented to the agent.
 
 Intent defaults to ``tools/call/{tool_name}``. Operators can supply a richer
 label via the ``X-Vaara-Intent`` HTTP request header; stdio transport uses the
@@ -43,7 +43,10 @@ import json
 import logging
 import threading
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional, cast
+
+if TYPE_CHECKING:
+    from vaara.attestation._attest_types import Algorithm
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +57,15 @@ _ISS = "vaara-mcp-proxy"
 # so an absent receipt for it is silence, not a clean negative. Stamped into
 # every authorization receipt's coverage block.
 _COVERAGE_SCOPE = "calls-routed-through-chokepoint"
+
+# The execution side gets its own sequence, under its own boundary id.
+#
+# A shared counter across both halves of the pair would read every denied call
+# as a gap, because a deny legitimately mints an authorization receipt and no
+# execution receipt. Two sequences under one id would be worse still: a reader
+# could not tell which population a seq belongs to. So the id says which stream
+# it counts, and `_next_completeness` stays keyed by whatever id it is handed.
+_EXEC_BOUNDARY = f"{_ISS}#execution"
 
 
 class AttestConfigError(RuntimeError):
@@ -77,17 +89,26 @@ class AttestPairEmitter:
         upstream_commands: dict[str, list[str]],
         exp_seconds: int = 300,
         tool_constraints: "Optional[dict[str, tuple[Any, ...]]]" = None,
+        revocation: Any = None,
+        clock_skew_seconds: int = 30,
+        expected_tenant: Optional[str] = None,
+        max_staleness_seconds: Optional[float] = None,
     ) -> None:
         from vaara.attestation._attest_types import VALID_ALGS
         if alg not in VALID_ALGS:
             raise AttestConfigError(f"unsupported alg: {alg!r}; use HS256, ES256, or RS256")
         self._signing_key = signing_key
-        self._alg = alg
+        # Checked against VALID_ALGS above.
+        self._alg: Algorithm = cast("Algorithm", alg)
         self._receipts_dir = Path(receipts_dir)
         self._receipts_dir.mkdir(parents=True, exist_ok=True)
         self._secret_version = secret_version
         self._exp_seconds = exp_seconds
         self._tool_constraints: dict[str, tuple[Any, ...]] = tool_constraints or {}
+        self._revocation = revocation
+        self._clock_skew_seconds = clock_skew_seconds
+        self._expected_tenant = expected_tenant
+        self._max_staleness_seconds = max_staleness_seconds
         self._counter = 0
         # Per-coverage-boundary sequence for authorization receipts, gap-free by
         # construction. Distinct from ``_counter`` (the per-call attestation id):
@@ -96,8 +117,8 @@ class AttestPairEmitter:
         # seq is a provable gap. Guarded by ``_lock``.
         self._completeness: dict[str, int] = {}
         self._lock = threading.Lock()
-        # cmd-hash fingerprints pre-computed at construction; upgraded to
-        # manifest-hash on first tools/list response per upstream.
+        # cmd-hash fingerprints pre-computed at construction; replaced by the
+        # manifest-hash on every complete tools/list per upstream.
         self._fingerprints: dict[str, str] = {
             name: _cmd_hash(cmd) for name, cmd in upstream_commands.items()
         }
@@ -105,6 +126,13 @@ class AttestPairEmitter:
         # Fail-closed gateway for tools listed in tool_constraints. Built once at
         # init so the verifying material stays paired with the signing key. Only
         # present when tool_constraints is non-empty; absent = no enforcement.
+        #
+        # revocation defaults to None, and verify_grant skips its revocation
+        # branch entirely when no registry is supplied. A proxy started without
+        # --attest-revocation-registry therefore does not check revocation at
+        # all: it is not that every credential passes the check, it is that the
+        # check does not run. The same holds for the staleness bound, which
+        # needs a registry before it can mean anything.
         self._gateway: "Optional[Any]" = None
         if self._tool_constraints:
             try:
@@ -117,6 +145,10 @@ class AttestPairEmitter:
                 self._gateway = CredentialGateway(
                     verifying_material=vm,
                     receipts_dir=self._receipts_dir,
+                    expected_tenant=self._expected_tenant,
+                    revocation=self._revocation,
+                    clock_skew_seconds=self._clock_skew_seconds,
+                    max_staleness_seconds=self._max_staleness_seconds,
                 )
             except Exception:
                 logger.exception("Failed to build CredentialGateway for tool constraints")
@@ -132,34 +164,19 @@ class AttestPairEmitter:
     def is_constrained(self, tool_name: str) -> bool:
         return tool_name in self._tool_constraints
 
-    def update_manifest_fingerprint(
-        self, upstream_name: str, tools_list_response: dict
-    ) -> None:
-        """Upgrade from cmd-hash to manifest-hash on first tools/list response.
+    def set_manifest_fingerprint(self, upstream_name: str, digest_hex: str) -> None:
+        """Bind later receipts for this upstream to the manifest just listed.
 
-        Hashes the canonical JSON of the tools array from the response (which
-        may be post-operator-filter, binding the effective capability set the
-        proxy presents to agents). Idempotent after the first upgrade.
+        Called on every complete tools/list, not just the first: a server can
+        change its tools mid-session, and a fingerprint frozen at the first
+        list would certify a surface the server no longer presents.
         """
         with self._lock:
-            current = self._fingerprints.get(upstream_name, "")
-        if current.startswith("manifest:sha256:"):
-            return
-        try:
-            from vaara.attestation._attest_canonical import canonical_json
-            result = tools_list_response.get("result") or {}
-            tools = result.get("tools") or []
-            manifest_bytes = canonical_json({"tools": tools})
-            h = hashlib.sha256(manifest_bytes).hexdigest()
-            with self._lock:
-                self._fingerprints[upstream_name] = f"manifest:sha256:{h}"
-            logger.debug(
-                "Manifest fingerprint for upstream %r: sha256:...%s", upstream_name, h[-8:]
-            )
-        except Exception:
-            logger.exception(
-                "Failed to capture manifest fingerprint for upstream %r", upstream_name
-            )
+            self._fingerprints[upstream_name] = f"manifest:sha256:{digest_hex}"
+        logger.debug(
+            "Manifest fingerprint for upstream %r: sha256:...%s",
+            upstream_name, digest_hex[-8:],
+        )
 
     def fingerprint_for(self, upstream_name: str) -> str:
         """Best available fingerprint: manifest if captured, cmd-hash otherwise."""
@@ -220,7 +237,7 @@ class AttestPairEmitter:
 
             nonce_tag = attestation.issuer_asserted.nonce[:8]
             path = self._receipts_dir / f"{counter:010d}-{nonce_tag}-attest.json"
-            path.write_text(json.dumps(attestation.to_dict(), indent=2), encoding="utf-8")
+            path.write_text(json.dumps(attestation.to_dict(), indent=2), encoding="utf-8", newline="\n")
             logger.debug("Attestation %s tool=%r upstream=%r", path.name, tool_name, upstream_name)
             return (attestation, counter)
         except Exception:
@@ -283,7 +300,7 @@ class AttestPairEmitter:
             nonce_tag = attestation.issuer_asserted.nonce[:8]
             path = self._receipts_dir / f"{counter:010d}-{nonce_tag}-grant.json"
             path.write_text(
-                json.dumps(credential.to_dict(), indent=2), encoding="utf-8"
+                json.dumps(credential.to_dict(), indent=2), encoding="utf-8", newline="\n"
             )
             logger.debug(
                 "Grant %s tool=%r upstream=%r", path.name, tool_name, upstream_name
@@ -396,6 +413,7 @@ class AttestPairEmitter:
                     indent=2,
                 ),
                 encoding="utf-8",
+                newline="\n",
             )
             logger.debug(
                 "Authorization receipt %s verdict=%s", path.name, auth.evidence["verdict"]
@@ -413,24 +431,53 @@ class AttestPairEmitter:
         outcome_severity: float,
         upstream_name: str,
         tenant_id: str,
+        task_id: Optional[str] = None,
+        outcome_state: Optional[str] = None,
     ) -> None:
         """Build, sign, and persist an execution receipt paired to the attestation.
 
-        ``outcome_severity == 0.0`` maps to ``executed``; anything above maps
-        to ``errored``. Failures are logged and swallowed.
+        ``outcome_state == "unobserved"`` (the request may have reached the
+        server and no reply was read) maps to ``unobserved``, with no result
+        commitment. Otherwise ``outcome_severity == 0.0`` maps to ``executed``
+        and anything above maps to ``errored``, which keeps ``not_sent`` and
+        ``failed`` as ``errored``. ``task_id`` is the MCP related-task id the call
+        carried, if any; it is signed into the receipt so the receipt can
+        later be shown to belong to that task. Failures are logged and
+        swallowed.
         """
         try:
             from vaara.attestation.receipt import emit_receipt as _emit_receipt, make_back_link
             from vaara.attestation._receipt_types import OutcomeDerived
             from vaara.attestation._attest_canonical import now_iso8601
 
-            status: str = "errored" if outcome_severity > 0.0 else "executed"
+            status: Literal["errored", "executed", "unobserved"]
+            if outcome_state == "unobserved":
+                status = "unobserved"
+            else:
+                status = "errored" if outcome_severity > 0.0 else "executed"
             back_link = make_back_link(attestation)
             outcome = OutcomeDerived(
                 status=status,
                 completed_at=now_iso8601(),
             )
             sub = f"{tenant_id}/{upstream_name}" if tenant_id else upstream_name
+
+            # Completeness over executions. Consumed here, before the receipt is
+            # signed and written, exactly as the authorization side does it: a
+            # write that fails after this leaves a seq with no persisted receipt,
+            # and that gap is the finding rather than a bug in the counter.
+            #
+            # This is what lets a holder tell "the action never ran" from "the
+            # receipt was dropped". Until it existed, the execution side had no
+            # contiguity to break, so the set difference against the
+            # authorization side produced a list to investigate instead of an
+            # answer.
+            seq, running_count = self._next_completeness(_EXEC_BOUNDARY)
+            completeness = {
+                "boundaryId": _EXEC_BOUNDARY,
+                "seq": seq,
+                "runningCount": running_count,
+            }
 
             receipt = _emit_receipt(
                 back_link=back_link,
@@ -440,11 +487,13 @@ class AttestPairEmitter:
                 secret_version=self._secret_version,
                 alg=self._alg,
                 signing_material=self._signing_key,
+                completeness=completeness,
+                task_id=task_id,
             )
 
             nonce_tag = attestation.issuer_asserted.nonce[:8]
             path = self._receipts_dir / f"{counter:010d}-{nonce_tag}-receipt.json"
-            path.write_text(json.dumps(receipt.to_dict(), indent=2), encoding="utf-8")
+            path.write_text(json.dumps(receipt.to_dict(), indent=2), encoding="utf-8", newline="\n")
             logger.debug("Receipt %s status=%s", path.name, status)
         except Exception:
             logger.exception("Execution receipt emission failed")
@@ -477,6 +526,10 @@ def build_attest_emitter(
     secret_version: Optional[str] = None,
     exp_seconds: int = 300,
     tool_constraints_path: Optional[Path] = None,
+    revocation_registry_path: Optional[Path] = None,
+    clock_skew_seconds: int = 30,
+    expected_tenant: Optional[str] = None,
+    max_staleness_seconds: Optional[float] = None,
 ) -> AttestPairEmitter:
     """Load signing key from path and return an ``AttestPairEmitter``.
 
@@ -559,6 +612,34 @@ def build_attest_emitter(
         for tname, cap_list in raw_cfg.get("tools", {}).items():
             tool_constraints[tname] = tuple(capability_from_dict(c) for c in cap_list)
 
+    revocation = None
+    if revocation_registry_path is not None:
+        from vaara.attestation._revocation import RevocationRegistry
+
+        rev_path = Path(revocation_registry_path).expanduser()
+        if not rev_path.is_file():
+            raise AttestConfigError(
+                f"--attest-revocation-registry file not found: {rev_path}"
+            )
+        try:
+            revocation = RevocationRegistry.from_dict(
+                json.loads(rev_path.read_text(encoding="utf-8"))
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            # Refuse to start rather than fall back to no registry. Starting
+            # without one is a valid configuration, but it has to be chosen,
+            # not arrived at because a file failed to parse.
+            raise AttestConfigError(
+                f"--attest-revocation-registry is not a usable registry: {exc}"
+            ) from exc
+
+    if max_staleness_seconds is not None and revocation is None:
+        raise AttestConfigError(
+            "--attest-max-revocation-staleness-seconds has no effect without "
+            "--attest-revocation-registry: there is no registry whose age "
+            "could be bounded."
+        )
+
     return AttestPairEmitter(
         signing_key=signing_material,
         alg=alg,
@@ -567,4 +648,8 @@ def build_attest_emitter(
         upstream_commands=upstream_commands,
         exp_seconds=exp_seconds,
         tool_constraints=tool_constraints or None,
+        revocation=revocation,
+        clock_skew_seconds=clock_skew_seconds,
+        expected_tenant=expected_tenant,
+        max_staleness_seconds=max_staleness_seconds,
     )

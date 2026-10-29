@@ -1,0 +1,54 @@
+{
+  "evidence": {
+    "actionId": "vector-action-5",
+    "agentId": "vector-agent",
+    "cage": {
+      "confirmed": false,
+      "driver": "none"
+    },
+    "decidedAt": "2026-10-14T19:51:39.696Z",
+    "decision": "deny",
+    "eventType": "action_blocked",
+    "previousHash": "sha256:051a900a3292d62b4958caae37c3bcdc2755baac3be33919cabe99808255da50",
+    "reason": "He said \"no\"\n\ttab \u0001 back\\slash / \u00e4 \u20ac \ud83d\ude00 \u2028",
+    "recordHash": "sha256:3b9405391e0c69def15305d39b72fdc82c98981c24e0eba5dfed0cc59bc2c227",
+    "recordId": "bd387142-1845-4387-aa7c-ade8c4a43bb5",
+    "refusal": {
+      "basis": "undetermined"
+    },
+    "riskScore": "0.5",
+    "schema": "vaara.trail-decision/v0",
+    "tenantId": "",
+    "toolName": "mcp__fs__write_\u00e4"
+  },
+  "receipt": {
+    "alg": "ES256",
+    "backLink": {
+      "attestationDigest": "sha256:051a900a3292d62b4958caae37c3bcdc2755baac3be33919cabe99808255da50",
+      "attestationNonce": "bd387142-1845-4387-aa7c-ade8c4a43bb5"
+    },
+    "decisionDerived": {
+      "decidedAt": "2026-10-14T19:51:39.696Z",
+      "decision": "block",
+      "evidenceRef": {
+        "canonicalization": "jcs-rfc8785",
+        "digest": "sha256:e6fa11acbcfc11f8c890057c7f6b675566ef63f14e6c6d5df7bcec849e147208",
+        "ref": "vaara:trail/bd387142-1845-4387-aa7c-ade8c4a43bb5",
+        "schema": "vaara.trail-decision/v0"
+      },
+      "policyId": "policy:vaara-engine/1",
+      "reason": "He said \"no\"\n\ttab \u0001 back\\slash / \u00e4 \u20ac \ud83d\ude00 \u2028",
+      "riskScore": "0.5"
+    },
+    "issuerAsserted": {
+      "alg": "ES256",
+      "iat": "2026-10-14T19:51:39Z",
+      "iss": "vaara:engine",
+      "nonce": "1eYYm1Jo9VmXnPoo6LspQOD7",
+      "secretVersion": "es256:dfa441deb94a9c1c",
+      "sub": "vector-agent"
+    },
+    "signature": "0796ae58b358dbd6d96df204b8d618ada13103d746c0178a2892b00c8731fa57777cfe79d422db3b1265738fd5022724b7188d0a74b5b504da666e5a053b782a",
+    "version": 1
+  }
+}

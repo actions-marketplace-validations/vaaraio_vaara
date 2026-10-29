@@ -20,6 +20,7 @@ not fail. The offline half always runs.
 from __future__ import annotations
 
 import json
+import os
 import re
 import urllib.error
 import urllib.request
@@ -41,7 +42,7 @@ ROW = re.compile(r"\| (v\d+\.\d+\.\d+)(†?), (\d{4}-\d{2}-\d{2}) \|")
 def _rows() -> list[tuple[str, bool, str]]:
     return [
         (tag, bool(dagger), date)
-        for tag, dagger, date in ROW.findall(PRIOR_ART.read_text())
+        for tag, dagger, date in ROW.findall(PRIOR_ART.read_text(encoding="utf-8"))
     ]
 
 
@@ -65,8 +66,11 @@ def _pypi_dates() -> dict[str, str]:
 def _github_dates() -> dict[str, str]:
     """Release dates from the GitHub releases API.
 
-    Unauthenticated and paginated; a rate-limited or offline run skips
-    rather than failing, same as the PyPI check.
+    Paginated. Sends ``GITHUB_TOKEN`` when the environment has one, which CI
+    does: anonymous calls share a small per-address limit, and four matrix
+    jobs from one runner pool used it up and skipped the check. Without a
+    token, a rate-limited or offline run skips rather than failing, same as
+    the PyPI check.
 
     An empty first page is treated the same way. On 2026-08-17 this endpoint
     answered HTTP 200 with ``[]`` for a repository holding more than eighty
@@ -81,9 +85,11 @@ def _github_dates() -> dict[str, str]:
             f"?per_page=100&page={page}"
         )
         try:
-            request = urllib.request.Request(
-                url, headers={"Accept": "application/vnd.github+json"},
-            )
+            headers = {"Accept": "application/vnd.github+json"}
+            token = os.environ.get("GITHUB_TOKEN")
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            request = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(request, timeout=20) as response:
                 batch = json.load(response)
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
@@ -116,7 +122,7 @@ def test_only_the_yanked_releases_carry_a_dagger():
 
 def test_daggered_dates_match_the_changelog():
     """The changelog is the record those rows actually rest on."""
-    changelog = CHANGELOG.read_text()
+    changelog = CHANGELOG.read_text(encoding="utf-8")
     for tag, daggered, date in _rows():
         if not daggered:
             continue
@@ -158,7 +164,7 @@ def test_evidence_paths_in_the_table_exist():
     """A citation a reader cannot open is not evidence."""
     root = PRIOR_ART.resolve().parents[1]
     missing = set()
-    for line in PRIOR_ART.read_text().splitlines():
+    for line in PRIOR_ART.read_text(encoding="utf-8").splitlines():
         if not line.startswith("| "):
             continue
         for cited in re.findall(r"`([^`]+)`", line):

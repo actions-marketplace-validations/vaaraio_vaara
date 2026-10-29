@@ -2,9 +2,16 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """``vaara llm-proxy`` — govern LLM API calls from coding agents.
 
-Intercepts prompts, strips secrets, enforces model/rate policies, and forwards
-to the configured upstream provider.  Everything recorded in the Vaara audit
-trail.
+Governs ``POST /v1/chat/completions``, ``POST /v1/messages`` and
+``POST /v1/responses``: each call is checked against the model and rate policy
+and recorded in the Vaara audit trail with its prompt. Every other call is recorded by method, path, size and
+sha256. Every tool call a model reply asks for on those three paths, streamed
+or not, is run through the deny rules, and through the policy given with
+``--policy``, and recorded; with ``--enforce`` a rule hit or a call the policy
+denies or holds is taken out of the reply and replaced by text naming the rule, so the
+agent never gets a call to run. The secrets named in ``--seal-file`` are
+replaced on every path before the request leaves. Nothing beyond those values is removed from a request;
+``--redact`` masks only the trail's copy of the prompt.
 
 Usage::
 
@@ -17,13 +24,22 @@ Usage::
     vaara llm-proxy --upstream ... --model-allow "claude-sonnet-4-*,deepseek-*"
 
     # Agent points at 127.0.0.1:8790/v1
+
+    # Govern an agent that carries its own subscription credential, where
+    # there is no operator API key to inject
+    vaara llm-proxy \\
+        --upstream https://api.anthropic.com \\
+        --auth-passthrough --seal-file ~/.vaara/seal.json
+
+    # Then: ANTHROPIC_BASE_URL=http://127.0.0.1:8790 claude
 """
 
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from vaara import __version__ as _VAARA_VERSION
 from vaara.audit.sqlite_backend import SQLiteAuditBackend
@@ -31,9 +47,37 @@ from vaara.pipeline import InterceptionPipeline
 from vaara.taxonomy.actions import create_default_registry
 from .llm_actions import LLM_ACTIONS
 
+#: What the proxy does, stated to the edge of what it does. Shared by
+#: ``vaara llm-proxy --help`` and the subcommand list so the two cannot differ.
+DESCRIPTION = (
+    "Govern LLM API calls. POST /v1/chat/completions, POST /v1/messages and "
+    "POST /v1/responses are checked against the model and rate policy and "
+    "recorded in the Vaara audit trail with their prompt, and every tool "
+    "call in their replies goes through the deny rules, and through the "
+    "policy given with --policy, and is recorded. "
+    "Every other call is recorded by method, "
+    "path, size and sha256, never by content. The secrets named in "
+    "--seal-file are replaced on every path before the request leaves. "
+    "With --seal-known-secrets, values in published credential formats are "
+    "sealed too, and so are generated tokens of any format assigned to a "
+    "secret-named key or sent as a bearer token. Nothing else is removed from a request; "
+    "--redact masks only the trail's copy of the prompt. A call the trail "
+    "cannot record is refused unless --fail-open is set."
+)
 
-def _build_pipeline(db: Optional[Path] = None) -> InterceptionPipeline:
-    """Create a pipeline with LLM action types registered."""
+
+def _without_userinfo(url: str) -> str:
+    """The URL as printed: a user:password@ part is replaced by ***@."""
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(url)
+    if "@" not in parts.netloc:
+        return url
+    return urlunsplit(parts._replace(netloc="***@" + parts.netloc.rsplit("@", 1)[1]))
+
+def _build_pipeline(db: Optional[Path] = None,
+                    policy: Optional[Any] = None) -> InterceptionPipeline:
+    """Create a pipeline with LLM action types registered, and the
+    operator's policy bound to its scorer when one is given."""
     registry = create_default_registry()
     for at in LLM_ACTIONS:
         registry.register(at)
@@ -43,10 +87,31 @@ def _build_pipeline(db: Optional[Path] = None) -> InterceptionPipeline:
         trail = SQLiteAuditBackend(str(db)).load_trail()
     else:
         trail = None
-    return InterceptionPipeline(registry=registry, trail=trail)
+    pipeline = InterceptionPipeline(registry=registry, trail=trail)
+    if policy is not None:
+        pipeline.scorer.apply_policy(policy)
+    return pipeline
 
 
-def add_arguments(parser): ...
+def _timestamped_log_config():
+    """uvicorn's own logging config, with a dated prefix on every line.
+
+    uvicorn's defaults carry no time at all, so an operator correlating a
+    502 in this log against a trail entry has nothing to join on. The
+    sibling proxies all set %(asctime)s through basicConfig; that does not
+    work here because uvicorn installs its own handlers, so the timestamp
+    has to go into uvicorn's formatters instead.
+    """
+    from copy import deepcopy
+
+    from uvicorn.config import LOGGING_CONFIG
+
+    config = deepcopy(LOGGING_CONFIG)
+    for formatter in config["formatters"].values():
+        formatter["fmt"] = "%(asctime)s " + formatter["fmt"]
+        # Offset included, so a log shipped off this box stays unambiguous.
+        formatter["datefmt"] = "%Y-%m-%dT%H:%M:%S%z"
+    return config
 
 
 def main(args: Optional[list[str]] = None) -> int:
@@ -54,9 +119,7 @@ def main(args: Optional[list[str]] = None) -> int:
 
     p = argparse.ArgumentParser(
         prog="vaara llm-proxy",
-        description="Govern LLM API calls: intercept prompts, "
-                    "strip secrets, enforce model/rate policies, "
-                    "record everything in the Vaara audit trail.",
+        description=DESCRIPTION,
     )
     p.add_argument(
         "--upstream", required=True,
@@ -71,6 +134,14 @@ def main(args: Optional[list[str]] = None) -> int:
         "--api-key-file", default=None,
         help="Path to file containing the upstream API key (mode 0400)",
     )
+    key_group.add_argument(
+        "--auth-passthrough", action="store_true",
+        help="Hold no key. Forward the caller's own credential to the "
+             "provider untouched. Use this to govern an agent that "
+             "authenticates with its own subscription (Claude Code, Cursor), "
+             "which has no API key to hand over. The proxy still intercepts, "
+             "seals, audits and enforces; it just does not supply identity.",
+    )
     p.add_argument(
         "--api-key-header", default="x-api-key",
         help="Header name for the API key (default: x-api-key; "
@@ -79,7 +150,7 @@ def main(args: Optional[list[str]] = None) -> int:
     p.add_argument(
         "--mode", default="relay", choices=["relay", "govern"],
         help="relay: blind route without inspecting prompts (default). "
-             "govern: inspect, scan, redact, full audit.",
+             "govern: inspect and scan the prompt, redact the trail copy.",
     )
     p.add_argument(
         "--audit", default="meta", choices=["meta", "hash", "full"],
@@ -97,7 +168,21 @@ def main(args: Optional[list[str]] = None) -> int:
     )
     p.add_argument(
         "--enforce", action="store_true",
-        help="Gate instead of observe-only (only in govern mode)",
+        help="Block instead of observe. A prompt the scorer denies is "
+             "refused with 403, and a tool call in a model reply that a deny "
+             "rule matches is taken out of the reply and replaced by text "
+             "naming the rule. Without it both are recorded and forwarded.",
+    )
+    p.add_argument(
+        "--policy", default=None, metavar="FILE",
+        help="Policy file (thresholds, per-tool overrides, sequence "
+             "patterns), the format `vaara serve --policy` takes. A tool "
+             "call in a model reply that no deny rule matches is then also "
+             "scored under its own name, and with --enforce a call the "
+             "policy denies or holds for a human is taken out of the reply. "
+             "This proxy has no approval channel, so a held call is refused "
+             "and the hold is closed on the record as a deny by policy. "
+             "An invalid policy stops the proxy at startup.",
     )
     p.add_argument(
         "--model-allow", action="append", default=None, metavar="GLOB",
@@ -113,11 +198,76 @@ def main(args: Optional[list[str]] = None) -> int:
     )
     p.add_argument(
         "--redact", action="append", default=None, metavar="REGEX",
-        help="Additional regex pattern for prompt redaction (repeatable)",
+        help="Regex masked in the trail's copy of the prompt (govern mode, "
+             "--audit full; repeatable). The request sent to the provider "
+             "is unchanged.",
     )
     p.add_argument(
         "--agent-id-header", default="x-agent-id",
         help="Request header carrying the agent identity (default: x-agent-id)",
+    )
+    p.add_argument(
+        "--agent-id", default="llm-agent", metavar="ID",
+        help="Identity recorded when the caller sends no agent-id header "
+             "(default: llm-agent). A caller like Claude Code sends none, so "
+             "without this every record names the same anonymous agent.",
+    )
+    p.add_argument(
+        "--seal-file", default=None, metavar="PATH",
+        help="JSON object of {\"name\": \"secret\"} whose values are replaced "
+             "with stable placeholders before the request reaches the "
+             "provider, and restored in the response. Covers only what you "
+             "name in advance. Missing or unreadable file means sealing is "
+             "off and the proxy runs unchanged.",
+    )
+    p.add_argument(
+        "--seal-known-secrets", action="store_true",
+        help="Also seal values matching a published credential format: "
+             "Anthropic, OpenAI, GitHub, AWS access key id, Google API key, "
+             "Slack, Stripe, Hugging Face, JWT and PEM private keys. Also "
+             "seal a high-entropy value of any format assigned to a key that "
+             "ends in api_key, secret, token, password, access_key, "
+             "private_key, credential or auth, or sent as a bearer token. "
+             "Each is "
+             "replaced with a stable placeholder before the request leaves "
+             "and restored in the reply, and each record counts what was "
+             "sealed by format. Emails, names and other personal data are "
+             "not detected. Off by default.",
+    )
+    p.add_argument(
+        "--allow-unsealed", action="store_true",
+        help="Start even when --seal-file loads no secrets. Without this the "
+             "proxy refuses, because an operator who passed --seal-file "
+             "believes secrets are being held back, and a proxy that runs "
+             "unsealed while the flag is set claims what it does not do.",
+    )
+    p.add_argument(
+        "--compact-history", type=int, default=0, metavar="N",
+        help="Keep the last N assistant turns verbatim and replace older tool "
+             "results and tool inputs with a size-and-digest stub before the "
+             "request leaves. User and assistant text is never touched. A "
+             "payload then leaves the machine once, when it is fresh, "
+             "instead of on every later call. The record carries bytes before "
+             "and after. 0 (default) is off. This is a privacy control, not a "
+             "cost control: the stub boundary moves every turn, so against a "
+             "provider with prompt caching (Anthropic, OpenAI) every earlier "
+             "message changes on every call and the cached prefix is lost. "
+             "Measured at 6 to 10 times the input cost in front of a coding "
+             "agent that re-sends its whole context. Leave it at 0 for clients that rely on the cache.",
+    )
+    p.add_argument(
+        "--markers-file", default=None, metavar="PATH",
+        help="JSON object of {\"id\": \"marker\"}. Each prompt record lists "
+             "the ids whose marker string was inside the bytes that left, so "
+             "a marker later seen elsewhere can be traced to the call that "
+             "carried it. Ids only reach the trail; the strings never do. "
+             "Re-read on every request, so markers can be added while the "
+             "proxy runs.",
+    )
+    p.add_argument(
+        "--seal-listen-unix", default=None, metavar="PATH",
+        help="Bind a unix socket instead of TCP. No listening port, so "
+             "filesystem permissions decide who can reach the proxy.",
     )
     p.add_argument(
         "--allow-origin", action="append", default=None, metavar="ORIGIN",
@@ -126,6 +276,14 @@ def main(args: Optional[list[str]] = None) -> int:
              "default any request carrying an Origin header from another "
              "site is refused, which is what stops a page you visit from "
              "spending your upstream key. Native clients send no Origin.",
+    )
+    p.add_argument(
+        "--fail-open", action="store_true",
+        help="Forward a request even when its audit record could not be "
+             "written. Off by default: the proxy first repairs the trail and "
+             "retries, and if the record still cannot be written it answers "
+             "503 and forwards nothing. With this flag the request goes out "
+             "unrecorded and the log says so on every one.",
     )
     p.add_argument(
         # Read from the package rather than restated here. The literal that
@@ -143,9 +301,14 @@ def main(args: Optional[list[str]] = None) -> int:
         if not key_path.exists():
             print(f"Error: API key file not found: {key_path}", file=sys.stderr)
             return 1
-        api_key = key_path.read_text().strip()
+        api_key = key_path.read_text(encoding="utf-8").strip()
 
-    if not api_key:
+    if parsed.auth_passthrough:
+        # None is the signal the app layer reads as "hold nothing, forward
+        # what the caller sent". Kept distinct from the empty string so a key
+        # file that happens to be empty still fails loudly below.
+        api_key = None
+    elif not api_key:
         print("Error: no API key provided", file=sys.stderr)
         return 1
 
@@ -153,7 +316,20 @@ def main(args: Optional[list[str]] = None) -> int:
     if not trail_path:
         trail_path = str(Path.home() / ".vaara" / "llm-proxy" / "audit.db")
 
-    pipeline = _build_pipeline(Path(trail_path).expanduser())
+    policy = None
+    if parsed.policy:
+        from vaara.policy.validate import validate_source
+
+        policy_path = Path(parsed.policy).expanduser()
+        policy, report = validate_source(policy_path)
+        if policy is None:
+            print(f"vaara llm-proxy: policy {policy_path} failed validation:",
+                  file=sys.stderr)
+            for issue in report.issues:
+                print(f"  {issue.level.value}: {issue.message}", file=sys.stderr)
+            return 2
+
+    pipeline = _build_pipeline(Path(trail_path).expanduser(), policy=policy)
 
     try:
         from uvicorn import Config, Server
@@ -166,6 +342,42 @@ def main(args: Optional[list[str]] = None) -> int:
         return 1
 
     from ._llm_proxy_app import build_app
+    from .llm_envelope import MarkerWatch
+    from .llm_seal import SealRegistry
+
+    markers = MarkerWatch.from_file(str(parsed.markers_file)) \
+        if parsed.markers_file else None
+
+    # Neither the path nor the contents of the seal file reach a log line.
+    seal_path = str(parsed.seal_file) if parsed.seal_file else None
+    seal = SealRegistry.from_file(seal_path) if seal_path \
+        else SealRegistry()
+    seal.known_formats = bool(parsed.seal_known_secrets)
+    if seal_path and not seal.named:
+        # An operator who passed --seal-file believes secrets are being held
+        # back. Running anyway would be the proxy claiming what it does not
+        # do, so it refuses unless told the unsealed run is intended.
+        if not parsed.allow_unsealed:
+            print(
+                "vaara llm-proxy: the --seal-file loaded nothing to seal; "
+                "refusing to start unsealed. Fix the file, or pass "
+                "--allow-unsealed to run with sealing OFF.",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            "vaara llm-proxy: the --seal-file loaded nothing to seal; "
+            "sealing is OFF for this run (--allow-unsealed).",
+            file=sys.stderr,
+        )
+
+    # Requests a dead process left pending would look in flight forever.
+    # Close them as orphaned before taking new ones.
+    from ._llm_proxy_app import sweep_orphaned_outcomes
+    orphaned = sweep_orphaned_outcomes(pipeline, process_started=time.time())
+    if orphaned:
+        print(f"vaara llm-proxy: closed {orphaned} orphaned outcome(s) from "
+              "an earlier process.", file=sys.stderr)
 
     app = build_app(
         upstream=parsed.upstream,
@@ -178,20 +390,51 @@ def main(args: Optional[list[str]] = None) -> int:
         model_allow=parsed.model_allow,
         model_deny=parsed.model_deny,
         rate_limit_rpm=parsed.rate_limit,
+        seal_registry=seal,
         redact_patterns=parsed.redact,
         agent_id_header=parsed.agent_id_header,
+        agent_id_default=parsed.agent_id,
         allowed_origins=parsed.allow_origin,
+        marker_watch=markers,
+        compact_keep_turns=parsed.compact_history,
+        fail_open=parsed.fail_open,
+        score_tool_calls=policy is not None,
     )
 
-    host, _, port_str = parsed.listen.rpartition(":")
-    port = int(port_str) if port_str else 8790
-    host = host or "127.0.0.1"
+    seal_note = f", sealing {seal.named} named secret(s)" if seal.named \
+        else ""
+    if seal.known_formats:
+        seal_note += ", sealing known credential formats"
+    if markers is not None and markers.active:
+        seal_note += f", watching {len(markers)} marker(s)"
+    if parsed.compact_history > 0:
+        seal_note += f", compacting history beyond {parsed.compact_history} turn(s)"
+    if policy is not None:
+        seal_note += f", tool calls scored against policy {parsed.policy}"
+    if parsed.fail_open:
+        seal_note += ", FAIL-OPEN (forwards requests it cannot record)"
 
-    config = Config(app=app, host=host, port=port, log_level="info")
+    if parsed.seal_listen_unix:
+        sock_path = str(Path(parsed.seal_listen_unix).expanduser())
+        config = Config(app=app, uds=sock_path, log_level="info",
+                        log_config=_timestamped_log_config())
+        where = f"unix:{sock_path}"
+    else:
+        host, _, port_str = parsed.listen.rpartition(":")
+        port = int(port_str) if port_str else 8790
+        host = host or "127.0.0.1"
+        config = Config(app=app, host=host, port=port, log_level="info",
+                        log_config=_timestamped_log_config())
+        where = f"{host}:{port}"
     server = Server(config=config)
 
-    print(f"vaara llm-proxy: {parsed.mode} mode, audit={parsed.audit}, "
-          f"listening on {host}:{port} -> {parsed.upstream}", file=sys.stderr)
+    # Say which identity goes upstream. An operator who cannot tell whether
+    # the proxy is supplying a key or forwarding the caller's own cannot tell
+    # whose quota is being spent.
+    auth_note = ", auth=passthrough" if api_key is None else ""
+    print(f"vaara llm-proxy: {parsed.mode} mode, audit={parsed.audit}"
+          f"{seal_note}{auth_note}, listening on {where} -> {_without_userinfo(parsed.upstream)}",
+          file=sys.stderr)
 
     try:
         server.run()

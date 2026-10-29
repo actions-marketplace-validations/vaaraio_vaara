@@ -1,22 +1,58 @@
 # Supported platforms
 
-Vaara 1.71.0, Helm chart 0.1.0.
+Vaara 2.17.0, Helm chart 0.2.0.
 
-Vaara is a Python package with no runtime dependencies and a container image
-built on SUSE's SLE Base Container Image. This page lists what it runs on and,
-separately, what it has been run on.
+Vaara is a Python package with three runtime dependencies (`cryptography`,
+`rfc8785` and `cbor2`, which sign and canonicalise receipts) and a container
+image built on SUSE's SLE Base Container Image. This page lists what it runs
+on and, separately, what it has been run on.
 
 ## Package
 
 | Requirement | Supported |
 | --- | --- |
 | Python | 3.10, 3.11, 3.12, 3.13 |
-| Runtime dependencies | none for the base install |
-| Operating system | any platform CPython supports |
+| Runtime dependencies | `cryptography`, `rfc8785`, `cbor2` |
+| Operating system | any platform CPython supports, including Red Hat Enterprise Linux 9 (see below) |
 
 The proxy needs the `proxy` extra (fastapi, uvicorn, httpx). Signed
-attestation and receipt pairs need the `attestation` extra (cbor2,
-cryptography, rfc8785). The container image ships both.
+attestation and receipt pairs use the same three packages the base install
+carries; `vaara[attestation]` still installs and names them. The container
+image ships the proxy extra as well.
+
+## Red Hat Enterprise Linux
+
+| | |
+| --- | --- |
+| Supported | Red Hat Enterprise Linux 9 (x86_64), Python 3.12 from Red Hat's packages |
+| Tested on every change | the full test suite runs in CI inside Red Hat's Universal Base Image 9 (`ubi9/python-312`), the `tests-rhel` job in [ci.yml](../.github/workflows/ci.yml) |
+| Tested on a RHEL 9 system | RHEL 9.8 with SELinux enforcing, installed from PyPI as a non-root user; full test suite passing |
+
+Install on RHEL 9: `sudo dnf install python3.12 python3.12-pip`, then
+`python3.12 -m venv .venv && .venv/bin/pip install vaara`.
+
+For containers, [packaging/ubi9/README.md](../packaging/ubi9/README.md) builds
+`vaara proxy` on UBI 9, runs it as a non-root user in group 0, and records a
+Red Hat preflight run that passed all 10 checks. That image is built from the
+Containerfile; the published `ghcr.io/vaaraio/vaara` image stays on SUSE BCI.
+
+Rerunning the test suite on RHEL 9 needs Node.js 20 or later for the browser
+verifier tests (the `nodejs:20` module stream). RHEL 9's default Node.js 16
+has no global `crypto`, so those tests fail there for reasons that have
+nothing to do with Vaara; without Node installed at all they skip.
+
+The Linux OS layer does not run on RHEL 9. It confines agents with an
+AppArmor profile, and RHEL confines with SELinux and ships no AppArmor, so
+`sudo vaara os-guard` and `vaara run` refuse to start there rather than run
+an agent unconfined; the `vaara` driver of `vaara cage` reports itself not
+ready, and the AppArmor profile tests skip. Everything else runs: the MCP
+proxy (`vaara-mcp-proxy`), the LLM API proxy (`vaara llm-proxy`), the shell
+proxy (`vaara proxy-shell`), the model endpoint proxy, the agent host hooks,
+the trail and its verifiers. [cage.md](cage.md) covers the runtime-backed
+cages, which run through podman, and what gVisor needs on an
+SELinux-enforcing host.
+
+OpenShift is not listed: no run on an OpenShift cluster has been recorded.
 
 ## Container image
 
@@ -60,7 +96,7 @@ directory from provide neither. On those the write still goes through and the
 database corrupts.
 
 Vaara reads `/proc/mounts` when it opens a trail and, if the file sits on one
-of these, uses the DELETE journal instead and logs one line saying so:
+of these, uses the DELETE journal instead:
 
 `9p`, `afpfs`, `ceph`, `cifs`, `glusterfs`, `lustre`, `ncpfs`, `nfs`, `nfs4`,
 `smb2`, `smb3`, `smbfs`, `vboxsf`, `virtiofs`, `vmhgfs`, and any `fuse*`
@@ -76,6 +112,13 @@ virtiofs or FUSE), WSL2 writing to `/mnt/c`, and NFS or SMB network homes.
 | Elsewhere | macOS and Windows keep WAL, since the type is not readable without platform calls |
 | Override | `VAARA_TRAIL_JOURNAL_MODE=wal` or `=delete`, in either direction |
 
+Switching an existing trail off WAL needs a brief exclusive lock, and SQLite may
+answer without it by leaving the file in the mode it is already in. Vaara reads
+the mode back and retries. If the trail is still in WAL afterwards, the Claude
+Code session-start hook names the file and the filesystem, because a log line
+from a hook process reaches nobody. A trail that stays in WAL on one of these
+filesystems is intact and recording, and it corrupts later.
+
 DELETE journalling costs concurrency. Readers block writers where WAL would let
 them run together, and durability is unaffected. For a trail written by one
 process, which is what the hash chain requires anyway, the difference does not
@@ -84,6 +127,37 @@ show.
 If the trail lives on a network or virtual filesystem, the better answer is to
 move it. In a container, put it on a named volume rather than a bind mount, so
 it sits on the container runtime's own filesystem with real POSIX locking.
+
+## Operating systems tested
+
+The full test suite has been run on these hosts, with Python and every
+system library taken from the vendor's own repositories. The CI legs on
+Ubuntu, macOS, Windows and Red Hat's UBI 9 are defined in
+`.github/workflows/ci.yml` and are not repeated here.
+
+| System | Python | Vaara | Date | Result |
+| --- | --- | --- | --- | --- |
+| SUSE Linux Enterprise Server 15 SP6 | 3.12.12 (`python312` from the SLE BCI repository) | e9de66ee | 2026-10-22 | 6157 passed, 0 failed |
+| Red Hat Enterprise Linux 9.8 | 3.12.15 (`python3.12` from Red Hat's UBI 9 repositories) | 0cdb8b66 | 2026-10-18 | 5996 passed, 0 failed |
+
+The SLES 15 SP6 run used SUSE's `registry.suse.com/bci/bci-base:15.6` image,
+packages from the public SLE BCI repository only (Python 3.12, SQLite 3.50.2,
+Node.js 20 for the browser verifier tests), no registration, the suite run
+as a non-root user. `pip install vaara==2.15.0` from PyPI installed and ran on
+the same system. The skipped tests need optional extras or tools that were
+not installed, and every one is on the skip list CI accepts.
+
+The RHEL 9.8 run used Red Hat's own KVM guest image with SELinux enforcing,
+not registered with subscription-manager, the suite run as a non-root user.
+Python 3.12 came from Red Hat's signed UBI 9 repositories and SQLite was the
+system 3.34.1. The guest had no Node.js for the main run, so the browser
+verifier tests skipped; with Node.js 20 from the `nodejs:20` module stream
+those two files then ran with 27 passed. `pip install vaara==2.14.0` from
+PyPI installed and ran on the same system. Commit 0cdb8b66 is part of
+release 2.15.0.
+
+A row here is a test run, not an end-to-end deployment; those go in the next
+table.
 
 ## Verified releases
 

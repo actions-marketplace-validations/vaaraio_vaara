@@ -22,6 +22,9 @@ _DEFAULT_REDACT_PATTERNS: list[re.Pattern] = [
     re.compile(r"ghp_[a-zA-Z0-9]{36}"),            # GitHub tokens
     re.compile(r"gho_[a-zA-Z0-9]{36}"),            # GitHub oauth
     re.compile(r"ghu_[a-zA-Z0-9]{36}"),            # GitHub user tokens
+    re.compile(r"ghs_[a-zA-Z0-9]{36,}"),           # GitHub app installation
+    re.compile(r"ghr_[a-zA-Z0-9]{36,}"),           # GitHub refresh tokens
+    re.compile(r"github_pat_[a-zA-Z0-9_]{22,}"),   # GitHub fine-grained PATs
     re.compile(r"AKIA[0-9A-Z]{16}"),               # AWS access keys
     re.compile(r"fw_[a-zA-Z0-9]+"),                # Fireworks keys
     re.compile(r"sk-mel-[a-zA-Z0-9]+"),            # Melious keys
@@ -38,15 +41,22 @@ _DROP_REQUEST_HEADERS = frozenset({
 
 _AUDIT_MAX_CHARS = 4096
 
+#: Content block types that carry plain text. ``text`` in the chat and
+#: messages APIs, ``input_text`` and ``output_text`` in the Responses API.
+_TEXT_BLOCKS = frozenset({"text", "input_text", "output_text"})
+
 
 def extract_messages(body: dict[str, Any]) -> list[dict[str, Any]]:
     """Extract messages list from any provider-shaped request body.
 
-    Handles OpenAI ``/v1/chat/completions`` and Anthropic ``/v1/messages``
-    shapes.  Returns an empty list if the body doesn't look like either.
+    Handles OpenAI ``/v1/chat/completions``, Anthropic ``/v1/messages`` and
+    OpenAI ``/v1/responses`` shapes.  Returns an empty list if the body looks
+    like none of them.
     """
     if "messages" in body:
         return body["messages"]
+    if "input" in body:
+        return responses_messages(body)
     msgs: list[dict[str, Any]] = []
     for block in (body.get("system") or []):
         if isinstance(block, dict) and block.get("type") == "text":
@@ -60,23 +70,39 @@ def extract_messages(body: dict[str, Any]) -> list[dict[str, Any]]:
     return msgs
 
 
+def responses_messages(body: dict[str, Any]) -> list[dict[str, Any]]:
+    """The Responses API body as a message list.
+
+    ``instructions`` is the system prompt. ``input`` is either one string, the
+    user turn, or a list of items: messages with a ``role``, tool calls, and
+    tool outputs. Tool calls and outputs keep their payload as the content so
+    the envelope and the scan see what left.
+    """
+    msgs: list[dict[str, Any]] = []
+    instructions = body.get("instructions")
+    if isinstance(instructions, str) and instructions:
+        msgs.append({"role": "system", "content": instructions})
+    items = body.get("input")
+    if isinstance(items, str):
+        msgs.append({"role": "user", "content": items})
+        return msgs
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        if "role" in item and kind in (None, "message"):
+            msgs.append({"role": item["role"], "content": item.get("content", "")})
+        elif kind == "function_call_output":
+            msgs.append({"role": "tool", "content": str(item.get("output", ""))})
+        elif kind == "function_call":
+            msgs.append({"role": "assistant",
+                         "content": str(item.get("arguments", ""))})
+    return msgs
+
+
 def extract_model_name(body: dict[str, Any]) -> str:
     """Extract model identifier from the request body."""
     return body.get("model", "")
-
-
-def extract_system_prompt(body: dict[str, Any]) -> str:
-    """Extract the system prompt, provider-agnostic."""
-    if "system" in body:
-        if isinstance(body["system"], str):
-            return body["system"]
-        if isinstance(body["system"], list):
-            parts: list[str] = []
-            for b in body["system"]:
-                if isinstance(b, dict) and b.get("type") == "text":
-                    parts.append(b.get("text", ""))
-            return "".join(parts)
-    return ""
 
 
 def flatten_messages(messages: list[dict[str, Any]]) -> str:
@@ -86,7 +112,7 @@ def flatten_messages(messages: list[dict[str, Any]]) -> str:
         content = msg.get("content") or ""
         if isinstance(content, list):
             for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
+                if isinstance(block, dict) and block.get("type") in _TEXT_BLOCKS:
                     parts.append(block.get("text", ""))
         elif isinstance(content, str):
             parts.append(content)
@@ -162,14 +188,23 @@ def truncate_for_audit(messages: list[dict[str, Any]],
     return out
 
 
-def forward_request_headers(headers: Any) -> dict[str, str]:
-    """Return headers suitable for forwarding, dropping hop-by-hop and auth."""
+def forward_request_headers(
+    headers: Any, *, keep_auth: bool = False,
+) -> dict[str, str]:
+    """Return headers suitable for forwarding, dropping hop-by-hop and auth.
+
+    ``keep_auth`` leaves the caller's own credential in place instead of
+    stripping it, for the pass-through case where the proxy holds no key of
+    its own and the client authenticates itself.  Default stays False so the
+    operator-holds-the-key path is unchanged and no caller starts forwarding
+    credentials by accident.
+    """
     result: dict[str, str] = {}
     for k, v in headers.items():
         kl = k.lower()
         if kl in _DROP_REQUEST_HEADERS:
             continue
-        if kl in KNOWN_AUTH_HEADERS:
+        if kl in KNOWN_AUTH_HEADERS and not keep_auth:
             continue
         result[k] = v
     return result

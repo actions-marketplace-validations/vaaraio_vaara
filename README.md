@@ -10,14 +10,14 @@
   <a href="https://github.com/vaaraio/vaara/blob/main/LICENSE"><img src="https://img.shields.io/pypi/l/vaara.svg" alt="License"></a>
   <a href="https://github.com/vaaraio/vaara/actions/workflows/ci.yml"><img src="https://github.com/vaaraio/vaara/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://scorecard.dev/viewer/?uri=github.com/vaaraio/vaara"><img src="https://github.com/vaaraio/vaara/actions/workflows/scorecard.yml/badge.svg" alt="OpenSSF Scorecard"></a>
-  <a href="https://vaara.io/conformance.html"><img src="https://raw.githubusercontent.com/vaaraio/vaara/main/webpage/badge/conformance.svg" alt="Vaara Conformance: 44 suites, 0 failing"></a>
+  <a href="https://vaara.io/conformance.html"><img src="https://raw.githubusercontent.com/vaaraio/vaara/main/webpage/badge/conformance.svg" alt="Vaara Conformance: 55 suites, 0 failing"></a>
   <a href="https://doi.org/10.5281/zenodo.22027975"><img src="https://raw.githubusercontent.com/vaaraio/vaara/main/webpage/badge/doi.svg" alt="DOI 10.5281/zenodo.22027975"></a>
   <a href="https://www.bestpractices.dev/projects/12612"><img src="https://www.bestpractices.dev/projects/12612/badge" alt="OpenSSF Best Practices"></a>
   <a href="https://huggingface.co/spaces/vaaraio/vaara"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Space-blue" alt="Hugging Face Space"></a>
 </p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/vaaraio/vaara/badges/downloads.svg" alt="Downloads">
+  <a href="https://pepy.tech/projects/vaara"><img src="https://static.pepy.tech/personalized-badge/vaara?period=total&units=international_system&left_color=grey&right_color=green&left_text=PyPI%20downloads" alt="PyPI downloads"></a>
 </p>
 
 <p align="center"><b>Accountable Autonomy.</b></p>
@@ -25,10 +25,6 @@
 <p align="center">A verifiable receipt for every autonomous action, checkable by anyone.</p>
 
 Your AI agent transferred the funds, wrote the file, called the tool. Later, someone who does not trust you asks you to prove exactly what it did and why: a regulator, an auditor, a customer after an incident. Your own logs will not settle it, because you could have edited them.
-
-<p align="center">
-  <a href="https://github.com/vaaraio/vaara/releases/tag/v1.50.0"><img src="https://raw.githubusercontent.com/vaaraio/vaara/main/docs/vaara-v150-launch.gif" width="720" alt="Vaara for macOS launch demo"></a>
-</p>
 
 ## Quick start
 
@@ -46,30 +42,36 @@ def transfer_funds(to: str, amount: float) -> str:
     ...
 ```
 
-That is the whole thing. Every call to a governed function is risk-scored and decided against your policy before the body runs. An allowed call runs, and the decision, the call, and the outcome land in a hash-chained, tamper-evident record anyone can verify offline. Sign it at export (`vaara trail export`) for third-party proof. Records persist to `~/.vaara/trail/audit.db` by default, so evidence survives restarts. Python 3.10+, zero runtime dependencies.
+That is the whole thing. Every call to a governed function is risk-scored and decided against your policy before the body runs. An allowed call runs, and the decision, the call, and the outcome land in a hash-chained, tamper-evident record anyone can verify offline, with a signed receipt beside it. Sign the whole trail at export (`vaara trail export`) for third-party proof. Records persist to `~/.vaara/trail/audit.db` by default, so evidence survives restarts. Python 3.10+. The base install carries three runtime dependencies, `cryptography`, `rfc8785` and `cbor2`, which sign and canonicalise the receipts.
 
-Both `deny` and `escalate` raise `vaara.Blocked`, since an escalation means a human has not answered yet. Run the example above on a fresh install and it will raise: with no outcome history the scorer's confidence interval is wide, and a `tx.transfer` escalates on the interval's upper bound even though its point estimate sits under the allow threshold. That is the intended direction to fail, and it settles. Feeding real outcomes back through `report_outcome` narrows the interval, and the same call starts allowing after a few dozen clean results. To watch decisions without acting on them while that happens, start with `@vaara.govern(shadow=True)`.
+Both `deny` and `escalate` raise `vaara.Blocked`, since an escalation means a human has not answered yet. On a fresh install the example above runs. The default operating point is `balanced`, which allows below 0.55 and denies above 0.85, and a first call to `transfer_funds` scores 0.275 with a conformal interval of [0.085, 0.465]. Vaara decides on the interval's upper bound, and with no outcome history that interval is wide, so a riskier call escalates before its point estimate reaches the threshold. Feeding real outcomes back through `report_outcome` narrows it. The other presets are listed by `vaara mode list`. To watch decisions without acting on them, start with `@vaara.govern(shadow=True)`.
 
-### Check a receipt with nothing installed
+<details>
+<summary><b>Check a receipt with nothing installed</b></summary>
 
-[vaara.io/verify.html](https://vaara.io/verify.html) is the Vaara Resin. One HTML file, no build step and no dependencies. Paste in a receipt and it recomputes the DSSE pre-authentication encoding, takes its digest, and checks the Ed25519 signature with WebCrypto. The receipt never leaves the tab, nothing uploads, and the page works with the network off, so verification is not a service and Vaara is not a party to it. Save the file and it keeps working.
+[vaara.io/verify.html](https://vaara.io/verify.html) is the receipt explorer, in English and Finnish. A static page and one script, no build step and no dependencies. Paste in a receipt and it recomputes the DSSE pre-authentication encoding, takes its digest, and checks the Ed25519 signature with WebCrypto. The receipt never leaves the tab, nothing uploads, and the page works with the network off, so verification is not a service and Vaara is not a party to it. Save the page with its script and it keeps working.
 
 It also states what a passing check does not establish: that the key belongs to the party you expect, that the signed statement is true, that `decided_at` means anything without an external time authority, or that one receipt is a whole history.
 
 The explorer on the same page reads the public transparency log straight from your browser. Look a trail head up by digest, or paste a public key to see everything published under it. No account and no sign-in, because the key is the identity. Publishing to that log is opt-in and off by default (`vaara trail publish-head`), so an absence there means nothing was published rather than nothing happened.
+</details>
 
-### See who else has checked it
+<details>
+<summary><b>See who else has checked it</b></summary>
 
 [vaara.io/conformance.html](https://vaara.io/conformance.html) is the results page. It carries every suite and its verdict, and every party other than the maintainer who ran the checkers and reported what they found in public. Rows are chained, each holding the digest of the row before it, so removing or reordering one breaks every digest after it and the break is visible to anyone. The maintainer cannot take a row down either. A run that disagrees with ours is a row too, with the reason stated, and there is no blacklist.
 
 The aggregate runner grades every suite at once, and grades another implementation's vectors the same way:
 
 ```bash
+git clone https://github.com/vaaraio/vaara && cd vaara
+pip install cryptography rfc8785                                     # enough for 53 of the 55 suites; the two that skip name their extra
 python scripts/conformance_runner.py                                 # grade the reference corpus
 python scripts/conformance_runner.py --vectors-dir ./your_vectors    # grade your own
 ```
 
 It prints a prefilled link at the end of every run, so asking for a row takes one click. The named, versioned rule set, what a pass does and does not establish, and the full suite list are in [docs/conformance-profile.md](docs/conformance-profile.md).
+</details>
 
 <details>
 <summary><b>Prefer the explicit pipeline?</b></summary>
@@ -92,7 +94,7 @@ else:
     print(result.reason)
 ```
 
-Every call gets a risk score and an allow / block / escalate decision against your policy, then the call, the decision, and the real outcome are written to the audit trail. `report_outcome` closes the loop: the scorer reweights based on which signals actually predicted the outcome. Releases ship SLSA Build Level 3 provenance, verifiable with `slsa-verifier verify-artifact`. Optional ML classifier: `pip install 'vaara[ml]'`.
+Every call gets a risk score and an allow / block / escalate decision against your policy, then the call, the decision, and the real outcome are written to the audit trail. `report_outcome` closes the loop: the scorer reweights based on which signals actually predicted the outcome. Every release carries SLSA v1 build provenance as a GitHub artifact attestation (SLSA Build Level 2), and the PyPI wheel is the same file, so `gh attestation verify vaara-<version>-py3-none-any.whl --repo vaaraio/vaara` checks either download. Optional ML classifier: `pip install 'vaara[ml]'`.
 </details>
 
 <details>
@@ -123,7 +125,7 @@ For the whole loop in one runnable file, produce a signed record, verify it your
 <details>
 <summary><b>What the evidence looks like</b></summary>
 
-`vaara compliance report --format json` against a real trail produces an article-level evidence record an auditor reads directly. Articles with no recorded events return `evidence_insufficient`, not a rubber stamp.
+`vaara compliance report --db audit.db --format json` against a real trail produces an article-level evidence record an auditor reads directly. Articles with no recorded events return `evidence_insufficient`, not a rubber stamp.
 
 ```json
 {
@@ -183,7 +185,7 @@ Start with `--shadow`: every call is classified, scored, and recorded, nothing i
 A policy is code, so it belongs in the pull request that changes it. The action validates the policy, runs its cases, and fails the build on a policy that does not parse, a failing case, or a trail whose chain or signature does not hold.
 
 ```yaml
-- uses: vaaraio/vaara@v1
+- uses: vaaraio/vaara@v2
   with:
     policy: policies/production.yaml
     cases: policies/production.cases.yaml
@@ -197,13 +199,14 @@ This checks artifacts. Gating the agent is the runtime's job, at the moment of t
 <details>
 <summary><b>How it scores</b></summary>
 
-Each risk score blends five expert signals and keeps adapting as outcomes come back, and it carries a confidence interval with a coverage guarantee that holds regardless of the input distribution. On a held-out adversarial corpus the classifier reaches **84.7%** recall (95% Wilson [82.4, 86.7]) at a **4.1%** false-positive rate, and **1.2%** FPR on benign calls under live injection pressure. The hot-path rule scorer adds 140 µs mean per call on commodity CPU; the ML classifier is opt-in (`vaara[ml]`) and off that path. `make bench` reproduces the classifier figures below against the bundles that ship in the repo; it needs `pip install 'vaara[ml]'` and downloads the embedding model on first run.
+Each risk score blends five expert signals and keeps adapting as outcomes come back, and it carries a confidence interval with a coverage guarantee that holds regardless of the input distribution. On a held-out adversarial corpus the classifier reaches **85.6%** recall (95% Wilson [83.4, 87.6]) at a **5.1%** false-positive rate, and **0.0%** FPR on benign calls under live injection pressure. The hot-path rule scorer adds 140 µs mean per call on commodity CPU; the ML classifier is opt-in (`vaara[ml]`) and off that path. `make bench` reproduces the classifier figures below against the bundles that ship in the repo; it needs `pip install 'vaara[ml]'` and downloads the embedding model on first run.
 
-- 12,155-entry adversarial corpus (250 hand-curated + 11,905 LLM-generated), 70/15/15 split stratified by (category, source).
-- Classifier v9 (236 hand-features + 384-dim MiniLM embeddings) at calibrated threshold 0.9150 on held-out TEST n=1,827: recall 84.7% [82.4, 86.7] at FPR 4.1% [2.9, 5.7].
-- Cross-model held-out recall 66.8% [64.9, 68.7] over n=2,277 with no eval-set attacker model in TRAIN; the weakest sub-cell is data_exfil against a closed-weight model at 38.9%. Both figures are v8 on the v0.37 surface ([bench/vaara-bench-v0.37.md](bench/vaara-bench-v0.37.md)), which is the last release that measured this surface; v9 has not been run against it. This is the honest worst case, and the in-distribution number above is the easier denominator.
-- BIPIA-pressure FPR on benign tool calls 1.2% [0.4, 3.6] across four agent backends (Claude Haiku 4.5, Llama-3.1-8B, Mistral-7B, Qwen-2.5-7B). Down from 35.2% on v8.
-- Multi-attacker PAIR robustness: 0/25 successes per attacker across Qwen2.5-32B, Qwen2.5-72B, Llama-3.3-70B on identical seeds, Wilson upper 13.3%.
+- 25,556-entry adversarial corpus (250 hand-curated + 25,306 LLM-generated). The v0.40 split assigns 24,619 of them leak-free by (category, generation batch) cell: 15,114 train, 2,921 val, 2,980 test, 3,604 holdout.
+- Classifier v11 (254 hand-features + 384-dim MiniLM embeddings) at threshold 0.8800 on held-out TEST n=1,827: recall 85.6% [83.4, 87.6] at FPR 5.1% [3.8, 6.9]. Recall is up 0.9 points on v9 and the false-positive rate is up 1.0. That trade is deliberate and the rest of this section is why.
+- Cross-model held-out recall 86.3% over n=5,600, against attacks written by Qwen2.5-72B, a model absent from TRAIN. v9 reads 67.4% on the same set. The previous published figure here was 66.8% [64.9, 68.7], measured on v8 against the v0.37 surface; v9 reproducing it within a point on a different attacker family and freshly generated data is the reason that number survived two releases unchanged. This is still the honest worst case, and the in-distribution number above is the easier denominator.
+- On four attack categories that the corpus had barely covered until v0.40, measured on 5,600 entries generated after v11's operating point was fixed: recall 63.1% to 87.0% and false positives 6.6% to 2.5% against v9. Credential exfiltration alone moves 45.9% to 80.3% at 10.0% to 3.9% FPR. Full record in [bench/V11-CANDIDATE.md](bench/V11-CANDIDATE.md), including the earlier candidate that was rejected and why.
+- BIPIA-pressure FPR on benign tool calls 0.0% [0.0, 0.5]: none of 704 calls flagged across four agent backends (Claude Haiku 4.5, Llama-3.1-8B, Mistral-7B, Qwen-2.5-7B). v9 flags 2.7% of the same calls and v8 35.7%. `scripts/eval_bipia_entries.py` reproduces all three.
+- Multi-attacker PAIR robustness, measured on v0.31 and not re-run on v11: 0/25 successes per attacker across Qwen2.5-32B, Qwen2.5-72B, Llama-3.3-70B on identical seeds, Wilson upper 13.3% ([bench/vaara-bench-v0.31.md](bench/vaara-bench-v0.31.md)).
 - Distribution-free conformal coverage on the score; MWU regret bound O(sqrt(T log N)).
 - Chain of custody: corpus, split, training commit, and bundle SHAs locked and printed by every script.
 
@@ -241,6 +244,8 @@ The public surface is fixed: the signed envelope (`vaara.receipt/v1`), capabilit
 | [docs/tamper-evident-audit-trail.md](docs/tamper-evident-audit-trail.md) | How the trail works, its honest limits, and what it costs |
 | [docs/vaara-vs-observability-vs-grc.md](docs/vaara-vs-observability-vs-grc.md) | Vaara vs Datadog/Splunk vs Vanta/Drata: three different questions |
 | [docs/dogfood/](docs/dogfood/README.md) | Our marketing runs under this gate; the signed trail and key to verify it |
+| [docs/capabilities.md](docs/capabilities.md) | Everything Vaara does, by area, each entry naming its code |
+| [docs/library.md](docs/library.md) | The capabilities with no command of their own, reached from Python, each with a block that runs |
 | [docs/architecture.md](docs/architecture.md) | Scoring, conformal coverage, time anchor, formal properties |
 | [SPEC.md](SPEC.md) | The canonical vaara.receipt/v1 receipt format spec |
 | [docs/standards.md](docs/standards.md) | SEP-2828, SEP-2787, OVERT, the sovereign inference harness |
@@ -259,11 +264,15 @@ Commercial license and paid pilots available: see [vaara.io](https://vaara.io/#p
 
 ## Acknowledgements
 
+- Listed in the [OECD.AI Catalogue of Tools & Metrics](https://oecd.ai/en/catalogue/tools/vaara) for trustworthy AI.
 - Listed in the industry acknowledgements of the [IMDA Model AI Governance Framework for Agentic AI v1.5](https://www.imda.gov.sg/-/media/imda/files/about/emerging-tech-and-research/artificial-intelligence/mgf-for-agentic-ai.pdf) (Singapore, 20 May 2026).
 - The [AMD AI Developer Program](https://www.linkedin.com/posts/amd-developer_meet-henri-sirkkavaara-henri-created-vaara-activity-7459667676555132928-QFSd) ran a developer testimonial of Vaara in May 2026.
+- A [Red Hat](https://www.redhat.com/en/partners) partner in the Sell With module since October 2026.
 - [Article 14 runtime: why oversight of agentic AI has to be evidenced as action, not model](https://futurium.ec.europa.eu/ga/apply-ai-alliance/community-content/article-14-runtime-why-oversight-agentic-ai-has-be-evidenced-action-not-model), the position post on the EU Apply AI Alliance Futurium.
 - [Article 12 and the difference between a log and evidence](https://futurium.ec.europa.eu/en/apply-ai-alliance/community-content/article-12-and-difference-between-log-and-evidence), the companion position post on the EU Apply AI Alliance Futurium.
 - [Sovereign proof for the AI Act](https://futurium.ec.europa.eu/en/apply-ai-alliance/community-content/sovereign-proof-ai-act), the latest position post on the EU Apply AI Alliance Futurium.
+
+Red Hat is a trademark of Red Hat, LLC, registered in the United States and other countries.
 
 ## Citation
 

@@ -57,6 +57,10 @@ EMILIA Protocol
 
 9 of 9 and 8 of 8, including the tampered-proof and forked-root negatives
 
+### Kind of run
+
+{kind}
+
 ### Your own scoping
 
 Validates the pinned independent vector lanes.
@@ -79,6 +83,7 @@ def form(**over) -> str:
         "suites": "transparency_consistency_v0, evidence_bundle_v0",
         "commit": HEAD,
         "record": "https://mailarchive.ietf.org/arch/msg/scitt/fE4RYzpmR440PVrZaknTvVKjUoI/",
+        "kind": "Reproduction: the author's checkers over the author's vectors",
         "c1": "X",
         "c2": "X",
         "c3": "X",
@@ -97,6 +102,107 @@ def test_a_complete_form_becomes_a_row():
     assert row["suites"] == ["transparency_consistency_v0", "evidence_bundle_v0"]
     assert row["at_commit"] == HEAD
     assert row["submitted_by"] == "someone"
+
+
+# ── Kind of run ───────────────────────────────────────────────────────────────
+#
+# What a run establishes is a property of who wrote the verifier and who wrote
+# the vectors. A register that cannot tell a reproduction from an independent
+# implementation gets cited for the second while holding the first, and the row
+# outlives the message that would have explained it.
+
+
+@pytest.mark.parametrize(
+    "chosen,key",
+    [
+        ("Reproduction: the author's checkers over the author's vectors",
+         "reproduction"),
+        ("Construction reproduction: a published construction derived from its prose "
+         "alone, without running the author's verifier",
+         "construction_reproduction"),
+        ("Independent implementation from the text, run against the author's vectors",
+         "independent_implementation"),
+        ("Independent implementation run against independently constructed vectors",
+         "independent_implementation_and_vectors"),
+    ],
+)
+def test_each_kind_reaches_the_row_as_a_stable_key(chosen, key):
+    """The row stores a key, so rewording the form cannot restate a published row."""
+    assert row_from(form(kind=chosen))["kind"] == key
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "something else entirely", "_No response_"])
+def test_an_unnamed_or_unknown_kind_is_never_promoted(raw):
+    """An unnamed kind reads as the weakest claim available, never the strongest."""
+    assert vcr.parse_kind(raw) == "reproduction"
+    assert vcr.DEFAULT_KIND == "reproduction"
+
+
+def test_a_construction_reproduction_does_not_fall_through_to_reproduction():
+    """The fourth kind's wording carries the third's word, and order keeps them apart.
+
+    A construction reproduction asks whether the prose was sufficient to derive
+    a published value. A reproduction asks whether the author's own checker runs
+    elsewhere. Filing the first as the second would record a claim about the
+    text as a claim about an artefact, in a row that cannot be edited later.
+    """
+    for phrasing in (
+        "Construction reproduction: a published construction derived from its prose "
+        "alone, without running the author's verifier",
+        "construction reproduction",
+        "CONSTRUCTION REPRODUCTION of the class digest",
+    ):
+        assert vcr.parse_kind(phrasing) == "construction_reproduction"
+
+
+def test_the_issue_form_offers_exactly_the_kinds_the_register_knows():
+    """The dropdown a submitter reads and the table a row is stored against.
+
+    Nothing bound these together, so a kind added to the table without a form
+    option was unreachable, and a reworded option would have parsed as the
+    weakest kind and filed a quieter claim than the submitter picked. Both fail
+    silently, and a row cannot be edited afterwards.
+    """
+    # Read without PyYAML. It ships in the `yaml` extra, so importing it here
+    # would error this test out on every job that does not install that extra,
+    # which is the fault #622 fixed. A guard that skips on most runs is not a
+    # guard, and the block being read is a flat list of quoted strings.
+    text = (ROOT / ".github" / "ISSUE_TEMPLATE" / "conformance-row.yml").read_text(
+        encoding="utf-8"
+    )
+    block = re.search(
+        r"^(?P<indent> +)options:\n(?P<items>(?:(?P=indent) +- .*\n)+)",
+        text,
+        re.MULTILINE,
+    )
+    assert block, "the kind dropdown has no options block"
+    options = [
+        re.sub(r'^\s*- +"?|"?\s*$', "", line)
+        for line in block.group("items").splitlines()
+    ]
+    assert [vcr.parse_kind(o) for o in options] == list(vcr.KINDS), (
+        f"the form's options no longer map one-to-one onto KINDS, in order.\n"
+        f"form: {options}\nkinds: {list(vcr.KINDS)}"
+    )
+
+
+def test_a_form_with_no_kind_field_still_yields_the_weakest():
+    body = form().replace("### Kind of run", "### Something Else")
+    assert row_from(body)["kind"] == "reproduction"
+
+
+def test_the_page_states_the_rule_for_a_row_that_has_no_kind():
+    """Rows listed before the field existed are never edited to add one."""
+    text = render.kind_text({"id": 1, "party": "Someone"})
+    assert "Not stated" in text
+    assert "reproduction" in text.lower()
+    for key, prose in render.KIND_TEXT.items():
+        assert render.kind_text({"kind": key}) == prose
+
+
+def test_the_two_kind_tables_agree():
+    """vcr_row writes the key; the renderer turns it into prose. Same three."""
+    assert set(vcr.KINDS) == set(render.KIND_TEXT)
 
 
 @pytest.mark.parametrize(
@@ -139,6 +245,50 @@ def test_a_whole_corpus_claim_has_to_match_the_corpus():
     n = len(vcr.known_suites())
     with pytest.raises(vcr.Rejected, match="suites"):
         row_from(form(suites=f"all {n - 1} suites"))
+
+
+#: A commit whose corpus is smaller than the one on the branch today. Iman
+#: Schrock ran here, and the runner at this commit prints `all 44 suites`.
+HISTORICAL_COMMIT = "62a7080b7c854173c7d6b8ee51ce4dd724d59227"
+
+
+def _has_commit(sha: str) -> bool:
+    return subprocess.run(
+        ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+        cwd=ROOT, capture_output=True,
+    ).returncode == 0
+
+
+@pytest.mark.skipif(
+    not _has_commit(HISTORICAL_COMMIT),
+    reason="shallow clone cannot see the tree at that commit",
+)
+def test_the_corpus_size_is_read_at_the_commit_the_row_is_scoped_to():
+    """A row over 44 suites at a 44-suite commit is not a claim about 46.
+
+    Issue #618, 2026-08-24. The corpus grew from 44 to 46, this validator
+    resolved the count against the working tree, and an honest row became
+    impossible to file. `all 44 suites` was refused for not being 46, and the
+    rejection told the submitter to rerun at the commit they were listing and
+    use the link it prints, which is exactly what produced the 44. Naming the
+    suites instead does not help either: the field caps at 200 characters and
+    the 44 names come to 802. The only remaining path was to relabel the run as
+    46, and Iman Schrock refused to do that, correctly.
+    """
+    at_commit = vcr.known_suites(HISTORICAL_COMMIT)
+    today = vcr.known_suites()
+    assert at_commit, "no suites resolved at the historical commit"
+    assert len(at_commit) < len(today), (
+        "this test needs a commit whose corpus is smaller than today's; "
+        f"got {len(at_commit)} then and {len(today)} now"
+    )
+
+    row = row_from(form(suites=f"all {len(at_commit)} suites", commit=HISTORICAL_COMMIT))
+    assert row["suites"] == sorted(at_commit)
+
+    # And today's count is the wrong claim for that commit, in both directions.
+    with pytest.raises(vcr.Rejected, match="suites"):
+        row_from(form(suites=f"all {len(today)} suites", commit=HISTORICAL_COMMIT))
 
 
 def test_prose_around_the_suites_is_still_refused():
@@ -312,7 +462,7 @@ def test_a_row_records_which_terms_it_agreed_to():
 
 def test_the_committed_table_ships_with_no_rows_and_no_badges():
     """Nobody appears on the page until they have asked to be there."""
-    data = json.loads((ROOT / "conformance" / "reproductions.json").read_text())
+    data = json.loads((ROOT / "conformance" / "reproductions.json").read_text(encoding="utf-8"))
     assert data["reproductions"] == []
     assert render.badge_drift(data) == []
 
@@ -374,6 +524,6 @@ def test_the_first_row_links_to_the_declared_genesis():
 
 def test_the_committed_file_declares_a_genesis_and_verifies():
     """Whatever ships has to pass its own checker, empty or not."""
-    data = json.loads((ROOT / "conformance" / "reproductions.json").read_text())
+    data = json.loads((ROOT / "conformance" / "reproductions.json").read_text(encoding="utf-8"))
     assert data.get("genesis", "").startswith("sha256:")
     assert vcr.verify_chain(data) == []

@@ -215,7 +215,7 @@ def discover_mcp_clients(proxy_bin: str = "vaara-mcp-proxy") -> list[MCPClientIn
 
 def _count_mcp_servers(config_path: Path, proxy_bin: str) -> dict:
     try:
-        obj = json.loads(config_path.read_text())
+        obj = json.loads(config_path.read_text(encoding="utf-8"))
         servers = obj.get("mcpServers", {})
         if not isinstance(servers, dict):
             return {"mcp_servers": 0, "governed_servers": 0}
@@ -255,7 +255,8 @@ def run_discovery() -> DiscoverReport:
     from vaara import __version__
     return DiscoverReport(
         agents=discover_agents(),
-        shell=discover_shell(),
+        # A report field named shell, not subprocess shell=True.
+        shell=discover_shell(),  # nosec B604
         mcp_clients=discover_mcp_clients(),
         sensitive_paths=discover_sensitive_paths(),
         known_tools=discover_known_tools(),
@@ -377,7 +378,7 @@ def write_default_policy(
     """Generate and write the default policy file."""
     policy = generate_default_policy(discovery, shadow=shadow, mode_name=mode_name)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(policy, indent=2) + "\n")
+    path.write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8", newline="\n")
     return path
 
 
@@ -423,5 +424,5 @@ def write_discovery_config(
         }
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(config, indent=2) + "\n")
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8", newline="\n")
     return path

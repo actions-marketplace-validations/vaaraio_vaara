@@ -11,6 +11,10 @@ four commands in that block failed as printed.
 The check walks the real argparse tree of every installed console script, so
 it tracks whatever the CLI actually accepts rather than a second list that
 can drift the same way the docs did.
+
+The site is read too, inside its ``<pre>`` and ``<code>`` blocks: the
+test-it-yourself page told a reader to run ``vaara conformance check --all``
+for a year, and the parser had no ``--all``.
 """
 
 from __future__ import annotations
@@ -47,6 +51,30 @@ NOT_OURS = {
     "--create-namespace",  # helm install
     "--namespace",         # helm, kubectl
     "--from-file",         # kubectl create secret generic
+    # git, in docs/conformance-profile.md. Repairing a Windows clone whose
+    # line endings were rewritten is a git operation, so the commands that
+    # undo it belong to git.
+    "--cached",  # git rm --cached -r .
+    "--hard",    # git reset --hard
+    # pip and gh, in docs/signing-keys.md. Verifying a Vaara release means
+    # downloading the wheel and checking its GitHub attestation.
+    "--no-deps",  # pip download
+    "--repo",     # gh attestation verify
+    # openshell, in docs/cage.md: the OpenShell driver's own `sandbox create`
+    # line, shown so a reader sees what the driver runs.
+    "--detach",  # openshell sandbox create
+    "--env",     # openshell sandbox create
+    # the other cages, in docs/cage.md: each driver's start line, in the
+    # cage's own CLI.
+    "--sandbox-state-json",  # codex sandbox
+    "--settings",            # srt
+    "--profile",             # nono run
+    "--detached",            # nono run
+    "--runtime",             # docker run (gVisor, Kata)
+    "--api-sock",            # firecracker
+    "--config-file",         # firecracker
+    "--conf",                # msb run
+    "--no-tty",              # msb run
 }
 
 
@@ -106,8 +134,15 @@ def _known_flags() -> set[str]:
 def _cited_flags() -> dict[str, str]:
     cited: dict[str, str] = {}
     for doc in sorted(ROOT.glob("docs/**/*.md")) + [ROOT / "README.md"]:
-        for flag in re.findall(r"(--[a-z][\w-]{2,})", doc.read_text()):
+        for flag in re.findall(r"(--[a-z][\w-]{2,})", doc.read_text(encoding="utf-8")):
             cited.setdefault(flag, str(doc.relative_to(ROOT)))
+    # A page's stylesheet is full of `--ink`-style custom properties; only
+    # what a reader is shown to type counts.
+    for page in sorted(ROOT.glob("webpage/**/*.html")):
+        text = page.read_text(encoding="utf-8")
+        for block in re.findall(r"<(?:pre|code)[^>]*>(.*?)</(?:pre|code)>", text, re.S):
+            for flag in re.findall(r"(--[a-z][\w-]{2,})", block):
+                cited.setdefault(flag, str(page.relative_to(ROOT)))
     return cited
 
 
@@ -133,7 +168,7 @@ def test_docs_cite_flags_that_exist(known):
 
 def test_the_compliance_handoff_block_uses_real_flags(known):
     """The block a regulator-facing reader copies verbatim."""
-    block = (ROOT / "docs" / "COMPLIANCE.md").read_text()
+    block = (ROOT / "docs" / "COMPLIANCE.md").read_text(encoding="utf-8")
     assert "vaara keygen --dev --out " in block
     assert "--out-dir" not in block
     assert "--public-key" not in block

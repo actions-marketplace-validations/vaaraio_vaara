@@ -26,7 +26,7 @@ DEFAULT_DB = Path.home() / ".vaara" / "trail" / "audit.db"
 
 def _load_config() -> dict:
     try:
-        data = json.loads(CONFIG_PATH.read_text())
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
@@ -34,7 +34,7 @@ def _load_config() -> dict:
 
 def _save_config(cfg: dict) -> None:
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2, sort_keys=True))
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2, sort_keys=True), encoding="utf-8", newline="\n")
 
 
 def _ask(prompt: str, default: str = "") -> str:
@@ -150,6 +150,14 @@ def _settings() -> None:
     print("Saved.")
 
 
+def _cages() -> None:
+    """Which cages are ready on this machine, and how to start one."""
+    _cli(["cage", "drivers"])
+    print()
+    print("Start an agent in a ready cage:")
+    print("  vaara cage run --driver <name> [--policy FILE | --image IMAGE] -- <agent>")
+
+
 def _check_updates() -> None:
     """Check whether a newer version of Vaara is available."""
     import urllib.request
@@ -158,7 +166,8 @@ def _check_updates() -> None:
 
     installed = vaara.__version__
     try:
-        with urllib.request.urlopen(
+        # Fixed https URL.
+        with urllib.request.urlopen(  # nosec B310
             "https://pypi.org/pypi/vaara/json", timeout=10
         ) as resp:
             latest = json.load(resp)["info"]["version"]
@@ -181,6 +190,7 @@ ITEMS: list[tuple[str, Callable[[], None]]] = [
     ("Shadow report: what would have been blocked", _shadow_report),
     ("Export evidence package from the trail", _export),
     ("Verify a signed evidence package", _verify),
+    ("Cages: which are ready on this machine", _cages),
     ("Settings", _settings),
     ("Check for updates", _check_updates),
 ]

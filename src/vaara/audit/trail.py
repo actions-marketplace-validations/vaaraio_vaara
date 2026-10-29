@@ -24,6 +24,7 @@ human oversight.  This module satisfies both.
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import logging
@@ -37,7 +38,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from vaara import _capture
+from vaara._decision_vocabulary import FINE_TO_COARSE, REFINEMENTS
 from vaara._sanitize import json_safe, strict_json_dumps
+from vaara.audit.write_failure import active_failure, mark_recovered, record_failure
 from vaara.taxonomy.actions import ActionRequest, RegulatoryDomain
 
 logger = logging.getLogger(__name__)
@@ -57,8 +61,102 @@ class EventType(str, Enum):
     OUTCOME_RECORDED = "outcome_recorded"   # Post-execution outcome observed
     POLICY_OVERRIDE = "policy_override"     # Manual override of policy decision
     ANCHOR_GAP = "anchor_gap"               # Auto-anchor attempt failed (fail-open marker)
+    REPAIR_GAP = "repair_gap"               # Store repair could not keep every record
+    REPAIR_RECOVERED = "repair_recovered"   # Records a repair declared lost, recovered and verified
+    TRAIL_FORKED = "trail_forked"           # Another branch of this trail continues from a shared seq
     KEY_LIFECYCLE = "key_lifecycle"         # Signing-key custodian rotated/revoked/added
     DISCLOSURE_RECORDED = "disclosure_recorded"  # EU AI Act Art 50 transparency disclosure
+    ACCESS_RECORDED = "access_recorded"     # Something was opened, and by whom
+    AGENT_SEEN = "agent_seen"               # vaara scan --watch saw an agent start
+    WITNESS_CONFIGURED = "witness_configured"  # Heads reach a log or a TSA at a stated cadence
+    RECORD_ERASED = "record_erased"         # A record's data was erased, its hash kept
+    CAGE_LIFECYCLE = "cage_lifecycle"       # A cage launch started or stopped
+    TRAIL_NOT_RECORDING = "trail_not_recording"  # The store refused writes, then took them again
+    TRAIL_ROTATED = "trail_rotated"         # A retention rotation archived the records before the trail's first one
+
+    # Copies and pickles go through the stored value, so a type this build
+    # does not know (see stored_event_type) survives them. Python 3.11+
+    # enums already copy as themselves; 3.10 rebuilt them with
+    # EventType(value), which refuses an unknown one inside asdict().
+    def __copy__(self) -> "EventType":
+        return self
+
+    def __deepcopy__(self, memo: dict) -> "EventType":
+        return self
+
+    def __reduce_ex__(self, protocol):  # type: ignore[override]
+        return stored_event_type, (self._value_,)
+
+
+def stored_event_type(value: str) -> EventType:
+    """The event type a stored record names, whether this build knows it or not.
+
+    A record written by a newer Vaara can carry a type added after this
+    one. ``EventType(value)`` refuses it, which made every older reader load
+    the row as a corrupt skeleton; the skeleton then failed its hash, and
+    one new event type read as a broken chain. An unknown value comes back
+    as an ``EventType`` whose ``value`` is the stored string, so the record
+    hashes as written, and which equals none of the members this build
+    knows. Only read paths use this; input validation keeps calling
+    ``EventType(value)``, which still refuses.
+    """
+    try:
+        return EventType(value)
+    except ValueError:
+        if not isinstance(value, str) or not value:
+            raise
+        unknown = str.__new__(EventType, value)
+        unknown._name_ = "UNKNOWN"
+        unknown._value_ = value
+        return unknown
+
+
+# Written only by the trail's own record_* methods, never accepted through an
+# append API. Verification reads them back: a REPAIR_GAP naming missing seqs
+# turns a broken chain into declared gaps, an ANCHOR_GAP marks an unwitnessed
+# stretch, KEY_LIFECYCLE is custodian evidence for SOC 2 CC6.2 and CC8.1,
+# RECORD_ERASED accounts for a record whose data was erased (see ERASED_DATA_KEY),
+# CAGE_LIFECYCLE pairs a cage launch's stop with its start,
+# TRAIL_NOT_RECORDING says the store refused writes between two adjacent records,
+# TRAIL_ROTATED accounts for the first surviving record's link after a retention purge.
+SYSTEM_EVENT_TYPES = frozenset({
+    EventType.ANCHOR_GAP,
+    EventType.REPAIR_GAP,
+    EventType.REPAIR_RECOVERED,
+    EventType.TRAIL_FORKED,
+    EventType.KEY_LIFECYCLE,
+    EventType.WITNESS_CONFIGURED,
+    EventType.RECORD_ERASED,
+    EventType.CAGE_LIFECYCLE,
+    EventType.TRAIL_NOT_RECORDING,
+    EventType.TRAIL_ROTATED,
+})
+
+# An erased record's stored data is exactly {ERASED_DATA_KEY: {"erasure_record_id": ...}}.
+# Its record_hash is the one written before the erasure, so it no longer
+# recomputes; a later RECORD_ERASED record naming its id and that hash is what
+# lets a walk report the slot as erased instead of rewritten.
+ERASED_DATA_KEY = "_vaara_erased"
+
+# Whether the party that wrote a decision could have stopped the action
+# (record_decision's ``enforcement``). Absent means not recorded.
+ENFORCEMENT_MODES = frozenset({"could_block", "shadow", "recorded_only"})
+
+
+def erasure_pointer(record: "AuditRecord") -> Optional[str]:
+    """The erasure record id a tombstoned record points at, else None."""
+    data = record.data
+    if not isinstance(data, dict) or set(data) != {ERASED_DATA_KEY}:
+        return None
+    inner = data[ERASED_DATA_KEY]
+    if not isinstance(inner, dict):
+        return None
+    pointer = inner.get("erasure_record_id")
+    return pointer if isinstance(pointer, str) and pointer else None
+
+# Every other type: what POST /v1/audit/events, the OpenAPI enum and the
+# TypeScript EventType accept. tests/test_event_type_vocabulary.py holds them.
+CLIENT_EVENT_TYPES = tuple(e for e in EventType if e not in SYSTEM_EVENT_TYPES)
 
 
 # ── Regulatory article mappings ───────────────────────────────────────────
@@ -88,8 +186,8 @@ EU_AI_ACT_MAPPINGS: dict[EventType, list[RegulatoryArticle]] = {
             "Adaptive risk scoring with conformal prediction intervals quantifies risk for every action",
         ),
         RegulatoryArticle(
-            RegulatoryDomain.EU_AI_ACT, "Article 9(7)",
-            "Testing shall be suitable to identify relevant risks",
+            RegulatoryDomain.EU_AI_ACT, "Article 9(6)",
+            "High-risk AI systems shall be tested to identify the most appropriate and targeted risk management measures",
             "Conformal calibration provides distribution-free coverage guarantees on risk estimates",
         ),
     ],
@@ -101,21 +199,21 @@ EU_AI_ACT_MAPPINGS: dict[EventType, list[RegulatoryArticle]] = {
         ),
         RegulatoryArticle(
             RegulatoryDomain.EU_AI_ACT, "Article 14(4)(a)",
-            "The human shall be able to fully understand the capacities and limitations of the system",
+            "The human shall be able to properly understand the relevant capacities and limitations of the system and duly monitor its operation",
             "Decision records include risk scores, confidence intervals, and contributing signals",
         ),
     ],
     EventType.ACTION_BLOCKED: [
         RegulatoryArticle(
-            RegulatoryDomain.EU_AI_ACT, "Article 9(4)(a)",
-            "Appropriate risk management measures shall be adopted, including elimination or reduction of risks",
+            RegulatoryDomain.EU_AI_ACT, "Article 9(5)(a)",
+            "Elimination or reduction of identified risks as far as technically feasible through adequate design and development",
             "High-risk actions are automatically blocked with full audit trail",
         ),
     ],
     EventType.ESCALATION_SENT: [
         RegulatoryArticle(
             RegulatoryDomain.EU_AI_ACT, "Article 14(3)(a)",
-            "Human oversight shall enable the human to properly monitor the AI system",
+            "Human oversight measures shall be identified and built into the high-risk AI system by the provider",
             "Borderline decisions are escalated with full context for human review",
         ),
     ],
@@ -128,13 +226,13 @@ EU_AI_ACT_MAPPINGS: dict[EventType, list[RegulatoryArticle]] = {
     ],
     EventType.OUTCOME_RECORDED: [
         RegulatoryArticle(
-            RegulatoryDomain.EU_AI_ACT, "Article 9(2)(b)",
-            "Appropriate measures to eliminate or reduce risks as far as possible through adequate design",
+            RegulatoryDomain.EU_AI_ACT, "Article 9(2)(c)",
+            "Evaluation of other risks possibly arising, based on the analysis of data gathered from the post-market monitoring system",
             "Post-execution outcomes feed back into adaptive scoring to improve future risk estimates",
         ),
         RegulatoryArticle(
-            RegulatoryDomain.EU_AI_ACT, "Article 61(1)",
-            "Post-market monitoring system proportionate to the nature of the AI technologies",
+            RegulatoryDomain.EU_AI_ACT, "Article 72(1)",
+            "Post-market monitoring system proportionate to the nature of the AI technologies and the risks of the high-risk AI system",
             "Continuous outcome tracking enables post-deployment monitoring of risk accuracy",
         ),
     ],
@@ -179,15 +277,15 @@ EU_AI_ACT_MAPPINGS: dict[EventType, list[RegulatoryArticle]] = {
 DORA_MAPPINGS: dict[EventType, list[RegulatoryArticle]] = {
     EventType.ACTION_REQUESTED: [
         RegulatoryArticle(
-            RegulatoryDomain.DORA, "Article 12(1)",
-            "ICT-related incident detection, including automated alert mechanisms",
+            RegulatoryDomain.DORA, "Article 10(1)",
+            "Mechanisms to promptly detect anomalous activities, including ICT-related incidents",
             "All agent actions are logged as events for incident detection",
         ),
     ],
     EventType.ACTION_BLOCKED: [
         RegulatoryArticle(
-            RegulatoryDomain.DORA, "Article 10(1)",
-            "ICT risk management framework shall include protection and prevention mechanisms",
+            RegulatoryDomain.DORA, "Article 9(1)",
+            "Continuous monitoring and control of ICT systems, with security tools, policies and procedures that minimise ICT risk",
             "Automated blocking of high-risk actions with full incident trail",
         ),
     ],
@@ -196,6 +294,96 @@ DORA_MAPPINGS: dict[EventType, list[RegulatoryArticle]] = {
             RegulatoryDomain.DORA, "Article 13(1)",
             "Learning and evolving from ICT-related incidents",
             "Outcome data feeds back into risk scoring for continuous improvement",
+        ),
+    ],
+}
+
+# SOC 2 Trust Services Criteria (AICPA TSC 2017, 2022 points of focus).
+# The common criteria a service auditor asks runtime evidence for: logical
+# access (CC6), system operations (CC7) and change management (CC8). The
+# criterion text is paraphrased in ``requirement``; the auditor reads the
+# original. Attached to records whose action carries the SOC2 domain
+# (data, infrastructure and identity actions in the built-in taxonomy),
+# and to the control events the trail writes about itself (key lifecycle,
+# escalations, policy overrides), which are control evidence whatever the
+# action was.
+SOC2_MAPPINGS: dict[EventType, list[RegulatoryArticle]] = {
+    EventType.ACTION_REQUESTED: [
+        RegulatoryArticle(
+            RegulatoryDomain.SOC2, "CC7.2",
+            "The entity monitors system components and their operation for anomalies indicative of malicious acts, natural disasters and errors",
+            "Every agent action is recorded with its arguments before it runs, so the monitored set is complete rather than sampled",
+        ),
+    ],
+    EventType.RISK_SCORED: [
+        RegulatoryArticle(
+            RegulatoryDomain.SOC2, "CC7.2",
+            "Anomalies are analysed to determine whether they represent security events",
+            "Each action is scored before the decision, with the contributing signals in the record",
+        ),
+    ],
+    EventType.DECISION_MADE: [
+        RegulatoryArticle(
+            RegulatoryDomain.SOC2, "CC6.1",
+            "Logical access security over protected information assets",
+            "The gate decided before the effect; the record names the agent, the tool, the decision and the policy behind it",
+        ),
+        RegulatoryArticle(
+            RegulatoryDomain.SOC2, "CC6.3",
+            "Access is authorised, modified or removed based on roles and responsibilities, with least privilege",
+            "Access is granted per action against the declared policy, never standing; the record names the approver when a human disposed",
+        ),
+    ],
+    EventType.ACTION_BLOCKED: [
+        RegulatoryArticle(
+            RegulatoryDomain.SOC2, "CC6.1",
+            "Logical access security over protected information assets",
+            "The action was refused before any effect; the record names the policy and the ground",
+        ),
+        RegulatoryArticle(
+            RegulatoryDomain.SOC2, "CC7.3",
+            "Security events are evaluated and action is taken to prevent or address a failure to meet objectives",
+            "The refusal is the action taken, recorded on the hash chain with its reason",
+        ),
+    ],
+    EventType.ESCALATION_SENT: [
+        RegulatoryArticle(
+            RegulatoryDomain.SOC2, "CC7.3",
+            "Security events are evaluated to determine whether they could result in a failure to meet objectives",
+            "The event is handed to a human with its context for that evaluation",
+        ),
+    ],
+    EventType.ESCALATION_RESOLVED: [
+        RegulatoryArticle(
+            RegulatoryDomain.SOC2, "CC7.3",
+            "Security events are evaluated to determine whether they could result in a failure to meet objectives",
+            "The human's determination and justification are recorded against the event",
+        ),
+    ],
+    EventType.OUTCOME_RECORDED: [
+        RegulatoryArticle(
+            RegulatoryDomain.SOC2, "CC7.3",
+            "Security events are evaluated to determine whether they have resulted in a failure to meet objectives",
+            "The outcome after execution is recorded against the action that caused it",
+        ),
+    ],
+    EventType.POLICY_OVERRIDE: [
+        RegulatoryArticle(
+            RegulatoryDomain.SOC2, "CC8.1",
+            "Changes to infrastructure, data, software and procedures are authorised, approved and implemented",
+            "A change to a policy decision names the overrider, the reason, and the prior and new decisions",
+        ),
+    ],
+    EventType.KEY_LIFECYCLE: [
+        RegulatoryArticle(
+            RegulatoryDomain.SOC2, "CC6.2",
+            "System credentials are registered and authorised before access, and removed when no longer authorised",
+            "Signing-key custodians added, rotated or revoked are recorded as hash-chained, time-anchored events",
+        ),
+        RegulatoryArticle(
+            RegulatoryDomain.SOC2, "CC8.1",
+            "Changes to infrastructure, data, software and procedures are authorised, approved and implemented",
+            "A change to the signing-key set is itself a recorded, approved change",
         ),
     ],
 }
@@ -263,15 +451,68 @@ TRANSPARENCY_DEFAULTS: dict[EventType, dict[str, str]] = {
         "data_usage": "chain_head_digest",
         "decision_making": "n/a",
     },
+    EventType.REPAIR_GAP: {
+        "system_operation": "store_repair",
+        "data_usage": "surviving_record_seqs",
+        "decision_making": "n/a",
+    },
+    EventType.REPAIR_RECOVERED: {
+        "system_operation": "store_recovery",
+        "data_usage": "recovered_bundle_digest+seqs",
+        "decision_making": "operator_action",
+    },
+    EventType.TRAIL_FORKED: {
+        "system_operation": "store_fork",
+        "data_usage": "fork_point+branch_head_digest",
+        "decision_making": "operator_action",
+    },
+    EventType.RECORD_ERASED: {
+        "system_operation": "record_erasure",
+        "data_usage": "erased_record_id+hash",
+        "decision_making": "operator_action",
+    },
+    EventType.WITNESS_CONFIGURED: {
+        "system_operation": "witness_configuration",
+        "data_usage": "cadence+target+key_fingerprint",
+        "decision_making": "operator_configuration",
+    },
     EventType.KEY_LIFECYCLE: {
         "system_operation": "key_custodian_management",
         "data_usage": "custodian_fingerprint+quorum",
+        "decision_making": "operator_action",
+    },
+    EventType.CAGE_LIFECYCLE: {
+        "system_operation": "cage_lifecycle",
+        "data_usage": "driver+name+policy_digest+actor",
+        "decision_making": "operator_action",
+    },
+    EventType.TRAIL_NOT_RECORDING: {
+        "system_operation": "recording_gap",
+        "data_usage": "refused_write_count+window",
+        "decision_making": "n/a",
+    },
+    EventType.TRAIL_ROTATED: {
+        "system_operation": "retention_rotation",
+        "data_usage": "archive_digest+purged_count",
         "decision_making": "operator_action",
     },
     EventType.DISCLOSURE_RECORDED: {
         "system_operation": "transparency_disclosure",
         "data_usage": "disclosure_statement",
         "decision_making": "policy_requirement",
+    },
+    EventType.ACCESS_RECORDED: {
+        "system_operation": "read_access",
+        # The record commits to what was returned by digest and holds none of
+        # it. That is the point: an access record over patient data cannot
+        # itself become a second copy of patient data.
+        "data_usage": "returned_set_digest",
+        "decision_making": "n/a",
+    },
+    EventType.AGENT_SEEN: {
+        "system_operation": "agent_discovery",
+        "data_usage": "process_table+connections",
+        "decision_making": "adapter_match",
     },
 }
 
@@ -397,7 +638,7 @@ class AuditRecord:
     def from_dict(d: dict) -> AuditRecord:
         """Deserialize from dict."""
         d = dict(d)
-        d["event_type"] = EventType(d["event_type"])
+        d["event_type"] = stored_event_type(d["event_type"])
         return AuditRecord(**d)
 
     @property
@@ -470,6 +711,17 @@ class AuditRecord:
                 f"{prefix} Article 50 disclosure: "
                 f"{_narrative_str(self.data.get('parameters', {}).get('article', '?'))}"
                 f" — {_narrative_str(self.data.get('parameters', {}).get('statement', ''), max_len=80)}"
+            ),
+            # The prefix already names the agent, so this names the person the
+            # agent acted for and the stated basis. Both belong in the line a
+            # human reads: "an entity saw it" is the transparency this record
+            # type exists to replace.
+            EventType.ACCESS_RECORDED: (
+                f"{prefix} opened "
+                f"{_narrative_str(self.data.get('parameters', {}).get('subject', '?'), max_len=64)}"
+                f" for "
+                f"{_narrative_str(self.data.get('parameters', {}).get('on_behalf_of', '?'), max_len=64)}"
+                f" ({_narrative_str(self.data.get('parameters', {}).get('basis', 'no basis given'), max_len=64)})"
             ),
         }
 
@@ -549,6 +801,299 @@ def _narrative_str(val: Any, max_len: int = _NARRATIVE_FIELD_MAX) -> str:
     return s
 
 
+@dataclass
+class SegmentVerification:
+    """The result of :meth:`AuditTrail.verify_segment`.
+
+    ``ok`` is the answer and ``reason`` is why, in both directions: on a pass
+    it states what was covered and what was not, because "verified" alone
+    would let an open segment read as an attested one.
+
+    ``closed`` is the distinction that matters. True means a later anchor's
+    RFC 3161 token attests the end of the segment, so the record existed by the
+    attested time. False means the record chains correctly back to an attested
+    head but nothing external has attested it yet, which is the normal state of
+    anything written since the last anchor.
+
+    ``lower_anchor_position`` of None means the segment starts at genesis
+    (the record sits below the first anchor). ``upper_anchor_position`` of None
+    means the segment is open at the top. ``anchor_gaps`` carries the indices of
+    any ``ANCHOR_GAP`` markers inside the segment: those records verify like any
+    other, but they record a stretch where the time authority was unreachable.
+    """
+
+    ok: bool
+    reason: str = ""
+    record_id: str = ""
+    record_index: int = -1
+    lower_anchor_position: Optional[int] = None
+    upper_anchor_position: Optional[int] = None
+    records_verified: int = 0
+    closed: bool = False
+    anchor_gaps: list[int] = field(default_factory=list)
+    lower_attested_time: Optional[str] = None
+    upper_attested_time: Optional[str] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class DeclaredGap:
+    """A break in the chain that a later REPAIR_GAP record names.
+
+    ``lost_seqs`` are the sequence numbers missing between the last record
+    before the break and ``resumes_at_seq``, the first record after it.
+    ``declared_by_seqs`` are the REPAIR_GAP records that name every one of
+    them; each sits later in the chain than the break and verified in the same
+    walk, so the declaration is itself chained evidence. ``record_index`` is
+    the position of the resuming record in the walk.
+    """
+
+    lost_seqs: tuple[int, ...]
+    resumes_at_seq: int
+    record_index: int
+    declared_by_seqs: tuple[Optional[int], ...]
+
+    def describe(self) -> str:
+        shown = ", ".join(str(s) for s in self.lost_seqs[:20])
+        if len(self.lost_seqs) > 20:
+            shown += f", ... ({len(self.lost_seqs)} in all)"
+        by = ", ".join("in this process" if s is None else str(s)
+                       for s in self.declared_by_seqs)
+        return f"seq {shown} lost, declared by repair record at seq {by}"
+
+
+@dataclass(frozen=True)
+class ErasedRecord:
+    """A record whose data was erased, accounted for by a RECORD_ERASED record.
+
+    The slot keeps its stored ``record_hash``, and the record after it still
+    chains to that hash, so the link verifies. What the record held cannot be
+    checked any more. ``erased_by_seq`` is the RECORD_ERASED record naming it,
+    later in the same walk (None when it was written in this process).
+    """
+
+    record_index: int
+    seq: Optional[int]
+    record_id: str
+    record_hash: str
+    erased_by_seq: Optional[int]
+
+    def describe(self) -> str:
+        at = "this process" if self.seq is None else f"seq {self.seq}"
+        by = "in this process" if self.erased_by_seq is None else f"seq {self.erased_by_seq}"
+        return (f"{at} ({self.record_id}) erased: link verified, content not "
+                f"checkable (erasure record at {by})")
+
+
+#: Mirrors vaara.audit.verify.ROTATION_RECORD_TYPE; the verifier module stays
+#: free of vaara imports, so the constant is written in both places.
+ROTATION_RECORD_TYPE = "vaara.trail-rotation/v1"
+_ROTATION_ARCHIVE_KINDS = frozenset({"zip", "sealed"})
+_ROTATION_TEXT_FIELDS = ("last_hash", "archive_sha256", "boundary_utc", "rotated_at",
+                         "signer_fingerprint")
+_ROTATION_SIGNATURE_KEYS = frozenset({"type", "alg", "signature"})
+
+
+@dataclass(frozen=True)
+class RotationSeam:
+    """The retention rotation a trail begins at.
+
+    A rotation archives the whole trail, then purges the records older than
+    the retention window. The first record that survives still links to the
+    last one purged, and a TRAIL_ROTATED record written before the purge names
+    that hash (``last_hash``), how many records went (``purged_records``) and
+    the digest of the archive that holds them. A walk that finds the first
+    record linked to such a record reports it here instead of a break.
+    ``record_index`` and ``seq`` place the rotation record in the walk.
+    """
+
+    record_index: int
+    seq: Optional[int]
+    record_id: str
+    last_hash: str
+    purged_records: int
+    archive_sha256: str
+    archive_records: int
+    archive_kind: str
+
+    def describe(self) -> str:
+        n = self.purged_records
+        return (f"begins at a rotation seam: {n} record{'s' if n != 1 else ''} "
+                f"archived as {self.archive_sha256}")
+
+
+def _rotation_seam(index: int, seq: Optional[int], record: "AuditRecord") -> Optional[RotationSeam]:
+    """The seam a TRAIL_ROTATED record states, or None when it is not well formed.
+
+    Shape only. The signature needs the signer's public key, which a walk of the
+    store does not hold; the export verifiers check it
+    (``vaara.audit.verify.check_rotations``). A record without the closed
+    signature block is not a seam: an unsigned claim accounts for nothing.
+    """
+    data = record.data if isinstance(record.data, dict) else {}
+    if not all(isinstance(data.get(k), str) and data[k] for k in _ROTATION_TEXT_FIELDS):
+        return None
+    purged, archived = data.get("purged_records"), data.get("archive_records")
+    if (isinstance(purged, bool) or not isinstance(purged, int) or purged < 1
+            or isinstance(archived, bool) or not isinstance(archived, int) or archived < 0):
+        return None
+    if data.get("archive_kind") not in _ROTATION_ARCHIVE_KINDS:
+        return None
+    block = data.get("rotation_signature")
+    if (not isinstance(block, dict) or set(block) != _ROTATION_SIGNATURE_KEYS
+            or block.get("type") != ROTATION_RECORD_TYPE or block.get("alg") != "Ed25519"
+            or not isinstance(block.get("signature"), str)):
+        return None
+    return RotationSeam(index, seq, record.record_id, data["last_hash"], purged,
+                        data["archive_sha256"], archived, data["archive_kind"])
+
+
+@dataclass(frozen=True)
+class ChainVerdict:
+    """The full answer of a chain walk, which ``verify_chain`` flattens.
+
+    Three states. ``intact``: every record chains to the one before it.
+    ``broken``: a record does not, and nothing in the chain accounts for it,
+    or a record's hash does not match its content; ``error`` says where.
+    ``declared_gaps``: every break sits where records are missing and a later
+    REPAIR_GAP record names each missing seq. A declared gap is never intact:
+    the records in it cannot be shown to be what was written, and a
+    declaration only says the hole was known and recorded, not what was in it.
+    ``erased``: every record whose hash does not recompute carries the erasure
+    tombstone, and a later RECORD_ERASED record names it by id and stored hash.
+    Never intact either: the erased content cannot be checked. ``state`` says
+    "declared_gaps" when a walk finds both; ``erased`` is still filled.
+    ``seams``: the trail begins at a retention rotation, not at its first
+    record. What is in the trail chains without a break from there, and the
+    records before it are in the archive the rotation record names, so this
+    stays ``intact`` and ``seams`` carries the rotation. A first record that
+    links to nothing the trail holds is still ``broken``.
+    """
+
+    error: Optional[str] = None
+    declared_gaps: tuple[DeclaredGap, ...] = ()
+    erased: tuple[ErasedRecord, ...] = ()
+    seams: tuple[RotationSeam, ...] = ()
+
+    @property
+    def state(self) -> str:
+        if self.error is not None:
+            return "broken"
+        if self.declared_gaps:
+            return "declared_gaps"
+        return "erased" if self.erased else "intact"
+
+    def summary(self) -> Optional[str]:
+        """None when intact, else one line: the error, the gaps, the erasures."""
+        if self.error is not None:
+            return self.error
+        if not self.declared_gaps and not self.erased:
+            return None
+        parts = []
+        if self.declared_gaps:
+            n = len(self.declared_gaps)
+            parts.append(
+                f"{n} declared gap{'s' if n != 1 else ''} ("
+                + "; ".join(g.describe() for g in self.declared_gaps) + ")"
+            )
+        if self.erased:
+            n = len(self.erased)
+            parts.append(
+                f"{n} erased record{'s' if n != 1 else ''} ("
+                + "; ".join(e.describe() for e in self.erased) + ")"
+            )
+        return "Chain not intact: " + ", ".join(parts) + ". Every other record verifies"
+
+
+class _GapLedger:
+    """Collects breaks at missing seqs, and the REPAIR_GAP records naming them.
+
+    A break is held open until the walk ends, because the record declaring
+    it is appended by the repair and so sits at or after it in the chain.
+    At, because a salvage that lost the tail leaves a seq floor, and the
+    repair's own REPAIR_GAP record is then the one that chains across the
+    hole. Declarations seen before the break do not count.
+    """
+
+    def __init__(self) -> None:
+        self._pending: list[tuple[int, tuple[int, ...], int, str]] = []
+        self._declared: list[tuple[int, Optional[int], frozenset[int]]] = []
+        self._tombstones: list[tuple[int, Optional[int], "AuditRecord", str]] = []
+        self._erasures: dict[tuple[str, str], tuple[int, Optional[int]]] = {}
+        self._start: Optional[tuple[str, str]] = None
+        self._rotations: list[RotationSeam] = []
+
+    def hold(self, index: int, lost: tuple[int, ...], resumes_at_seq: int,
+             error: str) -> None:
+        self._pending.append((index, lost, resumes_at_seq, error))
+
+    def hold_start(self, link: str, error: str) -> None:
+        """The first record of the walk links to ``link``, which the walk never
+        sees. Held open until the walk has seen every TRAIL_ROTATED record, one
+        of which has to name that hash."""
+        self._start = (link, error)
+
+    def hold_erased(self, index: int, seq: Optional[int], record: "AuditRecord",
+                    error: str) -> None:
+        """A tombstoned record whose hash no longer recomputes, held open
+        until the walk has seen every RECORD_ERASED record after it."""
+        self._tombstones.append((index, seq, record, error))
+
+    def see(self, index: int, seq: Optional[int], record: "AuditRecord") -> None:
+        if record.event_type == EventType.RECORD_ERASED:
+            data = record.data or {}
+            rid, rhash = data.get("erased_record_id"), data.get("erased_record_hash")
+            if isinstance(rid, str) and isinstance(rhash, str):
+                self._erasures.setdefault((rid, rhash), (index, seq))
+            return
+        if record.event_type == EventType.TRAIL_ROTATED:
+            seam = _rotation_seam(index, seq, record)
+            if seam is not None:
+                self._rotations.append(seam)
+            return
+        if record.event_type != EventType.REPAIR_GAP:
+            return
+        named = (record.data or {}).get("lost_seqs") or []
+        seqs = frozenset(s for s in named if isinstance(s, int) and not isinstance(s, bool))
+        if seqs:
+            self._declared.append((index, seq, seqs))
+
+    def verdict(self) -> ChainVerdict:
+        seams: tuple[RotationSeam, ...] = ()
+        if self._start is not None:
+            link, error = self._start
+            begun = next((s for s in self._rotations if s.last_hash == link), None)
+            if begun is None:
+                return ChainVerdict(error=(
+                    f"{error} (no signed rotation record in the trail names that hash)"
+                ))
+            seams = (begun,)
+        gaps = []
+        for index, lost, resumes, error in self._pending:
+            by = tuple(seq for at, seq, named in self._declared
+                       if at >= index and set(lost) <= named)
+            if not by:
+                missing = ", ".join(str(s) for s in lost[:20])
+                return ChainVerdict(error=(
+                    f"{error} (seq {missing} missing and not declared by any "
+                    f"repair record)"
+                ))
+            gaps.append(DeclaredGap(lost, resumes, index, by))
+        erased = []
+        for index, seq, record, error in self._tombstones:
+            found = self._erasures.get((record.record_id, record.record_hash))
+            if found is None or found[0] <= index:
+                return ChainVerdict(error=(
+                    f"{error} (the record carries an erasure tombstone, and no "
+                    f"erasure record later in the chain names it by id and hash)"
+                ))
+            erased.append(ErasedRecord(index, seq, record.record_id,
+                                       record.record_hash, found[1]))
+        return ChainVerdict(declared_gaps=tuple(gaps), erased=tuple(erased), seams=seams)
+
+
 # ── Audit Trail ───────────────────────────────────────────────────────────
 
 class AuditTrail:
@@ -572,7 +1117,31 @@ class AuditTrail:
         """
         self._records: list[AuditRecord] = []
         self._by_action: dict[str, list[AuditRecord]] = defaultdict(list)
+        # Escalations a human resolved, in append order, so
+        # find_prior_approval does not walk the whole trail on every
+        # intercept. Only resolutions land here, so it stays small even over a
+        # busy day: at 23,000 services an hour the trail holds ~552,000
+        # records in a 24 hour window and this list holds the handful a human
+        # actually answered. Maintained ONLY by _index_record.
+        self._resolved_approvals: list[AuditRecord] = []
+        # record_id -> its position in _records, so verify_segment can locate
+        # one record without a linear scan. Unlike the list above this holds an
+        # entry per record, measured at 66 bytes each, which is about 3 percent
+        # on top of a trail whose records already cost roughly 2 KiB apiece.
+        # It exists only where _records does, so a store too large to
+        # materialise carries neither: that trail is verified by
+        # SQLiteAuditBackend.verify_chain_streaming, which holds no index and
+        # no records. Maintained ONLY by _index_record.
+        self._pos_by_record_id: dict[str, int] = {}
+        # (tenant_id, agent_id, session_id) -> the action ids of that session,
+        # in the order their action_requested records landed, so authority
+        # decay replays one session without scanning every agent's history
+        # on every allowed call. Maintained ONLY by _index_record.
+        self._actions_by_session: dict[tuple[str, str, str], list[str]] = defaultdict(list)
         self._last_hash = ""
+        # Set by SQLiteAuditBackend.load_trail when receipts are on; called
+        # with every appended record and acts on decision records only.
+        self._receipt_sink: Optional[Callable[[AuditRecord], Any]] = None
         self._on_record = on_record
         # record_id -> the chain head the persistent store handed out for it,
         # recorded only when that head was not this trail's own previous
@@ -582,6 +1151,23 @@ class AuditTrail:
         # this to tell a legitimate foreign predecessor from a real break,
         # and accepts nothing it did not observe the store hand out.
         self._store_anchors: dict[str, str] = {}
+        # record_id -> store seq, filled by load_trail. verify_chain uses it to
+        # tell a break at missing seqs, which a REPAIR_GAP record can declare,
+        # from a break between adjacent seqs, which nothing can.
+        self._store_seqs: dict[str, int] = {}
+        # True when load_trail read every row of the table. Seqs are allocated
+        # across the whole table, so only then is a seq the walk skips a
+        # record that is missing; a tenant's records skip the seqs other
+        # tenants took.
+        self._store_seqs_whole_table = False
+        # The verdict load_trail reached when it opened this trail, or None
+        # for a trail that was not loaded from a store.
+        self._load_verdict: Optional[ChainVerdict] = None
+        # Set by load_trail when the chain head the store recorded at its last
+        # write is no longer stored (sqlite_backend._HEAD_KEY). The walk below
+        # cannot see records missing from the end; this is how it hears of
+        # them, and every verify of this trail reports it.
+        self._store_head_error: Optional[str] = None
         # v0.40 multi-tenant: action_id -> tenant_id, seeded by
         # record_action_requested. Subsequent record_* calls (decision,
         # execution, escalation) look up the action_id so every record in
@@ -595,6 +1181,20 @@ class AuditTrail:
         # surfaces only at next load_trail. Article 12(2) compliance asks
         # for active detection, not forensic-only.
         self._persistence_failures = 0
+        # This counter is per-process, and the Claude Code hook is a fresh
+        # process per tool call, so on that deployment it can never exceed 1.
+        # That is why the 2026-08-22 outage ran thirteen days without crossing
+        # any threshold. The durable count lives beside the database file; see
+        # vaara.audit.write_failure. False means "the marker has not been
+        # consulted since the last failure", so the first successful write
+        # after a failure is the one that clears it.
+        self._write_marker_checked = False
+        # Set under the chain lock by the first write that lands after an
+        # outage: the marker as it stood and the record that landed. The
+        # trail_not_recording record is written from it once the lock is
+        # free (see _flush_unrecorded_mark), because it has to follow that
+        # record on the chain.
+        self._unrecorded_pending: Optional[tuple[dict, str]] = None
         # Count of rows loaded as skeletons during load_trail because
         # their data/regulatory JSON columns were corrupt. Parallel
         # signal to persistence_failures but for the READ path — an ops
@@ -622,6 +1222,20 @@ class AuditTrail:
         # chain's existence is provable against an external clock even if the
         # signing key is later compromised. See vaara.audit.timeanchor.
         self._anchors: list = []
+        # The same anchors again, kept in chain-position order, so
+        # verify_segment can bisect for its bounding pair instead of scanning.
+        # Two lists rather than one list of tuples: two anchors can share a
+        # position, and a tuple comparison would then fall through to comparing
+        # the anchor objects themselves, which are not orderable.
+        #
+        # This has to be an insertion, never an append. anchor_head reads the
+        # position under _lock, makes the TSA round trip OUTSIDE it, then
+        # appends under _lock again, so two concurrent anchors can arrive in
+        # the opposite order to the positions they carry. _anchors is therefore
+        # unordered by construction and _index_anchor puts each one where it
+        # belongs. Maintained ONLY by _index_anchor.
+        self._anchor_positions: list[int] = []
+        self._anchors_by_position: list = []
         # v0.49 automatic cadence anchoring. Once enable_auto_anchor() sets a
         # client, the trail anchors its own head every _anchor_cadence records.
         # Fail-open: a failed anchor attempt records a chained ANCHOR_GAP marker
@@ -672,7 +1286,12 @@ class AuditTrail:
         """Verify the hash chain is unbroken."""
         return self.verify_chain() is None
 
-    def verify_chain(self) -> Optional[str]:
+    def verify_chain(
+        self,
+        *,
+        start_index: int = 0,
+        expected_previous_hash: str = "",
+    ) -> Optional[str]:
         """Verify hash chain integrity.  Returns None if intact, error string if broken.
 
         A trail whose persistent store owns the chain head holds a *window*
@@ -694,29 +1313,119 @@ class AuditTrail:
 
         This is the process's view. The complete chain is verified by
         reloading it from the store, which is what ``load_trail`` does on
-        every open and what ``vaara verify`` and the export path use.
+        every open and what ``vaara trail export`` and ``vaara dashboard`` use.
+
+        **Memory.** The walk holds one record at a time. It used to open with
+        ``snapshot = list(self._records)``, and measured, that copy was the
+        entire transient cost of the call: 393 KiB over 50,000 records against
+        390.6 KiB of pointer array, 1565 KiB over 200,000 against 1562.5 KiB.
+        ``_records`` is append-only (built once, appended to in one place), so
+        iterating by index up to a length captured at entry is safe against a
+        concurrent append and needs no copy. Records appended mid-walk are
+        simply outside this walk, which is the same guarantee the snapshot gave.
+
+        This does NOT make a trail too large to hold verifiable: ``_records``
+        still holds every record. Verifying a store that does not fit in memory
+        is ``SQLiteAuditBackend.verify_chain_streaming``, which never
+        materialises the rows.
+
+        **Resuming.** ``start_index`` and ``expected_previous_hash`` restart the
+        walk part way, so a long verify can checkpoint instead of starting
+        over. An anchored head is the intended restart point: pass
+        ``anchor.chain_position + 1`` and ``anchor.chain_head_hash``, having
+        verified that anchor's token first. Everything below ``start_index`` is
+        then NOT verified and no claim is made about it, which is the whole
+        point of resuming and the reason the caller has to supply the hash it
+        expects rather than have one read out of the records it is skipping.
+
+        **Declared gaps.** A break that a REPAIR_GAP record accounts for still
+        returns a string, starting "Chain not intact: N declared gap(s)", so
+        ``chain_intact`` stays False and every caller that treats non-None as
+        not intact keeps doing so. ``verify_chain_verdict`` tells the two
+        apart.
+        """
+        return self.verify_chain_verdict(
+            start_index=start_index,
+            expected_previous_hash=expected_previous_hash,
+        ).summary()
+
+    def verify_chain_verdict(
+        self,
+        *,
+        start_index: int = 0,
+        expected_previous_hash: str = "",
+    ) -> ChainVerdict:
+        """The walk behind ``verify_chain``, with declared gaps kept apart.
+
+        A break is declared only when the records either side of it came from
+        the store with seqs that are not adjacent, and a REPAIR_GAP record
+        later in the same walk names every seq between them. The resuming
+        record's own hash is still recomputed, and the walk continues from it.
+        A break between adjacent seqs, a break in records this process wrote,
+        or a gap no repair record names, is broken as before. See
+        :class:`ChainVerdict` for why a declared gap is never intact.
+
+        A trail loaded from a store whose recorded chain head is gone is broken
+        as well, whatever the walk finds: records deleted from the end leave a
+        shorter chain that links cleanly.
         """
         with self._lock:
-            snapshot = list(self._records)
+            length = len(self._records)
             anchors = dict(self._store_anchors)
-        prev_hash = ""
-        for i, record in enumerate(snapshot):
+            seqs = dict(self._store_seqs)
+            whole_table = self._store_seqs_whole_table
+            if start_index < 0 or (start_index > length and length):
+                raise ValueError(
+                    f"start_index {start_index} is outside the trail (len={length})"
+                )
+            records = self._records
+        ledger = _GapLedger()
+        prev_hash = expected_previous_hash
+        prev_seq: Optional[int] = None
+        for i in range(start_index, length):
+            record = records[i]
+            seq = seqs.get(record.record_id)
             if record.previous_hash != prev_hash:
                 anchor = anchors.get(record.record_id)
                 if anchor is None or record.previous_hash != anchor:
-                    return (
+                    error = (
                         f"Chain broken at record {i} ({record.record_id}): "
                         f"expected previous_hash={prev_hash!r}, "
                         f"got {record.previous_hash!r}"
                     )
+                    if i == start_index == 0 and not prev_hash and record.previous_hash:
+                        # The walk opens on a record that links past the start
+                        # of the trail: a retention rotation, if the trail
+                        # holds the signed record that says so.
+                        ledger.hold_start(record.previous_hash, error)
+                    elif seq is None or prev_seq is None or seq <= prev_seq + 1:
+                        return ChainVerdict(error=error)
+                    else:
+                        ledger.hold(i, tuple(range(prev_seq + 1, seq)), seq, error)
+            elif whole_table and seq is not None and prev_seq is not None \
+                    and seq > prev_seq + 1:
+                # The chain links across missing seqs: what a salvage that
+                # lost the tail leaves. A loss all the same.
+                ledger.hold(i, tuple(range(prev_seq + 1, seq)), seq, (
+                    f"Seqs missing before record {i} ({record.record_id}): "
+                    f"the chain links seq {prev_seq} to seq {seq}"
+                ))
             expected = record.compute_hash()
             if record.record_hash != expected:
-                return (
+                error = (
                     f"Hash mismatch at record {i} ({record.record_id}): "
                     f"expected {expected!r}, got {record.record_hash!r}"
                 )
+                if erasure_pointer(record) is None:
+                    return ChainVerdict(error=error)
+                ledger.hold_erased(i, seq, record, error)
+            ledger.see(i, seq, record)
             prev_hash = record.record_hash
-        return None
+            prev_seq = seq
+        verdict = ledger.verdict()
+        if verdict.error is None and self._store_head_error is not None:
+            return ChainVerdict(error=self._store_head_error)
+        return verdict
 
     # ── Recording events ──────────────────────────────────────────
 
@@ -770,6 +1479,46 @@ class AuditTrail:
             self._cap_record_str(request.parent_action_id, self._MAX_PARENT_ACTION_ID_LEN)
             if request.parent_action_id is not None else None
         )
+        # A field the operator declared digest-only (vaara._capture) goes
+        # into the record as a keyed digest; the engine already scored the
+        # real arguments, and the commitment below covers what is recorded.
+        parameters = self._cap_record_dict_bytes(
+            _capture.mask(request.tool_name, request.parameters)
+            if isinstance(request.parameters, dict) else {},
+            self._MAX_REQUEST_PARAMETERS_JSON_BYTES,
+        )
+        # A salted commitment to the arguments as recorded, so a decision
+        # receipt can name them without carrying them. The salt stays here on
+        # the trail; arguments that cannot be canonicalised get no commitment.
+        from vaara.audit._arguments_commitment import commit, new_salt
+
+        salt = new_salt()
+        commitment = commit(parameters, salt)
+        arguments_commitment = (
+            {"arguments_salt": salt, "arguments_commitment": commitment}
+            if commitment else {}
+        )
+        # Only an action that names its delegates carries the key, so a
+        # request without one hashes exactly as it did before the binding.
+        delegatees = (
+            {"delegatees": [
+                self._cap_record_str(d, self._MAX_AGENT_ID_LEN)
+                for d in request.delegatees
+            ]}
+            if request.delegatees is not None else {}
+        )
+        # Same rule for the capability grant: only an action that runs under
+        # one carries the key. Over the cap the marker lands instead, and a
+        # child checked against it is refused as unreadable, never passed.
+        capabilities = (
+            self._cap_record_dict_bytes(
+                {"capabilities": [json_safe(dict(c)) for c in request.capabilities]},
+                self._MAX_REQUEST_CONTEXT_JSON_BYTES,
+            )
+            if request.capabilities is not None else {}
+        )
+        if capabilities and "capabilities" not in capabilities:
+            capabilities = {"capabilities": capabilities}
         self._append(AuditRecord(
             record_id=str(uuid.uuid4()),
             action_id=action_id,
@@ -778,10 +1527,8 @@ class AuditTrail:
             agent_id=safe_agent_id,
             tool_name=safe_tool_name,
             data={
-                "parameters": self._cap_record_dict_bytes(
-                    request.parameters if isinstance(request.parameters, dict) else {},
-                    self._MAX_REQUEST_PARAMETERS_JSON_BYTES,
-                ),
+                "parameters": parameters,
+                **arguments_commitment,
                 "context": self._cap_record_dict_bytes(
                     request.context if isinstance(request.context, dict) else {},
                     self._MAX_REQUEST_CONTEXT_JSON_BYTES,
@@ -795,6 +1542,8 @@ class AuditTrail:
                 "session_id": safe_session_id,
                 "parent_action_id": safe_parent_action_id,
                 "sequence_position": request.sequence_position,
+                **delegatees,
+                **capabilities,
             },
             regulatory_articles=articles,
             tenant_id=tenant_id,
@@ -851,15 +1600,218 @@ class AuditTrail:
         reason: str,
         risk_score: float,
         regulatory_domains: frozenset[RegulatoryDomain] = frozenset(),
+        decision_detail: Optional[str] = None,
+        modified_parameters: Optional[dict] = None,
+        approver: str = "",
+        human_disposed: bool = False,
+        policy_id: str = "",
+        violation_type: str = "",
+        cage: Optional[dict] = None,
+        unavailable_input: str = "",
+        policy_digest: str = "",
+        policy_state: Optional[dict] = None,
+        sequence_steps: Optional[dict] = None,
+        value_origin: Optional[dict] = None,
+        enforcement: str = "",
+        attenuation: Optional[dict] = None,
     ) -> None:
-        """Record the allow/deny/escalate decision."""
+        """Record the allow/deny/escalate decision.
+
+        ``decision`` is always one of the coarse three. ``decision_detail``
+        carries the AARM Core R4 refinement behind it when there is one
+        ("modify", "step_up", "defer"), and ``modified_parameters`` the
+        arguments a ``modify`` proposed. Both keys are omitted entirely when
+        absent, so a record without a refinement is byte-identical to one
+        written before this vocabulary existed and its hash does not move.
+
+        ``approver`` and ``human_disposed`` say what kind of party disposed of
+        the action. They matter most on the ``allow`` that
+        :meth:`find_prior_approval` produces: that allow replays a human's
+        earlier decision by cache lookup, so a human did not act on THIS
+        action and the record must not read as though one did. Same omission
+        rule as above; empty approver adds no keys.
+
+        ``policy_id`` and ``violation_type`` say which policy denied the
+        action and on what ground. They are written on a deny only; the
+        pipeline, the deny-rule hook and the MCP proxy supply both on every
+        deny they write. Same omission rule: empty adds no keys.
+
+        ``unavailable_input`` names the input a deny could not get: the
+        scorer that raised or could not be reached, a decision that could
+        not be read. It is what separates a check that ran and failed the
+        action from a check that never completed, which a refusal word
+        alone cannot show. Written on a deny only; empty adds no keys.
+
+        ``policy_digest`` is the digest of the engine's decision state
+        (``vaara.policy_state``) and ``policy_state`` the state itself, which
+        a caller passes on the first decision after the state changes. Same
+        omission rule: empty adds no keys.
+
+        ``sequence_steps`` maps each sequence pattern that matched to the
+        action ids of its earlier steps, oldest first, so the record names the
+        actions that changed the outcome. Same omission rule.
+
+        ``value_origin`` maps each authority argument whose value was seen
+        only in external tool results to ``{"seen_in": [action ids],
+        "source": tool}``, so the record names the result the value came
+        from. Same omission rule.
+
+        ``enforcement`` says whether the party writing the decision could
+        have stopped the action: ``could_block`` (it stands in the path and
+        the caller honours its verdict), ``shadow`` (it could, but was set to
+        let everything through) or ``recorded_only`` (it sees the action but
+        cannot hold it). A word outside those three is left out with a
+        warning, never recorded. Same omission rule: empty adds no keys, and
+        a reader takes a missing value as unknown, not as a stop.
+
+        ``attenuation`` says what the delegated-privilege check made of an
+        action that carries a grant and names a parent: ``{"status": "held"
+        | "violated" | "unverified", "reason": ..., "source": "memory" |
+        "trail"}``. ``unverified`` means the check could not run (parent
+        unknown, parent without a grant, parent grant unreadable), so a
+        skipped check is on the record and never silent. Same omission rule.
+
+        ``cage`` is the block :func:`vaara.cage.observe` returns: which cage
+        the deciding process runs in and whether the kernel confirmed it at
+        this moment. Every decision carries one; when the caller passes
+        none, the trail observes now. A run outside any cage is recorded as
+        ``{"driver": "none", "confirmed": false}``, so a record is never
+        silent about its confinement.
+        """
         event_type = (
             EventType.ACTION_BLOCKED if decision == "deny"
             else EventType.DECISION_MADE
         )
+        if cage is None:
+            from vaara.cage import observe
+
+            cage = observe().to_record()
 
         articles = self._get_regulatory_articles(
             event_type, regulatory_domains,
+        )
+
+        # The refinement is checked against the decision it claims to explain
+        # before either reaches the chain. The pipeline never passes an
+        # inconsistent pair, but record_decision is reachable from custom
+        # policy code, and a record saying `allow` with a `modify` refinement
+        # would be hash-chained evidence that contradicts itself. That is the
+        # exact failure the coarse/fine split exists to prevent, so an
+        # unrecognised or mismatched refinement is dropped with a warning
+        # rather than recorded: `decision` is the authoritative field and it
+        # stays true either way.
+        if decision_detail:
+            claimed = str(decision_detail).strip().lower()
+            projects_to = FINE_TO_COARSE.get(claimed)
+            if claimed not in REFINEMENTS or projects_to != decision:
+                logger.warning(
+                    "record_decision: decision_detail=%r does not refine "
+                    "decision=%r for action_id=%s; recording the decision "
+                    "without it",
+                    decision_detail, decision, action_id,
+                )
+                decision_detail = None
+                modified_parameters = None
+
+        # Proposed arguments only mean something alongside a modify. Anywhere
+        # else they are arguments nobody decided on.
+        if modified_parameters and decision_detail != "modify":
+            logger.warning(
+                "record_decision: modified_parameters supplied with "
+                "decision_detail=%r for action_id=%s; dropping them",
+                decision_detail, action_id,
+            )
+            modified_parameters = None
+
+        # The disposition raises rather than dropping, which is the opposite
+        # of the refinement handling directly above, and the difference is
+        # deliberate. A bad refinement is a record that is less specific than
+        # it could be. A bad disposition is a record that OVERSTATES human
+        # involvement, and dropping it quietly would leave the same allow it
+        # was meant to qualify. Fail loudly instead.
+        disposition: dict = {}
+        if approver:
+            from vaara._disposition import check
+
+            checked_approver, checked_flag = check(approver, human_disposed)
+            disposition = {
+                "approver": checked_approver,
+                "human_disposed": checked_flag,
+            }
+        elif human_disposed:
+            from vaara._disposition import DispositionError
+
+            raise DispositionError(
+                "human_disposed=True requires approver='human'; "
+                "a producer must not claim a human disposed what a policy did"
+            )
+
+        data: dict = {
+            "decision": self._cap_record_str(decision, self._MAX_DECISION_LABEL_LEN),
+            "reason": self._cap_record_str(reason, self._MAX_DECISION_REASON_LEN),
+            "risk_score": risk_score,
+        }
+        if decision_detail:
+            data["decision_detail"] = self._cap_record_str(
+                decision_detail, self._MAX_DECISION_LABEL_LEN,
+            )
+        if modified_parameters:
+            data["modified_parameters"] = self._cap_record_dict_bytes(
+                {str(k): json_safe(v) for k, v in
+                 _capture.mask(tool_name, modified_parameters).items()},
+                self._MAX_EXECUTION_RESULT_JSON_BYTES,
+            )
+        data.update(disposition)
+        if decision == "deny":
+            if policy_id:
+                data["policy_id"] = self._cap_record_str(
+                    policy_id, self._MAX_TOOL_NAME_LEN,
+                )
+            if violation_type:
+                data["violation_type"] = self._cap_record_str(
+                    violation_type, self._MAX_DECISION_LABEL_LEN,
+                )
+            if unavailable_input:
+                data["unavailable_input"] = self._cap_record_str(
+                    unavailable_input, self._MAX_TOOL_NAME_LEN,
+                )
+        if policy_digest:
+            data["policy_digest"] = self._cap_record_str(
+                policy_digest, self._MAX_TOOL_NAME_LEN,
+            )
+            if policy_state:
+                data["policy_state"] = self._cap_record_dict_bytes(
+                    {str(k): json_safe(v) for k, v in policy_state.items()},
+                    self._MAX_ASSESSMENT_JSON_BYTES,
+                )
+        if sequence_steps:
+            data["sequence_steps"] = self._cap_record_dict_bytes(
+                {str(k): [str(i) for i in v] for k, v in sequence_steps.items()
+                 if isinstance(v, (list, tuple))},
+                self._MAX_ASSESSMENT_JSON_BYTES,
+            )
+        if value_origin:
+            data["value_origin"] = self._cap_record_dict_bytes(
+                {str(k): json_safe(v) for k, v in value_origin.items()},
+                self._MAX_ASSESSMENT_JSON_BYTES,
+            )
+        if enforcement:
+            if enforcement in ENFORCEMENT_MODES:
+                data["enforcement"] = enforcement
+            else:
+                logger.warning(
+                    "record_decision: enforcement=%r is not one of %s for "
+                    "action_id=%s; recording the decision without it",
+                    enforcement, sorted(ENFORCEMENT_MODES), action_id,
+                )
+        if attenuation:
+            data["attenuation"] = {
+                str(k): self._cap_record_str(str(v), self._MAX_DECISION_REASON_LEN)
+                for k, v in attenuation.items()
+            }
+        data["cage"] = self._cap_record_dict_bytes(
+            {str(k): json_safe(v) for k, v in cage.items()},
+            self._MAX_ASSESSMENT_JSON_BYTES,
         )
 
         self._append(AuditRecord(
@@ -869,11 +1821,7 @@ class AuditTrail:
             timestamp=time.time(),
             agent_id=self._cap_record_str(agent_id, self._MAX_AGENT_ID_LEN),
             tool_name=self._cap_record_str(tool_name, self._MAX_TOOL_NAME_LEN),
-            data={
-                "decision": self._cap_record_str(decision, self._MAX_DECISION_LABEL_LEN),
-                "reason": self._cap_record_str(reason, self._MAX_DECISION_REASON_LEN),
-                "risk_score": risk_score,
-            },
+            data=data,
             regulatory_articles=articles,
             tenant_id=self._tenant_for(action_id),
         ))
@@ -915,6 +1863,93 @@ class AuditTrail:
             tenant_id=self._tenant_for(action_id),
         ))
 
+    def record_agent_seen(
+        self,
+        agent: str,
+        state: str,
+        detail: str,
+        pid: int,
+        command: str = "",
+    ) -> None:
+        """Record that ``vaara scan --watch`` saw an AI agent process start.
+
+        ``state`` is ``governed``, ``reachable`` or ``ungoverned`` as
+        :mod:`vaara.integrations.scan` defines them. The watcher writes these
+        to a trail of its own, so an engine older than this event type never
+        loads one.
+        """
+        action_id = str(uuid.uuid4())
+        self._append(AuditRecord(
+            record_id=str(uuid.uuid4()),
+            action_id=action_id,
+            event_type=EventType.AGENT_SEEN,
+            timestamp=time.time(),
+            agent_id=self._cap_record_str(agent, self._MAX_AGENT_ID_LEN),
+            tool_name="",
+            data={
+                "state": self._cap_record_str(state, self._MAX_DECISION_LABEL_LEN),
+                "detail": self._cap_record_str(detail, self._MAX_DECISION_REASON_LEN),
+                "pid": int(pid),
+                "command": self._cap_record_str(command, self._MAX_DECISION_REASON_LEN),
+            },
+            regulatory_articles=[],
+            tenant_id=self._tenant_for(action_id),
+        ))
+
+    def record_witness_configured(
+        self,
+        kind: str,
+        every_records: int,
+        target: str,
+        *,
+        key_fingerprint: str = "",
+        source: str = "",
+    ) -> Optional[str]:
+        """State on the trail that heads reach an outside witness at a cadence.
+
+        ``kind`` is ``publish`` (a public transparency log) or ``anchor`` (an
+        RFC 3161 authority). The record is what makes the bound on the
+        unpublished window readable: a verifier sees how many records can
+        pass between two heads a third party holds. Written once per
+        configuration, not once per process: when the newest record of this
+        kind already states the same cadence, target and key, nothing is
+        appended and ``None`` is returned.
+        """
+        if kind not in ("publish", "anchor"):
+            raise ValueError(f"record_witness_configured: kind must be publish or anchor, got {kind!r}")
+        if int(every_records) < 1:
+            raise ValueError("record_witness_configured: every_records must be a positive integer")
+        data = {
+            "kind": kind,
+            "every_records": int(every_records),
+            "target": self._cap_record_str(target, 512),
+            "key_fingerprint": self._cap_record_str(key_fingerprint, 128),
+            "source": self._cap_record_str(source, 128),
+        }
+        with self._lock:
+            latest = next(
+                (r for r in reversed(self._records)
+                 if r.event_type == EventType.WITNESS_CONFIGURED
+                 and (r.data or {}).get("kind") == kind),
+                None,
+            )
+        if latest is not None and latest.data == data:
+            return None
+        record_id = str(uuid.uuid4())
+        action_id = str(uuid.uuid4())
+        self._append(AuditRecord(
+            record_id=record_id,
+            action_id=action_id,
+            event_type=EventType.WITNESS_CONFIGURED,
+            timestamp=time.time(),
+            agent_id="vaara",
+            tool_name=f"witness:{kind}",
+            data=data,
+            regulatory_articles=[],
+            tenant_id=self._tenant_for(action_id),
+        ))
+        return record_id
+
     def record_escalation(
         self,
         action_id: str,
@@ -932,7 +1967,8 @@ class AuditTrail:
         gate for every shape of this agent + tool.
         """
         articles = self._get_regulatory_articles(
-            EventType.ESCALATION_SENT, frozenset({RegulatoryDomain.EU_AI_ACT}),
+            EventType.ESCALATION_SENT,
+            frozenset({RegulatoryDomain.EU_AI_ACT, RegulatoryDomain.SOC2}),
         )
 
         self._append(AuditRecord(
@@ -964,17 +2000,51 @@ class AuditTrail:
         reviewer: str,
         justification: str = "",
         args_digest: str = "",
+        approver: str = "",
+        human_disposed: bool = False,
+        reviewer_signature: Optional[dict] = None,
     ) -> None:
-        """Record human resolution of an escalation.
+        """Record resolution of an escalation.
 
         ``args_digest`` is the argument-shape digest carried over from the
         ESCALATION_SENT record. find_prior_approval requires it to match
         before auto-allowing a later action, so approving ``tx.transfer``
         with amount 10 does not auto-allow amount 100000.
+
+        ``approver`` and ``human_disposed`` say what KIND of party disposed of
+        this, which ``reviewer`` does not: reviewer is free text naming who,
+        and both shipped call sites pass a mechanism name. When ``approver``
+        is empty the two keys are omitted entirely, so a caller that does not
+        supply a disposition produces a record that hashes exactly as it did
+        before these parameters existed.
+
+        ``reviewer_signature`` is the reviewer's own signature block from
+        ``vaara.credential.sign_resolution``. It is stored as given, under its
+        own key, and only when supplied, so unsigned rows hash as before.
         """
         articles = self._get_regulatory_articles(
-            EventType.ESCALATION_RESOLVED, frozenset({RegulatoryDomain.EU_AI_ACT}),
+            EventType.ESCALATION_RESOLVED,
+            frozenset({RegulatoryDomain.EU_AI_ACT, RegulatoryDomain.SOC2}),
         )
+
+        disposition: dict = {}
+        if approver:
+            from vaara._disposition import check  # local import: avoid cycle
+
+            checked_approver, checked_flag = check(approver, human_disposed)
+            disposition = {
+                "approver": checked_approver,
+                "human_disposed": checked_flag,
+            }
+        elif human_disposed:
+            # A flag with no approver beside it is the exact claim this
+            # vocabulary exists to prevent, so it fails rather than recording.
+            from vaara._disposition import DispositionError
+
+            raise DispositionError(
+                "human_disposed=True requires approver='human'; "
+                "a producer must not claim a human disposed what a policy did"
+            )
 
         self._append(AuditRecord(
             record_id=str(uuid.uuid4()),
@@ -990,6 +2060,9 @@ class AuditTrail:
                 "args_digest": self._cap_record_str(
                     args_digest, self._MAX_ARGS_DIGEST_LEN,
                 ),
+                **disposition,
+                **({"reviewer_signature": dict(reviewer_signature)}
+                   if reviewer_signature is not None else {}),
             },
             regulatory_articles=articles,
             tenant_id=self._tenant_for(action_id),
@@ -1055,12 +2128,28 @@ class AuditTrail:
         """
         cutoff = time.time() - window_hours * 3600
         want_tenant = tenant_id or ""
-        # Snapshot under the chain lock — every other reader of _records
-        # does the same; iterating a list another thread is appending to
-        # is a data race even under the GIL.
+        # Snapshot under the chain lock — every other reader does the same;
+        # iterating a list another thread is appending to is a data race even
+        # under the GIL.
+        #
+        # Scans _resolved_approvals, not _records. That is the whole fix: this
+        # ran on every intercept and took 62 percent of a 3,000 call benchmark
+        # because it copied and walked the entire trail to find records that
+        # are a tiny fraction of it.
+        #
+        # NOT an early `break` on the cutoff, and that was tried and reverted
+        # on 2026-09-08. Two reasons it stays a `continue`. Under the load that
+        # matters a full 24 hour window holds every record there is, so there
+        # is no window edge to stop at. And append order is not guaranteed to
+        # be timestamp order: two threads can take timestamps and append in
+        # opposite orders, and a `break` would then silently stop early and
+        # miss a valid approval. `continue` costs nothing on a short list and
+        # holds the boundary property unconditionally.
         with self._lock:
-            records = list(self._records)
+            records = list(self._resolved_approvals)
         for r in reversed(records):
+            # Redundant by construction, kept because it is the invariant the
+            # whole index rests on and it costs one comparison on a short list.
             if r.event_type != EventType.ESCALATION_RESOLVED:
                 continue
             if r.timestamp < cutoff:
@@ -1181,7 +2270,8 @@ class AuditTrail:
         overrides even though Article 14(4)(d) evidence hinges on them.
         """
         articles = self._get_regulatory_articles(
-            EventType.POLICY_OVERRIDE, frozenset({RegulatoryDomain.EU_AI_ACT}),
+            EventType.POLICY_OVERRIDE,
+            frozenset({RegulatoryDomain.EU_AI_ACT, RegulatoryDomain.SOC2}),
         )
 
         override_reason = self._cap_record_str(
@@ -1270,7 +2360,8 @@ class AuditTrail:
             raise ValueError("record_key_lifecycle: fingerprint is required")
 
         articles = self._get_regulatory_articles(
-            EventType.KEY_LIFECYCLE, frozenset({RegulatoryDomain.EU_AI_ACT}),
+            EventType.KEY_LIFECYCLE,
+            frozenset({RegulatoryDomain.EU_AI_ACT, RegulatoryDomain.SOC2}),
         )
         data: dict = {
             "action": action,
@@ -1296,6 +2387,134 @@ class AuditTrail:
             tenant_id=tenant_id,
         ))
         return record_id
+
+    _CAGE_LIFECYCLE_ACTIONS = ("started", "stopped")
+
+    def record_cage_lifecycle(
+        self,
+        action: str,
+        driver: str,
+        name: str,
+        *,
+        policy_digest: str = "",
+        actor: str = "",
+        started_record_id: str = "",
+        processes_ended: Optional[int] = None,
+        exit_code: Optional[int] = None,
+        reason: str = "",
+    ) -> str:
+        """Record that a cage launch started or stopped.
+
+        Written by ``vaara cage run`` / ``cage stop`` and by ``vaara run``.
+        A stop names the start it closes in ``started_record_id`` when that
+        start is on this trail (a launch started outside Vaara has none), and
+        says how many processes it ended, the exit code and why
+        (``exited``, ``operator``, ``guard_gone``). A stop may only name a
+        start of the same driver and launch name: the signed-export verifier
+        fails an export where it does not, so the trail refuses to write one.
+
+        Returns:
+            The new record's ``record_id``.
+        """
+        if action not in self._CAGE_LIFECYCLE_ACTIONS:
+            raise ValueError(
+                "record_cage_lifecycle: action must be one of "
+                f"{list(self._CAGE_LIFECYCLE_ACTIONS)}, got {action!r}"
+            )
+        if not driver:
+            raise ValueError("record_cage_lifecycle: driver is required")
+        data: dict = {
+            "action": action,
+            "driver": self._cap_record_str(driver, 64),
+            "name": self._cap_record_str(name or "", self._MAX_AGENT_ID_LEN),
+            "policy_digest": self._cap_record_str(policy_digest, 128),
+            "actor": self._cap_record_str(actor, self._MAX_OVERRIDER_LEN),
+        }
+        if action == "stopped":
+            if started_record_id:
+                with self._lock:
+                    start = next((r for r in self._records
+                                  if r.record_id == started_record_id), None)
+                if (start is None or start.event_type != EventType.CAGE_LIFECYCLE
+                        or (start.data or {}).get("action") != "started"
+                        or (start.data or {}).get("driver") != data["driver"]
+                        or (start.data or {}).get("name") != data["name"]):
+                    raise ValueError(
+                        f"record_cage_lifecycle: {started_record_id!r} is not the start "
+                        f"of {driver}/{name} on this trail"
+                    )
+                data["started_record_id"] = started_record_id
+            if processes_ended is not None:
+                data["processes_ended"] = int(processes_ended)
+            if exit_code is not None:
+                data["exit_code"] = int(exit_code)
+            data["reason"] = self._cap_record_str(reason, self._MAX_DECISION_LABEL_LEN)
+
+        record_id = str(uuid.uuid4())
+        action_id = str(uuid.uuid4())
+        self._append(AuditRecord(
+            record_id=record_id,
+            action_id=action_id,
+            event_type=EventType.CAGE_LIFECYCLE,
+            timestamp=time.time(),
+            agent_id=data["name"] or "vaara",
+            tool_name=f"cage:{data['driver']}",
+            data=data,
+            regulatory_articles=[],
+            tenant_id=self._tenant_for(action_id),
+        ))
+        return record_id
+
+    def open_cage_start(self, driver: str, name: str) -> Optional[str]:
+        """The newest start of ``driver``/``name`` on this trail no stop closes yet."""
+        with self._lock:
+            closed: set = set()
+            for r in reversed(self._records):
+                if r.event_type != EventType.CAGE_LIFECYCLE:
+                    continue
+                data = r.data or {}
+                if data.get("driver") != driver or data.get("name") != name:
+                    continue
+                if data.get("action") == "stopped":
+                    closed.add(data.get("started_record_id"))
+                elif data.get("action") == "started" and r.record_id not in closed:
+                    return r.record_id
+        return None
+
+    def _unrecorded_mark(self, state: dict, resumed_record_id: str) -> AuditRecord:
+        """The trail_not_recording record for the outage the failure marker describes.
+
+        Written by the trail itself, on the first write that lands after the
+        store refused writes (see ``_flush_unrecorded_mark``). The refused
+        records never took a place in the chain on disk, so
+        ``resumed_record_id`` (the first record that did land) and its
+        predecessor are adjacent there, and the window lies between them.
+        ``unrecorded_writes`` is a lower bound: the marker is not locked across
+        processes (see ``write_failure``). A marker edited by hand into the wrong
+        types still gives a record its verifier reads: a count of 1 and the
+        time ``unknown``.
+        """
+        count = state.get("count")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            count = 1
+        return AuditRecord(
+            record_id=str(uuid.uuid4()),
+            action_id="trail-not-recording",
+            event_type=EventType.TRAIL_NOT_RECORDING,
+            timestamp=time.time(),
+            agent_id="vaara",
+            tool_name="trail.recording",
+            data={
+                "unrecorded_writes": count,
+                "first_failure_utc": self._cap_record_str(
+                    state.get("first_failure_utc") or "unknown", 64),
+                "last_failure_utc": self._cap_record_str(
+                    state.get("last_failure_utc") or "unknown", 64),
+                "resumed_record_id": self._cap_record_str(resumed_record_id, 128),
+                "stage": self._cap_record_str(state.get("stage") or "", 64),
+                "error": self._cap_record_str(state.get("error") or "", 300),
+            },
+        )
 
     # ── Querying ──────────────────────────────────────────────────
 
@@ -1350,6 +2569,28 @@ class AuditTrail:
             snapshot = list(self._records)
         records = [r for r in snapshot if r.agent_id == agent_id]
         return records[-limit:]
+
+    def get_session_records(self, agent_id: str, session_id: str,
+                            tenant_id: str = "") -> list[AuditRecord]:
+        """Every record of one agent's session, in trail order, with no limit.
+
+        A session is the set of actions whose ``action_requested`` record
+        carries ``data.session_id``, within one tenant; the records of those
+        actions follow. Authority decay replays the budget from this list, so
+        it must be the whole session: a window would let a session outrun
+        its own spend, and another tenant's session under the same ids must
+        not be charged to this one. Served from the per-session index, so
+        the cost is the session's own records and not the whole trail.
+        """
+        with self._lock:
+            actions = list(self._actions_by_session.get(
+                (tenant_id or "", agent_id, session_id), ()))
+            records = [
+                r for action_id in actions for r in self._by_action.get(action_id, ())
+                if r.agent_id == agent_id and (r.tenant_id or "") == (tenant_id or "")
+            ]
+        records.sort(key=lambda r: self._pos_by_record_id.get(r.record_id, 0))
+        return records
 
     def get_records_by_type(
         self, event_type: EventType, limit: int = 100
@@ -1417,7 +2658,7 @@ class AuditTrail:
         # _sanitize.json_safe at ingress is still rendered clean for the
         # regulator-facing export.
         path.write_text(
-            strict_json_dumps(records, indent=2), encoding="utf-8"
+            strict_json_dumps(records, indent=2), encoding="utf-8", newline="\n"
         )
         return len(records)
 
@@ -1455,8 +2696,237 @@ class AuditTrail:
             head_hash = self._records[-1].record_hash
         anchor = client.anchor(position, head_hash)
         with self._lock:
-            self._anchors.append(anchor)
+            self._index_anchor(anchor)
         return anchor
+
+    def verify_segment(
+        self,
+        *,
+        record_id: Optional[str] = None,
+        action_id: Optional[str] = None,
+    ) -> "SegmentVerification":
+        """Verify only the anchored segment holding one record. Exact, not sampled.
+
+        The supervisory question is "show me that this action's record is what
+        it was when it was written", and answering it does not need the whole
+        trail. Anchors already make a segment independently verifiable:
+        ``previous_hash`` is part of the hashed content, so a record cannot be
+        re-parented onto a different hash without breaking its own hash, and
+        the RFC 3161 token over an anchored head verifies offline.
+
+        So the work is two token verifications and the records between the
+        bounding anchors, which is the auto-anchor cadence (32 by default)
+        regardless of how long the trail is. Records below the lower anchor are
+        NOT read and a rewrite down there does not affect this answer; that is
+        the point, and it is what makes this cheaper than a genesis walk rather
+        than a genesis walk with extra steps.
+
+        **This is not a statement about the trail.** It says one segment is
+        intact. Use :meth:`verify_chain` for the whole-chain claim.
+
+        MEASURED on this machine, 32-record cadence, best of five:
+
+            trail    verify_segment   of which id scan   of which 2 tokens
+            5,000        0.74 ms          0.12 ms            0.44 ms
+            50,000       2.41 ms          1.41 ms            0.48 ms
+
+        against 261 ms for :meth:`verify_chain` over the same 50,000 records.
+        The verification work is flat, 32 record hashes and two tokens whatever
+        the trail size. What grows is finding the record: resolving an id is a
+        linear scan of the in-memory list, and by 50,000 records that scan is
+        already most of the cost. So "milliseconds at any size" holds into the
+        low millions and then the LOOKUP becomes the wall, not the hashing.
+        Indexing id to position is a separate change and is not done here.
+
+        Fails, and never passes quietly, when: the trail has no anchors at all
+        (the common case, since anchoring is opt-in and no TSA is configured by
+        default); the selector matches nothing; an anchor's token does not
+        verify; or an anchor names a head hash the trail does not have at that
+        position, which means the chain was rewritten under it.
+
+        A record ABOVE the last anchor is reported ``ok`` with ``closed=False``.
+        It chains correctly back to an attested head, but nothing external
+        attests it yet, and those are different claims. A record BELOW the first
+        anchor is walked from genesis, with ``lower_anchor_position`` None.
+
+        Exactly one of ``record_id`` or ``action_id`` is required. An action's
+        records can straddle an anchor, so an ``action_id`` widens the walk to
+        cover all of them rather than reporting on whichever came first.
+        """
+        if (record_id is None) == (action_id is None):
+            raise ValueError("pass exactly one of record_id or action_id")
+
+        with self._lock:
+            # Length and a reference, not a copy. `list(self._records)` was
+            # the same O(n) materialisation verify_chain shed: it allocated a
+            # pointer array the size of the trail to look at 32 records.
+            # _records is append-only, so indexing below a length captured here
+            # is safe against a concurrent append.
+            length = len(self._records)
+            records = self._records
+            store_anchors = dict(self._store_anchors)
+            # Exactly one of the two is set, guarded above, but the branches
+            # test each one directly so the narrowing is local.
+            targets: list[int] = []
+            if record_id is not None:
+                # O(1). This was a scan, and measured it was 59 percent of the
+                # call at 50,000 records: the flat verification work was flat
+                # and finding the record was not.
+                position = self._pos_by_record_id.get(record_id)
+                if position is not None:
+                    targets = [position]
+            elif action_id is not None:
+                # An action's records are already indexed by action_id; map
+                # each to its position rather than walking the trail. An action
+                # holds a handful of records, so this is O(that handful).
+                targets = sorted(
+                    p for r in self._by_action.get(action_id, [])
+                    if (p := self._pos_by_record_id.get(r.record_id)) is not None
+                )
+            # An index entry pointing past the captured length belongs to a
+            # record appended after this call started. It is outside this walk,
+            # the same as any other late arrival.
+            targets = [t for t in targets if t < length]
+            first = min(targets) if targets else -1
+            last = max(targets) if targets else -1
+
+            # O(log n), against the position-ordered index rather than the
+            # arrival-ordered list. This was a full pass over every anchor, and
+            # measured at a million records with the default 32-record cadence
+            # it was 6.7 ms of which about 0.58 ms was the actual verification
+            # work: 31,250 anchors scanned to use two of them.
+            #
+            # The scan existed because _anchors is genuinely unordered:
+            # anchor_head makes its TSA round trip outside the lock, so two
+            # concurrent anchors can append in the opposite order to the
+            # positions they carry. _index_anchor maintains the order instead
+            # of assuming it, which is what makes a bisect sound here.
+            #
+            # Both lookups run under _lock. Unlike _records these lists are
+            # inserted into rather than appended to, so an element can move
+            # while another thread reads, and a reference taken outside the
+            # lock would not be safe.
+            n_anchors = len(self._anchor_positions)
+            lower = upper = None
+            if targets and n_anchors:
+                # The last anchor strictly below the segment, and the first at
+                # or above its end. Ties resolve to the same position and the
+                # same head hash, so either member of a tie is the same answer.
+                low_i = bisect.bisect_left(self._anchor_positions, first) - 1
+                if low_i >= 0:
+                    lower = self._anchors_by_position[low_i]
+                up_i = bisect.bisect_left(self._anchor_positions, last)
+                if up_i < n_anchors:
+                    upper = self._anchors_by_position[up_i]
+
+        label = (f"record_id={record_id!r}" if record_id is not None
+                 else f"action_id={action_id!r}")
+        if not targets:
+            return SegmentVerification(ok=False, reason=f"{label} not found in trail")
+
+        if not n_anchors:
+            return SegmentVerification(
+                ok=False,
+                record_index=first,
+                reason=(
+                    "trail has no time anchors, so no segment can be bounded. "
+                    "Anchoring is opt-in: call anchor_head() or "
+                    "enable_auto_anchor(). Refusing to fall back to a "
+                    "whole-chain walk, which would answer a different question."
+                ),
+            )
+
+        from vaara.audit.timeanchor import TimeAnchorError, verify_anchor
+
+        def _check(anchor: Any, which: str) -> tuple[Optional[str], Optional[str]]:
+            """Verify one bounding anchor. Returns (attested_time, error)."""
+            pos = anchor.chain_position
+            # Against the length captured at entry, not the live one. Now that
+            # `records` is the live list rather than a copy, len() would drift
+            # upward mid-call and an anchor could pass a bounds check against
+            # records this walk is not covering.
+            if pos < 0 or pos >= length:
+                return None, (f"{which} anchor at position {pos} is outside the "
+                              f"trail (len={length})")
+            if records[pos].record_hash != anchor.chain_head_hash:
+                return None, (f"{which} anchor at position {pos} names a head "
+                              "hash this trail does not have there: the chain "
+                              "was rewritten under the anchor")
+            try:
+                return verify_anchor(anchor).isoformat(), None
+            except TimeAnchorError as exc:
+                return None, f"{which} anchor token did not verify: {exc}"
+
+        lower_time = upper_time = None
+        if lower is not None:
+            lower_time, err = _check(lower, "lower")
+            if err:
+                return SegmentVerification(ok=False, record_index=first, reason=err)
+        if upper is not None:
+            upper_time, err = _check(upper, "upper")
+            if err:
+                return SegmentVerification(ok=False, record_index=first, reason=err)
+
+        start = 0 if lower is None else lower.chain_position + 1
+        end = last if upper is None else upper.chain_position
+        expected_prev = "" if lower is None else lower.chain_head_hash
+
+        gaps: list[int] = []
+        prev_hash = expected_prev
+        for i in range(start, end + 1):
+            record = records[i]
+            if record.previous_hash != prev_hash:
+                store_anchor = store_anchors.get(record.record_id)
+                if store_anchor is None or record.previous_hash != store_anchor:
+                    return SegmentVerification(
+                        ok=False, record_index=first,
+                        lower_anchor_position=None if lower is None else lower.chain_position,
+                        upper_anchor_position=None if upper is None else upper.chain_position,
+                        records_verified=i - start,
+                        reason=(f"Chain broken at record {i} ({record.record_id}): "
+                                f"expected previous_hash={prev_hash!r}, "
+                                f"got {record.previous_hash!r}"),
+                    )
+            expected = record.compute_hash()
+            if record.record_hash != expected:
+                return SegmentVerification(
+                    ok=False, record_index=first,
+                    lower_anchor_position=None if lower is None else lower.chain_position,
+                    upper_anchor_position=None if upper is None else upper.chain_position,
+                    records_verified=i - start,
+                    reason=(f"Hash mismatch at record {i} ({record.record_id}): "
+                            f"expected {expected!r}, got {record.record_hash!r}"),
+                )
+            if record.event_type is EventType.ANCHOR_GAP:
+                gaps.append(i)
+            prev_hash = record.record_hash
+
+        closed = upper is not None
+        if closed:
+            reason = (f"segment {start}..{end} verified and closed by the anchor "
+                      f"at {end}")
+        else:
+            reason = (f"segment {start}..{end} chains back to the anchor at "
+                      f"{lower.chain_position if lower else 'genesis'}, but is "
+                      "NOT closed by a later anchor: no external authority has "
+                      "attested these records yet")
+        if gaps:
+            reason += (f". {len(gaps)} ANCHOR_GAP marker(s) inside it at {gaps}: "
+                       "a time authority was unreachable across that stretch")
+
+        return SegmentVerification(
+            ok=True,
+            reason=reason,
+            record_id=records[first].record_id,
+            record_index=first,
+            lower_anchor_position=None if lower is None else lower.chain_position,
+            upper_anchor_position=None if upper is None else upper.chain_position,
+            records_verified=end - start + 1,
+            closed=closed,
+            anchor_gaps=gaps,
+            lower_attested_time=lower_time,
+            upper_attested_time=upper_time,
+        )
 
     def enable_auto_anchor(self, client: Any, *, every_records: int = 32) -> None:
         """Anchor the chain head automatically every ``every_records`` records.
@@ -1536,9 +3006,16 @@ class AuditTrail:
         the automatic-anchor trigger so the gap marker (which appends via
         ``_append_chained`` directly) cannot recurse back into anchoring.
         """
-        self._append_chained(record)
+        kept = self._append_chained(record)
         self._maybe_auto_anchor()
         self._maybe_auto_publish()
+        # A signed receipt per decision (vaara.audit.decision_receipts). It
+        # names the record's place on the chain, so it is minted only when the
+        # store kept the record; a refused write is counted by the
+        # write-failure marker instead. The sink logs its own failures.
+        sink = self._receipt_sink
+        if sink is not None and kept:
+            sink(record)
 
     def _maybe_auto_publish(self) -> None:
         """Publish the head when the cadence is reached (fail-open)."""
@@ -1582,6 +3059,28 @@ class AuditTrail:
         with self._publish_lock:
             self._publications.append(pub.to_dict())
 
+    def _index_anchor(self, anchor: Any) -> None:
+        """Record one anchor, in arrival order and in chain-position order.
+
+        Call under ``_lock``. The caller has already made the TSA round trip
+        outside the lock, so anchors can arrive out of position order and the
+        position-ordered list is built by insertion.
+
+        ``bisect_right`` puts a new anchor after any it ties with, which keeps
+        arrival order among equal positions. Ties are possible: two callers can
+        read the same head position before either appends. Both anchors then
+        name the same position and the same head hash, so a bound search may
+        pick either one and get the same answer, with a different token.
+
+        The insert is O(n) in list movement, and anchors arrive once per
+        cadence (32 records by default) and almost always in order, so in
+        practice it lands at the tail and costs a memmove of nothing.
+        """
+        self._anchors.append(anchor)
+        i = bisect.bisect_right(self._anchor_positions, anchor.chain_position)
+        self._anchor_positions.insert(i, anchor.chain_position)
+        self._anchors_by_position.insert(i, anchor)
+
     def _maybe_auto_anchor(self) -> None:
         """Anchor the head when the per-record cadence is reached (fail-open)."""
         if self._anchor_client is None:
@@ -1603,7 +3102,7 @@ class AuditTrail:
             self._record_anchor_gap(position, head_hash, repr(exc), client)
             return
         with self._lock:
-            self._anchors.append(anchor)
+            self._index_anchor(anchor)
 
     def _record_anchor_gap(
         self, position: int, head_hash: str, reason: str, client: Any
@@ -1628,8 +3127,230 @@ class AuditTrail:
             },
         ))
 
-    def _append_chained(self, record: AuditRecord) -> None:
-        """Append a record to the trail with hash chaining."""
+    #: Sequence numbers listed individually in a REPAIR_GAP record. A larger
+    #: loss is still counted exactly; only the enumeration is capped.
+    _REPAIR_GAP_SEQ_LIMIT = 1000
+
+    def repair_store(self):
+        """Repair the backing store and declare anything the repair lost.
+
+        Returns the backend's ``TrailRepair``, or ``None`` when this trail has
+        no repairable store. When records were lost, a chained REPAIR_GAP
+        record naming them is appended to the repaired trail, so the hole is
+        part of the evidence rather than something a verifier trips over.
+        Nothing is appended when nothing was lost: a rebuilt index is not an
+        event in the record's history.
+        """
+        backend = self._chain_backend()
+        if backend is None or not hasattr(backend, "repair"):
+            return None
+        report = backend.repair()
+        if report.ok and report.lost:
+            self.record_repair_gap(report)
+        return report
+
+    def record_repair_gap(self, report) -> None:
+        """Append a REPAIR_GAP record describing a ``TrailRepair``."""
+        lost = list(report.lost_seqs)
+        logger.warning(
+            "audit trail repaired by %s; %d record(s) could not be kept",
+            report.method, len(lost),
+        )
+        self._append_chained(AuditRecord(
+            record_id=str(uuid.uuid4()),
+            action_id="repair-gap",
+            event_type=EventType.REPAIR_GAP,
+            timestamp=time.time(),
+            agent_id="vaara",
+            tool_name="trail.repair",
+            data={
+                "method": report.method,
+                "problem": self._cap_record_str(report.problem or "", 512),
+                "lost_seq_count": len(lost),
+                "lost_seqs": lost[: self._REPAIR_GAP_SEQ_LIMIT],
+                "unreadable_rowids": report.unreadable_rowids,
+                "tables_damaged": list(report.tables_damaged),
+                "records_kept": report.records_kept,
+                "damaged_copy": report.damaged_copy or "",
+            },
+        ))
+
+    def record_repair_recovered(self, recovery: dict) -> None:
+        """Append a REPAIR_RECOVERED record for a verified recovery bundle.
+
+        The records themselves are not written back into the chain: a
+        REPAIR_GAP already declared them lost, and rewriting history would make
+        that declaration false. This record names the bundle by digest and
+        lists the seqs it holds, so a verifier with the bundle can recompute
+        each record and see that it fills the declared gap.
+        """
+        seqs = list(recovery.get("recovered_seqs", []))
+        self._append_chained(AuditRecord(
+            record_id=str(uuid.uuid4()),
+            action_id="repair-recovered",
+            event_type=EventType.REPAIR_RECOVERED,
+            timestamp=time.time(),
+            agent_id="vaara",
+            tool_name="trail.recover",
+            data={
+                "method": str(recovery.get("method", "")),
+                "bundle_sha256": str(recovery.get("bundle_sha256", "")),
+                "bundle_path": self._cap_record_str(str(recovery.get("bundle_path", "")), 512),
+                "recovered_seq_count": len(seqs),
+                "recovered_seqs": seqs[: self._REPAIR_GAP_SEQ_LIMIT],
+                "first_seq": seqs[0] if seqs else None,
+                "last_seq": seqs[-1] if seqs else None,
+                "links_verified": int(recovery.get("links_verified", 0)),
+                "anchored_to_seq": recovery.get("anchored_to_seq"),
+                "source": self._cap_record_str(str(recovery.get("source", "")), 512),
+            },
+        ))
+
+    def record_trail_forked(self, fork: dict) -> None:
+        """Append a TRAIL_FORKED record naming another branch of this trail.
+
+        Two stores that share every record up to ``fork_seq`` and then go on
+        separately are both the record as written. Neither is merged into the
+        other: this record names the other branch by its head hash, which
+        commits to every record on it, so a verifier holding that branch can
+        check it continues from this trail's own record at ``fork_seq``.
+        """
+        missing = list(fork.get("branch_missing_seqs", []))
+        self._append_chained(AuditRecord(
+            record_id=str(uuid.uuid4()),
+            action_id="trail-forked",
+            event_type=EventType.TRAIL_FORKED,
+            timestamp=time.time(),
+            agent_id="vaara",
+            tool_name="trail.fork",
+            data={
+                "fork_seq": int(fork["fork_seq"]),
+                "fork_hash": str(fork["fork_hash"]),
+                "branch_head_seq": int(fork["branch_head_seq"]),
+                "branch_head_hash": str(fork["branch_head_hash"]),
+                "branch_record_count": int(fork.get("branch_record_count", 0)),
+                "branch_missing_seq_count": len(missing),
+                "branch_missing_seqs": missing[: self._REPAIR_GAP_SEQ_LIMIT],
+                "branch_first_ts": fork.get("branch_first_ts"),
+                "branch_last_ts": fork.get("branch_last_ts"),
+                "links_verified": int(fork.get("links_verified", 0)),
+                "branch_path": self._cap_record_str(str(fork.get("branch_path", "")), 512),
+                "source": self._cap_record_str(str(fork.get("source", "")), 512),
+            },
+        ))
+
+    def record_erasure(
+        self,
+        target: AuditRecord,
+        seq: Optional[int],
+        reason: str,
+        *,
+        legal_ground: Optional[str] = None,
+        erased_by: Optional[str] = None,
+        sign: Optional[Callable[[dict], dict]] = None,
+    ) -> AuditRecord:
+        """Append the RECORD_ERASED record that accounts for ``target``.
+
+        Names the record by id and stored hash, which is what a walk matches
+        a tombstone against. Holds nothing from the erased content: its event
+        type and action id only, so the slot can be read in context.
+
+        ``legal_ground`` and ``erased_by`` are added only when given, so an
+        erasure without them keeps the original data shape. ``sign`` gets the
+        finished data, with ``erased_at`` added, and returns the
+        ``eraser_signature`` block (see ``vaara.audit.verify.check_erasures``).
+        """
+        now = time.time()
+        data: dict[str, Any] = {
+            "erased_record_id": target.record_id,
+            "erased_record_hash": target.record_hash,
+            "erased_seq": seq,
+            "erased_event_type": target.event_type.value,
+            "erased_action_id": target.action_id,
+            "reason": self._cap_record_str(reason, 512),
+        }
+        if legal_ground is not None:
+            data["legal_ground"] = self._cap_record_str(legal_ground, 512)
+        if erased_by is not None:
+            data["erased_by"] = self._cap_record_str(erased_by, 512)
+        if sign is not None:
+            data["erased_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+            data["eraser_signature"] = sign(dict(data))
+        record = AuditRecord(
+            record_id=str(uuid.uuid4()),
+            action_id="record-erased",
+            event_type=EventType.RECORD_ERASED,
+            timestamp=now,
+            agent_id="vaara",
+            tool_name="trail.erase",
+            data=data,
+        )
+        self._append_chained(record)
+        return record
+
+    def record_rotation(
+        self,
+        *,
+        last_hash: str,
+        purged_records: int,
+        archive_sha256: str,
+        archive_records: int,
+        archive_kind: str,
+        boundary_utc: str,
+        signer_fingerprint: str,
+        sign: Optional[Callable[[dict], Optional[dict]]] = None,
+        tenant_id: str = "",
+    ) -> AuditRecord:
+        """Append the TRAIL_ROTATED record that accounts for a retention purge.
+
+        Written after the archive is final and before the purge, so it sits at
+        the tip and outlives the records it names. ``last_hash`` is the hash of
+        the last record the purge removes, the one the first survivor links to.
+        ``sign`` gets the finished data, with ``rotated_at`` added, and returns
+        the ``rotation_signature`` block (see ``vaara.audit.verify.check_rotations``);
+        a record without it is written but accounts for nothing. ``tenant_id``
+        is the tenant whose chain is rotated: the record is written into it, so
+        a walk of that tenant's records finds it.
+
+        Raises ``RuntimeError`` when the store refuses the write, so a rotation
+        never purges on the strength of a record that did not land.
+        """
+        now = time.time()
+        data: dict[str, Any] = {
+            "last_hash": last_hash,
+            "purged_records": purged_records,
+            "archive_sha256": archive_sha256,
+            "archive_records": archive_records,
+            "archive_kind": archive_kind,
+            "boundary_utc": boundary_utc,
+            "rotated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+            "signer_fingerprint": signer_fingerprint,
+        }
+        if sign is not None:
+            block = sign(dict(data))
+            if block is not None:
+                data["rotation_signature"] = block
+        record = AuditRecord(
+            record_id=str(uuid.uuid4()),
+            action_id="trail-rotated",
+            event_type=EventType.TRAIL_ROTATED,
+            timestamp=now,
+            agent_id="vaara",
+            tool_name="trail.rotate",
+            data=data,
+            tenant_id=tenant_id,
+        )
+        if not self._append_chained(record):
+            raise RuntimeError("the store refused the rotation record")
+        return record
+
+    def _append_chained(self, record: AuditRecord) -> bool:
+        """Append a record to the trail with hash chaining.
+
+        Returns False when the store refused the write, True otherwise
+        (including a trail with no store behind it).
+        """
+        kept = True
         # Sanitize caller-supplied `data` at the single choke point so any
         # record_* method (including direct AuditTrail users bypassing the
         # pipeline) cannot land a datetime/bytes/Path/UUID in data and
@@ -1664,40 +3385,77 @@ class AuditTrail:
                         # only evidence that this discontinuity is somebody
                         # else's record rather than a missing one.
                         self._store_anchors[record.record_id] = head
-                except Exception:
+                except Exception as exc:
                     # Store rejected the write. Keep the in-memory chain
                     # coherent off the local head and count the divergence,
                     # exactly as the on_record path below does.
                     _stamp(self._last_hash)
-                    self._persistence_failures += 1
-                    logger.exception(
-                        "append_record failed for record %s "
-                        "(persistent store now out of sync with in-memory "
-                        "chain; failure count=%d)",
-                        record.record_id,
-                        self._persistence_failures,
-                    )
+                    self._note_persistence_failure(record, exc, "append_record")
+                    kept = False
+                else:
+                    self._note_persistence_ok(record)
             else:
                 _stamp(self._last_hash)
                 if self._on_record:
                     try:
                         self._on_record(record)
-                    except Exception:
-                        # logger.exception preserves the stack trace so ops can
-                        # diagnose disk-full / locked-DB / permission errors
-                        # instead of seeing a bare error line.
-                        self._persistence_failures += 1
-                        logger.exception(
-                            "on_record callback failed for record %s "
-                            "(persistent store now out of sync with in-memory "
-                            "chain; failure count=%d)",
-                            record.record_id,
-                            self._persistence_failures,
-                        )
+                    except Exception as exc:
+                        self._note_persistence_failure(record, exc, "on_record")
+                        kept = False
+                    else:
+                        self._note_persistence_ok(record)
 
             self._last_hash = record.record_hash
-            self._records.append(record)
-            self._by_action[record.action_id].append(record)
+            self._index_record(record)
+        if self._unrecorded_pending is not None:
+            self._flush_unrecorded_mark()
+        return kept
+
+    def _index_record(self, record: AuditRecord) -> None:
+        """Put one record into every in-memory index.
+
+        THE ONLY place that appends to ``_records``. Bulk loaders must call
+        this rather than appending directly, because a record that reaches
+        ``_records`` without reaching ``_resolved_approvals`` is invisible to
+        :meth:`find_prior_approval`.
+
+        That failure is silent and it fails CLOSED: a missing approval means
+        the action escalates to a human again rather than being auto-allowed,
+        which is the safe direction but is still wrong. ``load_trail`` in the
+        SQLite backend is the path that would have been forgotten, since
+        reloaded records never pass through ``_append``, so it calls this too.
+
+        Callers already holding ``_lock`` (``_append_chained``) must not
+        re-acquire it; this method deliberately does no locking of its own and
+        inherits whatever the caller holds. ``load_trail`` builds a fresh trail
+        single-threaded and needs none.
+        """
+        self._records.append(record)
+        self._by_action[record.action_id].append(record)
+        # record_id to position, so verify_segment can find one record without
+        # walking the trail. Measured before this existed: the id scan was 16
+        # percent of the call at 5,000 records and 59 percent at 50,000, which
+        # made the lookup the wall rather than the hashing.
+        #
+        # Positions are stable because _records is append-only. Nothing in the
+        # tree removes, reorders or replaces an element: rotate purges the
+        # DATABASE and builds a fresh trail through load_trail rather than
+        # editing a live one. If that ever changes, this index has to be
+        # rebuilt at the same moment, and test_index_matches_records is what
+        # will notice.
+        #
+        # setdefault, not assignment: on a duplicate record_id the FIRST
+        # occurrence wins, because a segment claim about the earlier copy is
+        # the conservative answer, it covers more of the chain.
+        self._pos_by_record_id.setdefault(record.record_id, len(self._records) - 1)
+        if record.event_type == EventType.ESCALATION_RESOLVED:
+            self._resolved_approvals.append(record)
+        if record.event_type == EventType.ACTION_REQUESTED:
+            session = (record.data or {}).get("session_id")
+            if session:
+                self._actions_by_session[
+                    (record.tenant_id or "", record.agent_id, str(session))
+                ].append(record.action_id)
 
     def _chain_backend(self):
         """The store that owns the persistent chain head, or ``None``.
@@ -1710,6 +3468,90 @@ class AuditTrail:
         if target is not None and hasattr(target, "append_record"):
             return target
         return None
+
+    def _persistence_path(self):
+        """The file the failure marker belongs beside, or ``None``.
+
+        An in-memory trail, a plain callable sink and a test double all
+        return ``None``, and every function in ``write_failure`` treats that
+        as "nowhere to report, do nothing".
+        """
+        for target in (self._backend, getattr(self._on_record, "__self__", None)):
+            if target is None:
+                continue
+            path = getattr(target, "db_path", None)
+            if path is None:
+                path = getattr(target, "_db_path", None)
+            if path is not None:
+                return path
+        return None
+
+    def _note_persistence_failure(self, record: AuditRecord, exc: BaseException,
+                                  stage: str) -> None:
+        """Record a failed persist so it is visible past this process.
+
+        The old behaviour was ``logger.exception`` on every record. That is
+        what hid the 2026-08-22 outage for thirteen days: a traceback per tool
+        call reads as normal hook noise within minutes, and the in-process
+        counter beside it could never climb because the hook is a new process
+        each call. So the stack trace is kept for the first failure of an
+        outage, where it is the diagnosis, and every failure after it is one
+        line that says the trail is not recording. The count that matters
+        lives in the marker file.
+        """
+        self._persistence_failures += 1
+        self._write_marker_checked = False
+        state = record_failure(self._persistence_path(), exc, stage=stage)
+        count = state.get("count", self._persistence_failures) if state else \
+            self._persistence_failures
+        if count <= 1:
+            logger.exception(
+                "%s failed for record %s (persistent store now out of sync "
+                "with in-memory chain; failure count=%d)",
+                stage, record.record_id, count,
+            )
+        else:
+            logger.error(
+                "%s failed for record %s: %s — THE TRAIL IS NOT RECORDING "
+                "(%d failed writes since %s)",
+                stage, record.record_id, exc, count,
+                state.get("first_failure_utc", "an unknown time") if state else "?",
+            )
+
+    def _note_persistence_ok(self, record: AuditRecord) -> None:
+        """Queue the outage's mark on the first write that succeeds.
+
+        Checked at most once per trail instance, and re-armed by the next
+        failure, so the steady state costs nothing. The marker is not closed
+        here: it stays open until the trail_not_recording record has landed,
+        so a refused mark leaves the window to be written by the next good
+        write instead of losing it.
+        """
+        if self._write_marker_checked:
+            return
+        self._write_marker_checked = True
+        state = active_failure(self._persistence_path())
+        if state is not None:
+            self._unrecorded_pending = (state, record.record_id)
+
+    def _flush_unrecorded_mark(self) -> None:
+        """Write the queued trail_not_recording record, then close the outage."""
+        with self._lock:
+            pending, self._unrecorded_pending = self._unrecorded_pending, None
+        if pending is None:
+            return
+        state, resumed_record_id = pending
+        mark = self._unrecorded_mark(state, resumed_record_id)
+        if not self._append_chained(mark):
+            return
+        resolved = mark_recovered(self._persistence_path())
+        if resolved:
+            logger.warning(
+                "the audit trail at %s is recording again after %s failed "
+                "write(s) starting %s",
+                resolved.get("db"), resolved.get("count", "?"),
+                resolved.get("first_failure_utc", "an unknown time"),
+            )
 
     def _get_regulatory_articles(
         self,
@@ -1731,6 +3573,17 @@ class AuditTrail:
         # DORA mappings (for financial actions)
         if RegulatoryDomain.DORA in action_domains:
             for article in DORA_MAPPINGS.get(event_type, []):
+                articles.append({
+                    "domain": article.domain.value,
+                    "article": article.article,
+                    "requirement": article.requirement,
+                    "how_satisfied": article.how_satisfied,
+                })
+
+        # SOC 2 mappings (data, infrastructure, identity actions, and the
+        # trail's own control events)
+        if RegulatoryDomain.SOC2 in action_domains:
+            for article in SOC2_MAPPINGS.get(event_type, []):
                 articles.append({
                     "domain": article.domain.value,
                     "article": article.article,

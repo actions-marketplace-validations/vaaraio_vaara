@@ -34,10 +34,23 @@ A Qualified Electronic Attestation of Attributes is an eIDAS trust service:
 attests an attribute of a subject, and the attestation carries a statutory
 presumption. An organisation cannot issue one about itself, by construction.
 
-As of 2026-08-05 there is exactly one granted `EAA/Q` service in the European
-Union, held by Microsec (HU), verified by walking the EU List of Trusted Lists
-with `eu_trusted_list.py` across all 31 national lists. The consuming side of
-this ecosystem is empty. That is the gap this spec occupies: Vaara is a
+Walking the EU List of Trusted Lists with `eu_trusted_list.py` on **2026-08-26**
+finds **two** granted `EAA/Q` services across the 31 national lists it points
+to:
+
+| Territory | Provider | Service |
+|---|---|---|
+| HU | Microsec Micro Software Engineering & Consulting | Issuance of Qualified Electronic Attestations of Attributes |
+| SE | IDnow Trust Services AB | IDnow Qualified electronic attestation of attributes |
+
+Two caveats on that count, both of which matter more than the number.
+The Portuguese list did not respond during the walk, so two is a floor rather
+than a ceiling. And an earlier revision of this document said there was exactly
+one, verified the same way on 2026-08-05: the field changed inside three weeks.
+**Re-walk the lists before repeating any count, and never publish "the only
+provider" from a cached figure.**
+
+The consuming side of this ecosystem is still where the gap is. Vaara is a
 relying party, not an issuer, and becoming a QTSP is neither possible nor
 necessary here.
 
@@ -153,4 +166,38 @@ Vaara.
 
 The trusted-list responses used by the negative cases are pinned fixtures, so
 the suite is deterministic and does not depend on a live national list being
-reachable at test time.
+reachable at test time. The Portuguese list being unreachable during the
+2026-08-26 walk is exactly why: a suite that needs 31 remote XML documents to
+agree is a suite that fails for reasons that have nothing to do with the code.
+
+## State of implementation, 2026-08-26
+
+1. **`mandate` on the grant envelope. DONE.** `src/vaara/credential/_grant_mandate.py`.
+   Optional block, covered by the existing grant signature over the JCS
+   encoding, added to the preimage only when present. A grant without one signs
+   exactly the bytes it signed before the field existed, which is asserted
+   directly rather than assumed. Closed schema on all four sub-objects, and the
+   reserved `boundVia` values reject rather than pass.
+2. **Digest verification. DONE.** `verify_mandate_binding` recomputes SHA-256
+   over the decoded attestation and compares it to the commitment. The
+   digest-only path returns true because there is nothing carried to disagree
+   with, and the docstring says why a caller wanting the bytes present must
+   check for them itself: "not carried" and "carried and wrong" must not
+   collapse into one answer. Undecodable base64 is a failed binding, not a
+   raise on the verification path.
+3. **Trusted-list resolution**, steps 4 and 5 of the verification order. **Next.**
+   `eu_trusted_list.py` already walks the LOTL and parses national lists, but
+   `parse_trusted_list` filters on `_QTST`, the qualified timestamp type. It
+   needs the `EAA/Q` type alongside, plus the status-at-a-time check step 4
+   describes, which the timestamp path never needed.
+4. **Attestation signature verification**, step 3 of the verification order.
+   Needs the provider's certificate, so it is the first piece that cannot be
+   done with invented bytes.
+5. **Wire it to `_decision_binding` and `_handoff`.** Where the value lands: a
+   handoff crossing an organisational boundary carrying an attestation the
+   receiving side resolves from a public register.
+6. **`qeaa_mandate_v0`**, the seven cases listed above, with pinned list
+   fixtures.
+
+Step 3 is self-contained and needs no real attestation. Steps 4 and 5 need one
+from a live provider, and there are now two to ask rather than one.

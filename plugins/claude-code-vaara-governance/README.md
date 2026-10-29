@@ -6,13 +6,13 @@ Runtime tool-call governance for Claude Code. Wires the [Vaara](https://github.c
 
 PreToolUse runs a two-layer check before Claude executes a tool:
 
-**Layer 1: regex deny patterns** (Bash, WebFetch, WebSearch, Write, Edit, NotebookEdit). A JSON deny-list (`policies/default_deny.json`) catches known-bad shapes on the shell and web surface: AWS / GCP / Azure metadata IPs, `/etc/shadow` reads, `curl | sh`, `rm -rf /`, fork bombs, `dd` to raw block devices, history purges, reverse shells, base64-piped exec, `~/.ssh/authorized_keys` writes.
+**Layer 1: regex deny patterns** (48 rules over 18 tools: `Bash`, `WebFetch`, `Read`, `Write`, `Edit`, `NotebookEdit`, the agent's meta-actions, and the MCP resource readers; `mcp__*` calls are matched by content). A JSON deny-list (`policies/default_deny.json`) catches known-bad shapes on the shell and web surface: AWS / GCP / Azure metadata IPs, `/etc/shadow` reads, `curl | sh`, `rm -rf /`, fork bombs, `dd` to raw block devices, history purges, reverse shells, base64-piped exec, `~/.ssh/authorized_keys` writes, git hooks and git configuration that runs a program (`core.fsmonitor`, `core.pager`, diff and filter drivers), and deleting or rewriting Vaara's own trail or reading its signing keys, and answering its own escalation.
 
 The same layer covers the file surface, because an agent that cannot run `curl | sh` can still write it to a file: shell startup files (`.bashrc`, `.zshrc`, `.profile`), `~/.ssh/authorized_keys`, `/etc/shadow` and `/etc/sudoers`, git hooks, cron paths, launchd and systemd units, and file content carrying a remote-pipe-to-shell or reverse-shell payload. A match is a hard deny: fast, deterministic, no ML.
 
 **Layer 2: Vaara classifier** (`mcp__*` only). MCP tool calls carry structured taxonomy that Vaara's adaptive scorer is trained for; the conformal risk score is meaningful there. The classifier output drives the allow / escalate / deny decision against the loaded policy thresholds.
 
-PostToolUse appends an outcome record to the audit trail, correlating it back to the PreToolUse decision and feeding the MWU online learner.
+PostToolUse appends an outcome record to the audit trail, correlating it back to the PreToolUse decision by the host's `tool_use_id` and feeding the MWU online learner. PostToolUseFailure records a call that failed or was interrupted, and PermissionDenied records a call the host's permission step refused after the hook allowed it; neither copies the host's error text or reason.
 
 Blocks and escalations also pop a native desktop notification (macOS via osascript, Linux via notify-send when present), so a decision is visible even when the terminal is buried. Notifications are fire-and-forget and can never break the hook.
 
@@ -20,9 +20,41 @@ SessionStart prints a one-line status (Vaara version, mode, protection preset, n
 
 | Hook | Matches | Mechanism |
 |---|---|---|
-| `PreToolUse` | `Bash`, `WebFetch`, `WebSearch`, `Write`, `Edit`, `NotebookEdit`, `Task`, `SendMessage`, `mcp__*` | Layer 1 regex on shell, web and file mutation. Layer 2 ML on MCP. Desktop notification on block/escalate. |
-| `PostToolUse` | same set | Audit outcome + MWU feedback. |
+| `PreToolUse` | every tool (`.*`) | Every call is dispatched and recorded. Layer 1 regex on shell, web, reads of secret material, file mutation and the agent's meta-actions (spawn, schedule, remote run, message out, harness config writes); a tool no rule names is recorded and allowed. Layer 2 ML on MCP. Desktop notification on block/escalate. |
+| `PostToolUse` | every tool (`.*`) | Audit outcome + MWU feedback. |
+| `PostToolUseFailure` | every tool (`.*`) | Outcome for a call that failed or was interrupted. Needs the `vaara` binary on PATH. |
+| `PermissionDenied` | every tool (`.*`) | Outcome for a call the host refused after the hook allowed it; it did not run, and the scorer does not learn from it. Needs the `vaara` binary on PATH. Claude Code sends it only in auto mode. |
 | `SessionStart` | n/a | Validate install, print status. |
+
+## Operator lifts
+
+The meta-action rules are operator policy, so each has a named exception.
+Set the variable to `1` in the environment for the job that needs it:
+
+| Variable | Lifts |
+|---|---|
+| `VAARA_ALLOW_SPAWN` | subagent spawn (`Agent`, `Task`), `Workflow` fan-out, a `Skill` that spawns a subagent, and `TaskStop` on a background task |
+| `VAARA_ALLOW_SCHEDULE` | a durable `CronCreate` job (session-only jobs pass anyway) and `CronDelete` of a schedule |
+| `VAARA_ALLOW_REMOTE` | `RemoteTrigger` create, update, run |
+| `VAARA_ALLOW_XSESSION` | `SendMessage` to anything but `main` |
+| `VAARA_ALLOW_HARNESS_EDIT` | writes to `.claude.json`, `.claude/settings*.json`, `.claude/hooks/`, `.claude/skills/`, `.claude/agents/`, `.claude-plugin/`, `.mcp.json`, whether by a file tool, a shell command, or an interpreter one-liner |
+| `VAARA_ALLOW_EGRESS` | a raw socket tool moving bytes to a remote host, and interpreter one-liners that open an outbound connection |
+| `VAARA_ALLOW_SECRET_READ` | `Read` and the MCP resource readers over dotenv files, private keys, the seal file, cloud and git credentials |
+| `VAARA_ALLOW_DISCARD` | `ExitWorktree` with the flag that discards uncommitted work |
+
+A lifted call is still recorded. `ScheduleWakeup` is recorded and never
+denied.
+
+The rules name tools in Claude Code's vocabulary (`Bash`, `Edit`, `Write`,
+`Agent` and the rest). Codex, Gemini CLI and Copilot CLI tool names are translated into
+that vocabulary before matching: Codex hands hooks its shell tools as `Bash`
+already, and its `apply_patch` and `spawn_agent` are translated, as are
+Gemini CLI's `run_shell_command`, `write_file`, `replace`, `read_file`,
+`read_many_files`, `web_fetch`, `read_mcp_resource` and `activate_skill`,
+and Copilot CLI's `bash`, `create`, `edit`, `view`, `task` and `skill`.
+Calls under an `mcp__*` name are matched on content, so MCP-routed tools are
+covered whatever the harness. Other harnesses' names do not match by name. The boundary red-team in `conformance/redteam/` drives every one
+of these through the real hook.
 
 ## Install
 
@@ -57,12 +89,16 @@ The config file, hand-editable:
 |---|---|---|
 | `mode` | `protect` (default), `watch`, `off` | `watch` checks and records everything but never blocks; `off` disables the plugin. |
 | `protection` | `eco`, `balanced` (default), `performance`, `strict` | Policy preset applied to MCP scoring; these are the `vaara mode` presets. |
-| `thresholds` | `{"escalate": E, "deny": D}` with `0 <= E <= D <= 1` | Optional custom decision thresholds, overriding the preset's defaults. The preset still provides the rest of the policy shape. Malformed values are ignored. |
+| `thresholds` | `{"escalate": E, "deny": D}` with `0 <= E < D <= 1` | Optional custom decision thresholds, overriding the preset's defaults. The preset still provides the rest of the policy shape. Malformed values are ignored. |
+| `policy` | path | A policy file, the format `vaara serve --policy` takes. It replaces `protection` and `thresholds`, and every tool call that passes the deny rules is then scored against it, shell and file calls included, not only `mcp__*` calls and deletes. A policy that cannot be read or fails validation blocks every call, with the reason, unless `mode` is `watch` or `fail_open` is set. Off when absent. |
 | `notifications` | `true` (default), `false` | Desktop popups on block/escalate. |
 | `agent_id` | string | Agent id written to the audit chain (default `claude-code`). |
 | `audit_db` | path | Audit DB path (default `~/.vaara/claude-code/audit.db`). |
 | `article50_statement` | string | When set, SessionStart records this as an EU AI Act Article 50(1) disclosure event into the audit trail with the session id, before the session's first tool call. Off when absent. |
-| `fail_open` | `false` (default), `true` | What happens to `mcp__*` calls in protect mode when the `vaara` package is not importable. Default: fail closed (block with an install hint). `true` passes them through unscored. |
+| `value_origin` | `false` (default), `true` | Hold a call that sends, pays or posts when its recipient, payee or endpoint (an email address, IBAN or URL host) appeared only in a tool result: a web page, an MCP tool's output, or a file read from outside the project. Values you typed in a prompt pass, and so do values never seen. The decision record names the tool result the value came from. Off by default, because an agent whose work is outreach takes its recipients from what it reads. |
+| `trusted_values` | list of strings | Recipients, payees and hosts that `value_origin` never holds, such as your own addresses and known suppliers. |
+| `authority_args` | `{"tool": ["arg", ...]}` | Arguments `value_origin` checks on top of the preset recipient, payee and endpoint names, keyed by full or bare tool name. |
+| `fail_open` | `false` (default), `true` | What happens to a tool call the hook cannot decide. That covers a hook that crashes, cannot find `vaara` or `python3`, or gives no verdict within 80 seconds, and `mcp__*` calls in protect mode that cannot be scored or recorded because the `vaara` package is not importable or the audit trail cannot be opened or written. Default: fail closed (block, and say why). `true` lets them run. The deny rules do not need the trail, so they keep enforcing whenever the hook runs. When the hook itself cannot run, the value is read with `python3`; without it, only `VAARA_PLUGIN_FAIL_OPEN=1` opts out. |
 
 Environment variables override the file (useful for CI or a single session):
 
@@ -71,12 +107,14 @@ Environment variables override the file (useful for CI or a single session):
 | `VAARA_PLUGIN_DISABLE=1` | Disable the whole plugin. All hooks pass through. |
 | `VAARA_PLUGIN_SHADOW=1` | Same as `"mode": "watch"`: record every decision, never block. |
 | `VAARA_PLUGIN_PROTECTION` | Same as `"protection"`: preset name. |
+| `VAARA_PLUGIN_POLICY` | Same as `"policy"`: path to a policy file. |
 | `VAARA_PLUGIN_NOTIFY=0` | Turn desktop notifications off. |
 | `VAARA_PLUGIN_AGENT_ID` | Override the agent_id written to the audit chain. |
 | `VAARA_PLUGIN_AUDIT_DB` | Override the audit DB path. |
 | `VAARA_PLUGIN_DENY_PATTERNS_FILE` | Replace the bundled `policies/default_deny.json` with your own. |
 | `VAARA_PLUGIN_ARTICLE50_STATEMENT` | Same as `"article50_statement"`. |
 | `VAARA_PLUGIN_FAIL_OPEN=1` | Same as `"fail_open": true`. |
+| `VAARA_HOOK_DEADLINE` | Seconds the PreToolUse hook has to give a verdict before the call is blocked. Can shorten the default 80, never lengthen it: past the 90 second hook timeout Claude Code would let the call run. |
 
 ## Extending the deny patterns
 
@@ -118,10 +156,22 @@ PreToolUse on Bash / WebFetch / WebSearch is regex-only and sub-millisecond. Pre
 ## Known limitations
 
 - Cold-start latency per MCP call (see above).
-- PostToolUse correlates to the most recent `ACTION_REQUESTED` for the same agent + tool. Parallel calls to the same MCP tool can race; outcome attribution may swap. The audit chain itself stays intact.
+- PostToolUse correlates to the `ACTION_REQUESTED` that carries the host's `tool_use_id`. A host that sends no id falls back to the latest request for the same agent + tool that has no outcome yet, and parallel calls to one tool can then swap their outcomes. The audit chain itself stays intact.
 - Outcome severity is a crude mapping from `tool_response.interrupted` / `isError` / `stderr`. Operators tune via policy once they have data.
 - This plugin does **not** wire OVERT attestation envelopes. Use `vaara-mcp-proxy` with `--overt-*` flags for envelopes.
 - The Vaara ML classifier is not run on raw Bash / WebFetch / WebSearch input. The classifier is trained on structured MCP tool patterns, not shell command strings; its output on raw bash is noise (measured 2026-05-28). Shell-surface coverage is the regex deny-list. Operators who want classifier coverage on shell can train Vaara on their own corpus and wire it in via `VAARA_PLUGIN_AGENT_ID` + a custom hook.
+
+## Privacy and data
+
+The plugin's own scripts make no network requests. Each hook calls `hooks/run.sh`, which runs the `vaara` CLI when it is on PATH and otherwise the bundled Python scripts in `hooks/`. On a block or escalation the plugin starts `osascript` (macOS) or `notify-send` (Linux) to show a desktop notification. Set `VAARA_PLUGIN_NOTIFY=0` to turn that off.
+
+Every tool call is written to a SQLite audit trail on your machine, by default `~/.vaara/claude-code/audit.db`. Each record holds the tool name, the input parameters Claude Code passed (a shell command, a file path, MCP arguments), the risk classification and the decision. Those parameters can contain personal data if the session handles any. Settings live in `~/.vaara/claude-code/config.json`.
+
+With `value_origin` on, the hook also keeps `~/.vaara/value_origin.json`: keyed digests (HMAC-SHA256) of the email addresses, IBANs and hosts seen in tool results and prompts, with the tool and action ids they were seen in. The key is `~/.vaara/value_origin.key`, readable by you only. The file holds no address or account number.
+
+The plugin does not upload the trail or any usage data. A trail leaves the machine only when you export it yourself with `vaara trail export`. Records stay until you delete the database file. The trail is append-only, and the plugin never removes records by itself.
+
+Contact for privacy questions: hello@vaara.io.
 
 ## License
 

@@ -16,6 +16,9 @@ from vaara.audit.sqlite_backend import SQLiteAuditBackend
 from vaara.audit.trail import EventType
 from vaara.integrations.mcp_server import VaaraMCPServer
 from vaara.pipeline import InterceptionPipeline
+from vaara.scorer.adaptive import AdaptiveScorer
+
+from .conftest import ESCALATING_THRESHOLDS
 
 
 @pytest.fixture
@@ -23,7 +26,11 @@ def server():
     backend = SQLiteAuditBackend(":memory:")
     trail = backend.load_trail()
     trail._on_record = backend.write_record
-    pipeline = InterceptionPipeline(trail=trail)
+    # See ESCALATING_THRESHOLDS in conftest: the handshake only engages
+    # on an escalate, and the default operating point allows this call.
+    pipeline = InterceptionPipeline(
+        trail=trail, scorer=AdaptiveScorer(**ESCALATING_THRESHOLDS),
+    )
     return VaaraMCPServer(pipeline=pipeline)
 
 
@@ -102,6 +109,34 @@ class TestMCPServerApprovalHandshake:
         payload, _ = _intercept(server)
         assert payload["allowed"] is False
         assert payload["decision"] == "escalate"
+
+    @pytest.mark.parametrize("failure", ["timeout", "error"])
+    def test_unanswered_approval_closes_the_hold_as_a_policy_deny(
+        self, server, escalate_payload, monkeypatch, failure
+    ):
+        # An escalation with no resolution reads on the chain as a hold still
+        # waiting. The claude-code hook already closes it (#873); here the
+        # refusal is the same and the trail now says so.
+        def _boom(*a, **kw):
+            raise RuntimeError("approvals dir unreadable")
+
+        monkeypatch.setattr(
+            vaara.approvals, "request_approval",
+            _boom if failure == "error" else (lambda *a, **kw: "timeout"),
+        )
+        payload, result = _intercept(server)
+        assert payload["allowed"] is False
+        assert payload["decision"] == "escalate"
+        assert result["isError"] is True
+        [resolved] = [
+            r for r in server._pipeline.trail._records
+            if r.event_type == EventType.ESCALATION_RESOLVED
+            and r.action_id == payload["action_id"]
+        ]
+        assert resolved.data["resolution"] == "deny"
+        assert resolved.data["reviewer"] == "approvals-timeout"
+        assert resolved.data["approver"] == "policy"
+        assert resolved.data.get("human_disposed") is not True
 
     def test_handshake_error_fails_closed(
         self, server, escalate_payload, monkeypatch

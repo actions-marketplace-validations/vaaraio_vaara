@@ -68,6 +68,31 @@ canonical lifecycle is `action_requested` to `risk_scored`  to
 `escalation_sent` to `escalation_resolved`) to `outcome_recorded`.
 `policy_override` may appear at any point after `decision_made`.
 
+The trail also carries events about itself and its surroundings. Each has
+an `action_id` of its own and takes part in the hash chain like any other
+record.
+
+| Value | What it states |
+|---|---|
+| `anchor_gap` | A scheduled head publication or time anchor did not happen; the reason and the head it tried to witness are in `data`. |
+| `repair_gap` | A store repair could not keep every record; the declared gap is in `data`. |
+| `repair_recovered` | Records a repair declared lost were recovered from the damaged file and verified; `data` names the bundle by sha256 and lists the seqs. The records are not written back. |
+| `trail_forked` | Another store shares this trail's records up to `data.fork_seq` and then continues on its own; `data` names that branch by its head hash and seq, with its record count and any seqs it declared lost. Neither branch is merged into the other. |
+| `key_lifecycle` | A signing-key custodian was added, rotated or revoked. |
+| `disclosure_recorded` | An EU AI Act Article 50 transparency disclosure was made. |
+| `access_recorded` | Something in the store was opened, and by whom. |
+| `agent_seen` | `vaara scan --watch` or the MCP beacon saw an agent process. |
+| `witness_configured` | Heads reach an outside witness at a stated cadence: `data.kind` is `publish` (a transparency log) or `anchor` (an RFC 3161 authority), `data.every_records` the cadence, `data.target` the log or authority, `data.key_fingerprint` the publishing key. Written when the cadence is switched on or changed, so the bound on the unwitnessed window is readable from the trail. |
+| `record_erased` | Another record's `data` was erased (`vaara trail erase`, GDPR Art. 17): `data.erased_record_id`, `data.erased_record_hash` and `data.erased_seq` name it, `data.erased_event_type` and `data.erased_action_id` place it, `data.reason` says why. Optional, only when given: `data.legal_ground`, `data.erased_by`, and with a signing key `data.erased_at` and `data.eraser_signature` (`vaara.record-erasure/v1`, ES256 or RS256 by the eraser, checked with `vaara trail verify --erasure-key`). The erased record keeps its `record_hash` and its `data` becomes `{"_vaara_erased": {"erasure_record_id": ...}}`; verification reports that slot as erased (link verified, content not checkable), never as intact. |
+| `cage_lifecycle` | A cage launch started or stopped (`vaara cage run` / `cage stop`, `vaara run`). `data.action` is `started` or `stopped`; `data.driver`, `data.name`, `data.policy_digest` and `data.actor` say which launch, under which policy, by whom. A stop adds `data.reason` (`exited`, `operator`, `guard_gone`), and `data.processes_ended` and `data.exit_code` when known, and names the start it closes in `data.started_record_id` when that start is on the trail. Verification fails a stop that names anything other than an earlier start of the same driver and launch, and lists starts with no stop and stops whose start is outside the export. |
+| `trail_not_recording` | The audit store refused writes and then took them again. Written by the trail on the first write that lands after the refusals, from the failure marker beside the database (`<db>.write-failure.json`): `data.unrecorded_writes` is the number of record writes the store refused (a lower bound), `data.first_failure_utc` and `data.last_failure_utc` bound the window, `data.stage` and `data.error` say what failed, and `data.resumed_record_id` names the first record that landed afterwards. The refused records never took a place in the chain on disk, so that record and the one before it are adjacent, and the window lies between them; calls in it ran with no record. Verification lists each window, and fails a record whose count is not a whole number of at least 1, whose times or record id are missing, or whose record id is not an earlier record. Nothing is written if the store never recovers, and a process that ends before the first good write loses the marker. |
+| `trail_rotated` | A retention rotation archived the records before this trail's first one (`vaara trail rotate`). Written after the archive is final and before the purge, so it outlives the records it names: `data.last_hash` is the hash of the last record purged, the one the first surviving record links to; `data.purged_records` is how many went; `data.archive_sha256`, `data.archive_records` and `data.archive_kind` (`zip` or `sealed`) identify the archive that holds them; `data.boundary_utc` is the retention cut-off, `data.rotated_at` the signing time, `data.signer_fingerprint` the key; `data.rotation_signature` (`vaara.trail-rotation/v1`, Ed25519, the key that signs the archive) covers every one of those fields. Verification accepts a first record that links outside the trail only when the trail holds a signed record of this type naming that hash, and then reports the trail as beginning at a rotation seam; a first record that links to nothing stays a chain break. `vaara trail verify --archive` checks the archive's digest, its records and the link, and a sealed archive by digest alone. |
+
+`anchor_gap`, `repair_gap`, `repair_recovered`, `trail_forked`, `key_lifecycle`,
+`witness_configured`, `record_erased`, `cage_lifecycle`, `trail_not_recording` and `trail_rotated` are written by the trail alone. Verification reads them back, so
+`POST /v1/audit/events` refuses them with 400 `invalid_request`; every other
+type in both tables is accepted there.
+
 ## Hash chain
 
 The chain is SHA-256 over a canonical JSON encoding of a strict subset
@@ -116,7 +141,7 @@ keys). Reserved top-level keys:
   null), `sequence_position` (integer). The delegation keys link this action
   to the one that spawned it; see [§ Delegation linkage](#delegation-linkage).
 - `risk_scored`: `risk_score` (number in [0, 1]), `interval` (`[low, high]`), `classifier_version` (string), `contributing_signals` (array).
-- `decision_made`: `decision` (`allow` | `escalate` | `deny`), `threshold_set` (string), `verdict_inputs` (array).
+- `decision_made`: `decision` (`allow` | `escalate` | `deny`), `threshold_set` (string), `verdict_inputs` (array), `decision_detail` (`modify` | `step_up` | `defer`, optional), `modified_parameters` (object, optional).
 - `action_executed`: `executor` (string), `duration_ms` (number).
 - `action_blocked`: `reason` (string), `blocking_policy` (string).
 - `escalation_sent`: `reviewer_queue` (string), `priority` (string).
@@ -128,6 +153,17 @@ Caller-controlled strings in `data` (`agent_id`, `reason`,
 `override_reason`) MUST be treated as untrusted at narrative-rendering
 time. The hash chain still covers original values; the renderer
 sanitizes for display only.
+
+`decision` on a `decision_made` record stays inside the three-value enum
+above and always will. A policy layer may work with a finer vocabulary,
+and `decision_detail` names which refinement produced the recorded
+decision: `step_up` and `defer` are holds and record `escalate`, `modify`
+records `deny` because the arguments it was asked about do not run. When a
+`modify` proposes different arguments, `modified_parameters` carries them
+and the caller resubmits, producing a second decision bound to those
+arguments. **No decision record ever says `allow` against arguments other
+than the ones that executed.** Both optional keys are omitted when absent,
+so records written without a refinement are unchanged.
 
 ## Delegation linkage
 

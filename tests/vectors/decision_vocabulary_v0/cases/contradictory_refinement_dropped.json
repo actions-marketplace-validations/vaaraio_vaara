@@ -1,0 +1,41 @@
+[
+  {
+    "record_id": "b33faf31-baaf-5f4f-9793-830c77cc2674",
+    "action_id": "vector-contradiction",
+    "event_type": "decision_made",
+    "timestamp": 1780000036.0,
+    "agent_id": "agent:vector",
+    "tool_name": "tx.transfer",
+    "data": {
+      "decision": "allow",
+      "reason": "vector: allow carrying a modify refinement",
+      "risk_score": 0.1,
+      "cage": {
+        "driver": "none",
+        "confirmed": false
+      }
+    },
+    "regulatory_articles": [
+      {
+        "domain": "eu_ai_act",
+        "article": "Article 14(1)",
+        "requirement": "High-risk AI systems shall be designed to be effectively overseen by natural persons",
+        "how_satisfied": "Three-tier decision (allow/escalate/deny) ensures humans review borderline cases"
+      },
+      {
+        "domain": "eu_ai_act",
+        "article": "Article 14(4)(a)",
+        "requirement": "The human shall be able to properly understand the relevant capacities and limitations of the system and duly monitor its operation",
+        "how_satisfied": "Decision records include risk scores, confidence intervals, and contributing signals"
+      }
+    ],
+    "previous_hash": "",
+    "record_hash": "d38b873fa0ce9d90fdd3ca747289267529c611d268311520b8f5bedcfeafb308",
+    "system_operation": "decision_threshold",
+    "data_usage": "risk_score+thresholds",
+    "decision_making": "threshold_match",
+    "limitations": null,
+    "tenant_id": "",
+    "chain_version": 2
+  }
+]

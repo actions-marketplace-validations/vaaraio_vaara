@@ -76,8 +76,10 @@ def _reject_unknown_keys(d: dict[str, Any], allowed: frozenset[str], where: str)
             "the signed schema is closed"
         )
 
-ReceiptStatus = Literal["executed", "refused", "errored"]
-VALID_STATUSES: frozenset[str] = frozenset({"executed", "refused", "errored"})
+ReceiptStatus = Literal["executed", "refused", "errored", "unobserved"]
+VALID_STATUSES: frozenset[str] = frozenset(
+    {"executed", "refused", "errored", "unobserved"}
+)
 
 
 @dataclass(frozen=True)
@@ -128,6 +130,56 @@ class ReceiptAsserted:
     signed bytes. Absent means the record predates the block and the envelope
     is byte-for-byte what it was before. See
     ``docs/design/cbom-crypto-posture-spec.md``.
+
+    ``completeness`` is the optional per-boundary sequence block:
+    ``{"boundaryId": str, "seq": int, "runningCount": int}`` with
+    ``runningCount == seq + 1``. Authorization receipts have carried one since
+    the held-set work; execution receipts did not, so the held-set proof covered
+    only one half of the pair. A holder could name every allow decision with no
+    execution receipt, because the authorization side is provably contiguous and
+    every execution receipt back-links to its attestation. What the holder could
+    not do was separate "the action never ran" from "the receipt was dropped or
+    never persisted", because the execution side had no contiguity to break.
+
+    Its boundary id is the authorization boundary with ``#execution`` appended,
+    so the two sequences never share a counter. Denied calls legitimately mint an
+    authorization receipt and no execution receipt, and a shared sequence would
+    read every deny as a gap.
+
+    **The limit, stated so it is not overclaimed.** Contiguity closes
+    dropped-in-the-middle. A pure tail truncation is not detectable by sequence
+    contiguity alone and needs a timestamp anchor over the running count to
+    close. The same limit is already recorded for the authorization side.
+
+    Absent means the receipt predates the block and the envelope is
+    byte-for-byte what it was before this field existed.
+
+    ``aud`` is the optional audience: the relying party this receipt was
+    issued for. It rides inside the signed preimage, so a receipt legitimately
+    issued for one counterparty does not verify as if issued for another when
+    replayed there. Absent means the issuer bound no audience, and a verifier
+    asked to check one reports that association as unsupported rather than as
+    either bound or contradicted: integrity intact, association unknown. That
+    third state is the reason the field exists; a check that can only say
+    "verified" or "failed" loses the case where nothing was there to check.
+
+    ``task_id`` is the optional durable task this execution belongs to, the
+    ``taskId`` of an MCP task (``io.modelcontextprotocol/related-task``) or
+    any other long-running unit of work a supervisor accounts for. It rides
+    inside the signed preimage for the same reason ``aud`` does: when a
+    supervisor shows what a sub-agent did under a task, the receipts have to
+    name the task in signed bytes, or a receipt from another task is
+    indistinguishable from one that belongs. Absent means the issuer bound no
+    task, and a verifier asked to check one reports unsupported.
+
+    ``time_source`` is the optional declaration of where ``iat`` came from:
+    ``ntp`` (a synced network clock), ``rtc`` (a hardware real-time clock,
+    never synced to a network source), ``unsynced`` (the host knows its clock
+    is not synced) or ``tsa`` (the receipt carries an RFC 3161 token in
+    ``existenceProof`` that attests the time). It is signed, so an issuer that
+    declared ``unsynced`` cannot later be read as having claimed ``ntp``.
+    Absent means unknown. Only ``tsa`` backed by a token that checks is a
+    trusted time; see ``verify_receipt_time_source``.
     """
 
     iss: str
@@ -138,17 +190,28 @@ class ReceiptAsserted:
     alg: Algorithm
     sig_suite: Optional[str] = None
     crypto_posture: Optional["CryptoPosture"] = None
+    completeness: Optional[dict[str, Any]] = None
+    aud: Optional[str] = None
+    task_id: Optional[str] = None
+    time_source: Optional[str] = None
+
+
+#: The values ``receiptAsserted.timeSource`` may take. Absent means unknown.
+TIME_SOURCES = frozenset({"ntp", "rtc", "unsynced", "tsa"})
 
 
 @dataclass(frozen=True)
 class OutcomeDerived:
     """Facts about what happened to the attested request.
 
-    ``status`` is one of ``executed`` / ``refused`` / ``errored``.
-    ``result_commitment`` is a commitment over the result payload and
-    is optional: a refused call has no result, so the commitment is
-    absent. An executed or errored call commits to the result or the
-    error object respectively.
+    ``status`` is one of ``executed`` / ``refused`` / ``errored`` /
+    ``unobserved``. ``unobserved`` means the request was sent and no outcome
+    was observed (a timeout, a cut connection, an unreadable reply), so the
+    issuer cannot say whether the action ran; a consumer reads it as neither
+    ``executed`` nor ``errored``. ``result_commitment`` is a commitment over
+    the result payload and is optional: a refused or unobserved call has no
+    result, so the commitment is absent. An executed or errored call commits
+    to the result or the error object respectively.
 
     ``decision_digest`` is the SEP-2828 Check B (outcome-to-decision)
     binding: ``sha256:<hex>`` over the full signed decision-record wire
@@ -188,7 +251,13 @@ def pq_signature_to_dict(pq: PqSignature) -> dict[str, Any]:
     return {"alg": pq.alg, "keyid": pq.keyid, "sig": pq.sig}
 
 
+_PQ_SIGNATURE_KEYS = frozenset({"alg", "keyid", "sig"})
+
+
 def pq_signature_from_dict(d: dict[str, Any]) -> PqSignature:
+    # Outside the signed payload, so an extra member here is covered by nothing
+    # at all; it is refused like every other block rather than carried unseen.
+    _reject_unknown_keys(d, _PQ_SIGNATURE_KEYS, "pqSignature")
     for required in ("alg", "keyid", "sig"):
         value = d.get(required)
         if not isinstance(value, str) or not value:
@@ -435,10 +504,25 @@ def receipt_asserted_to_dict(ra: ReceiptAsserted) -> dict[str, Any]:
         "secretVersion": ra.secret_version,
         "sub": ra.sub,
     }
+    if ra.aud is not None:
+        out["aud"] = ra.aud
+    if ra.task_id is not None:
+        out["taskId"] = ra.task_id
+    if ra.time_source is not None:
+        out["timeSource"] = ra.time_source
     if ra.sig_suite is not None:
         out["sigSuite"] = ra.sig_suite
     if ra.crypto_posture is not None:
         out["cryptoPosture"] = crypto_posture_to_dict(ra.crypto_posture)
+    if ra.completeness is not None:
+        # Rebuilt key by key rather than copied, so a caller handing in a dict
+        # with extra keys cannot smuggle unsigned-looking fields into a block
+        # that a verifier reads as authoritative.
+        out["completeness"] = {
+            "boundaryId": ra.completeness["boundaryId"],
+            "seq": ra.completeness["seq"],
+            "runningCount": ra.completeness["runningCount"],
+        }
     return out
 
 
@@ -459,8 +543,14 @@ _BACK_LINK_KEYS = frozenset(
 )
 _RECEIPT_ASSERTED_KEYS = frozenset(
     {"alg", "iat", "iss", "nonce", "secretVersion", "sub", "sigSuite",
-     "cryptoPosture"}
+     "cryptoPosture", "completeness", "aud", "taskId", "timeSource"}
 )
+
+#: The keys a completeness block may carry, and all three are required when the
+#: block is present. A partial block is refused rather than half-read, because a
+#: sequence with no boundary id names no population and a boundary id with no
+#: sequence proves nothing.
+_COMPLETENESS_KEYS = frozenset({"boundaryId", "seq", "runningCount"})
 _OUTCOME_KEYS = frozenset(
     {"status", "completedAt", "resultCommitment", "decisionDigest"}
 )
@@ -502,6 +592,25 @@ def receipt_asserted_from_dict(d: dict[str, Any]) -> ReceiptAsserted:
                 "receiptAsserted.cryptoPosture must be an object or absent"
             )
         crypto_posture = crypto_posture_from_dict(crypto_posture_raw)
+    completeness = _completeness_from_dict(d.get("completeness"))
+    aud = d.get("aud")
+    if aud is not None and (not isinstance(aud, str) or not aud):
+        raise AttestationError("receiptAsserted.aud must be a non-empty string or absent")
+    task_id = d.get("taskId")
+    if task_id is not None and (not isinstance(task_id, str) or not task_id):
+        raise AttestationError(
+            "receiptAsserted.taskId must be a non-empty string or absent"
+        )
+    # Present-but-null is refused rather than read as absent: unknown is
+    # spelled by leaving the key out, so there is one wire form per meaning.
+    time_source = d.get("timeSource")
+    if "timeSource" in d and not (
+        isinstance(time_source, str) and time_source in TIME_SOURCES
+    ):
+        raise AttestationError(
+            f"receiptAsserted.timeSource must be one of {sorted(TIME_SOURCES)} "
+            f"or absent; got {time_source!r}"
+        )
     return ReceiptAsserted(
         alg=d["alg"],
         iat=d["iat"],
@@ -511,7 +620,52 @@ def receipt_asserted_from_dict(d: dict[str, Any]) -> ReceiptAsserted:
         sub=d["sub"],
         sig_suite=sig_suite,
         crypto_posture=crypto_posture,
+        completeness=completeness,
+        aud=aud,
+        task_id=task_id,
+        time_source=time_source,
     )
+
+
+def _completeness_from_dict(raw: Any) -> Optional[dict[str, Any]]:
+    """Validate a completeness block, or refuse it.
+
+    Strict on purpose. This block is the thing a holder counts on to tell a
+    dropped receipt from an action that never ran, so a malformed one has to
+    fail loudly instead of being read as a smaller population.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise AttestationError(
+            "receiptAsserted.completeness must be an object or absent"
+        )
+    _reject_unknown_keys(raw, _COMPLETENESS_KEYS, "receiptAsserted.completeness")
+    for required in ("boundaryId", "seq", "runningCount"):
+        if required not in raw:
+            raise AttestationError(
+                f"receiptAsserted.completeness missing required field {required!r}"
+            )
+    boundary = raw["boundaryId"]
+    if not isinstance(boundary, str) or not boundary:
+        raise AttestationError(
+            "receiptAsserted.completeness.boundaryId must be a non-empty string"
+        )
+    seq, running = raw["seq"], raw["runningCount"]
+    # bool is a subclass of int, and True would otherwise pass as seq 1.
+    for name, value in (("seq", seq), ("runningCount", running)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise AttestationError(
+                f"receiptAsserted.completeness.{name} must be an integer"
+            )
+    if seq < 0:
+        raise AttestationError("receiptAsserted.completeness.seq must not be negative")
+    if running != seq + 1:
+        raise AttestationError(
+            "receiptAsserted.completeness.runningCount must equal seq + 1, "
+            f"got seq={seq} runningCount={running}"
+        )
+    return {"boundaryId": boundary, "seq": seq, "runningCount": running}
 
 
 def outcome_from_dict(d: dict[str, Any]) -> OutcomeDerived:
@@ -541,6 +695,22 @@ def outcome_from_dict(d: dict[str, Any]) -> OutcomeDerived:
     )
 
 
+#: The one envelope version this library reads. A later version may change the
+#: signed member set or the canonicalization, so an unknown version is refused
+#: rather than parsed under v1 rules and reported as verified.
+ENVELOPE_VERSION = 1
+
+
+def require_envelope_version(value: Any, where: str) -> None:
+    # bool is an int subclass; True must not pass as version 1, and a JSON
+    # 1.0 arrives as a float that compares equal to 1 and is not the integer
+    # the envelope names.
+    if type(value) is not int or value != ENVELOPE_VERSION:
+        raise AttestationError(
+            f"{where} version MUST be {ENVELOPE_VERSION}; got {value!r}"
+        )
+
+
 def receipt_from_dict(d: dict[str, Any]) -> ExecutionReceipt:
     """Reconstruct an ExecutionReceipt from its wire JSON dict.
 
@@ -555,6 +725,7 @@ def receipt_from_dict(d: dict[str, Any]) -> ExecutionReceipt:
     ):
         if required not in d:
             raise AttestationError(f"receipt missing required field {required!r}")
+    require_envelope_version(d["version"], "receipt")
     if d["alg"] not in VALID_ALGS:
         raise AttestationError(f"unsupported alg {d['alg']!r}")
     pq_raw = d.get("pqSignature")

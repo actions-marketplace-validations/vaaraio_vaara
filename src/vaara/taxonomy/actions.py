@@ -139,6 +139,12 @@ class ActionRequest:
     sequence_position: int = 0  # Position in current action sequence
     timestamp_utc: str = ""
     tenant_id: str = ""  # v0.40 multi-tenant scope; "" = single-tenant
+    # Agents this action may hand work to; None = names nobody (unbound)
+    delegatees: Optional[tuple[str, ...]] = None
+    # The capability grant this action runs under, as wire objects
+    # ({"arg", "op", "value"}); None = no grant. Recorded so a child can be
+    # attenuation-checked against it from the trail, in any process.
+    capabilities: Optional[tuple[dict, ...]] = None
 
     def to_policy_context(self) -> dict:
         """Convert to a plain dict of policy-evaluation fields.
@@ -153,6 +159,7 @@ class ActionRequest:
             "agent_id": self.agent_id,
             "tool_name": self.tool_name,
             "action_type": self.action_type.category.value,
+            "action_name": self.action_type.name,
             "reversibility": self.action_type.reversibility.value,
             "blast_radius": self.action_type.blast_radius.value,
             "urgency": self.action_type.urgency.value,
@@ -425,19 +432,20 @@ BUILTIN_ACTIONS = [
     # Data
     ActionType("data.read", ActionCategory.DATA, Reversibility.FULLY,
                BlastRadius.SELF, UrgencyClass.DEFERRABLE,
-               frozenset({RegulatoryDomain.GDPR}),
+               frozenset({RegulatoryDomain.GDPR, RegulatoryDomain.SOC2}),
                "Read data from storage"),
     ActionType("data.write", ActionCategory.DATA, Reversibility.PARTIALLY,
                BlastRadius.LOCAL, UrgencyClass.DEFERRABLE,
-               frozenset({RegulatoryDomain.GDPR}),
+               frozenset({RegulatoryDomain.GDPR, RegulatoryDomain.SOC2}),
                "Write data to storage"),
     ActionType("data.delete", ActionCategory.DATA, Reversibility.IRREVERSIBLE,
                BlastRadius.SHARED, UrgencyClass.DEFERRABLE,
-               frozenset({RegulatoryDomain.GDPR}),
+               frozenset({RegulatoryDomain.GDPR, RegulatoryDomain.SOC2}),
                "Delete data permanently"),
     ActionType("data.export", ActionCategory.DATA, Reversibility.IRREVERSIBLE,
                BlastRadius.GLOBAL, UrgencyClass.DEFERRABLE,
-               frozenset({RegulatoryDomain.GDPR, RegulatoryDomain.HIPAA}),
+               frozenset({RegulatoryDomain.GDPR, RegulatoryDomain.HIPAA,
+                          RegulatoryDomain.SOC2}),
                "Export data to external system"),
 
     # Communication
@@ -454,18 +462,18 @@ BUILTIN_ACTIONS = [
     # Infrastructure
     ActionType("infra.deploy", ActionCategory.INFRASTRUCTURE, Reversibility.PARTIALLY,
                BlastRadius.SHARED, UrgencyClass.TIMELY,
-               frozenset({RegulatoryDomain.NIS2}),
+               frozenset({RegulatoryDomain.NIS2, RegulatoryDomain.SOC2}),
                "Deploy code or configuration"),
     ActionType("infra.config_change", ActionCategory.INFRASTRUCTURE, Reversibility.PARTIALLY,
                BlastRadius.SHARED, UrgencyClass.DEFERRABLE,
-               frozenset({RegulatoryDomain.NIS2}),
+               frozenset({RegulatoryDomain.NIS2, RegulatoryDomain.SOC2}),
                "Modify system configuration"),
     ActionType("infra.scale", ActionCategory.INFRASTRUCTURE, Reversibility.FULLY,
                BlastRadius.SHARED, UrgencyClass.TIMELY,
                frozenset(), "Scale resources up or down"),
     ActionType("infra.terminate", ActionCategory.INFRASTRUCTURE, Reversibility.IRREVERSIBLE,
                BlastRadius.SHARED, UrgencyClass.IMMEDIATE,
-               frozenset({RegulatoryDomain.NIS2}),
+               frozenset({RegulatoryDomain.NIS2, RegulatoryDomain.SOC2}),
                "Terminate process or resource"),
 
     # Identity

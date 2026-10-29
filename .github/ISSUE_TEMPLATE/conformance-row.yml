@@ -61,6 +61,23 @@ body:
       placeholder: "9 of 9 and 8 of 8, including the tampered-proof and forked-root negatives"
     validations:
       required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind of run
+      description: >
+        What your run establishes, which is a property of who wrote the
+        verifier and who wrote the vectors, not of how well it went. These are
+        not degrees of the same thing. Naming one is required, so a new row
+        cannot arrive without a kind. Rows filed before this field existed read
+        as the first one, because that is the weakest claim available.
+      options:
+        - "Reproduction: the author's checkers over the author's vectors"
+        - "Construction reproduction: a published construction derived from its prose alone, without running the author's verifier"
+        - "Independent implementation from the text, run against the author's vectors"
+        - "Independent implementation run against independently constructed vectors"
+    validations:
+      required: true
   - type: textarea
     id: scoping
     attributes:
@@ -84,6 +101,19 @@ body:
       placeholder: "https://mailarchive.ietf.org/arch/msg/..."
     validations:
       required: true
+  - type: textarea
+    id: prior-art
+    attributes:
+      label: Prior art
+      description: >
+        Optional. If the phenomenon your run turns on is already on the public
+        record, cite it here, and say what is new to this register rather than
+        what is new to the world. A row that names its prior art is stronger
+        than one that does not, because a reader can tell the difference
+        between finding something and being the first to raise it here.
+      placeholder: "draft-example-00 Section 6.2.1, or a paper, or a prior issue"
+    validations:
+      required: false
   - type: markdown
     attributes:
       value: |
@@ -93,20 +123,40 @@ body:
 
         The page at vaara.io/conformance.html is public and indexed. A row
         carries the name you gave above, your affiliation if you gave one, the
-        suites, the commit, the result, your scoping quoted as you wrote it,
-        and a link to your public record.
+        suites, the commit, the result, the kind of run, your scoping quoted as
+        you wrote it, and a link to your public record.
 
         **A row is permanent. It does not come down, and asking will not take
         it down.** This is a record of something that happened, not a list of
         current members. Your run happened on a date at a commit, and that does
         not stop being true later, so the entry does not stop existing later.
 
-        The maintainer cannot remove it either. Rows are chained, each one
-        carrying the digest of the row before it, so deleting or reordering an
-        entry breaks every digest after it and anybody can see the break with
-        `python scripts/vcr_chain.py`. That constraint is the reason the table
-        is worth reading: one its owner could quietly edit would just be the
-        owner's opinion.
+        Rows are chained, each one carrying the digest of the row before it, so
+        removing or reordering an entry changes every digest after it, and you
+        can recompute the whole chain with `python scripts/vcr_chain.py`.
+
+        **What the chain gives, and what it does not.** Rewriting or reordering
+        a published row changes every digest after it, and anyone recomputing
+        sees the break. Removing rows from the *end* is a different thing: what
+        remains is a perfectly valid shorter chain, and a reader holding only
+        the file cannot tell. So removal is detectable relative to a retained
+        head. Saying the maintainer "cannot" remove a row was an overclaim, and
+        it sat here, in the form you are consenting through.
+
+        `vcr_chain.py` now reports whether the tail is pinned on every run, and
+        carries `tailPinned` in its JSON, so nothing reading the result can take
+        *verified* for *verified to be complete*. If you keep your own copy of
+        the head, `--expect-count` and `--expect-last-hash` pin it, and a
+        mismatch fails the same way a break in the middle does.
+
+        So each published head is also recorded in a public transparency log the
+        maintainer does not operate. A rewritten chain reaches a head that
+        matches no witnessed entry, and you check that against the log rather
+        than against our word. `python scripts/vcr_chain.py --check-witness`
+        does it for you.
+
+        The residual is narrow and real: a row added after the last witnessing
+        carries only the chain until the next head is published.
 
         Nothing is edited after the fact either. A correction is a new row that
         refers to the earlier one.
@@ -139,7 +189,8 @@ body:
           required: true
         - label: >
             I understand the row is permanent, that asking will not remove it,
-            and that the maintainer cannot remove it either.
+            and that removal by the maintainer is detectable against a witnessed
+            head rather than impossible.
           required: true
         - label: >
             The link I gave is my own public record of this run, and the result

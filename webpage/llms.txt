@@ -1,6 +1,30 @@
 # Vaara
 
-> Tamper-evident runtime evidence layer for AI agents. Covers EU AI Act compliance and any case where you need to prove what an agent actually did. Open source, no SaaS, no telemetry.
+> Vaara checks every action that software takes on its own against the operator's rules before it happens, holds the unusual ones for a person, refuses the rest, and leaves a signed receipt for each decision that anyone can verify later, offline, without trusting the operator or Vaara. AI agents are one case. Open source (AGPL-3.0), runs on your own machines, no telemetry. Built in Finland.
+
+## Pages
+
+- [Vaara: software that acts on its own, inside your rules](https://vaara.io/): Vaara checks every action that software takes on its own against your rules before it happens, and leaves a receipt anyone can check later. Open source, runs on your own machines.
+- [Sectors | Vaara](https://vaara.io/sectors/): Vaara by sector (Care and social services; Payments and finance; Public sector; Healthcare; Energy, industry and infrastructure; Software teams): what you can do, what you are saved from, what it costs and what it saves.
+- [Care and social services | Vaara](https://vaara.io/sectors/care.html): Locked doors, medication, alarms and records written by software, with an answer for every family that asks.
+- [Payments and finance | Vaara](https://vaara.io/sectors/payments.html): Agents and automations that move money, with every payment checked against the mandate it came from.
+- [Public sector | Vaara](https://vaara.io/sectors/public.html): Automated decisions and AI assistants in public services, with records that answer a citizen and an auditor alike.
+- [Healthcare | Vaara](https://vaara.io/sectors/health.html): Clinical decision support and automation, with the approval behind each step on record.
+- [Energy, industry and infrastructure | Vaara](https://vaara.io/sectors/infrastructure.html): Automated control and maintenance actions, checked before they reach the plant, recorded for the regulator.
+- [Software teams | Vaara](https://vaara.io/sectors/software.html): Coding agents on developers' machines, governed in the agent's own hooks, with one policy across all of them.
+- [Products | Vaara](https://vaara.io/products/): What Vaara is made of: the gate, receipts, the cage, the desktop app, and the published tests you can run yourself.
+- [The gate | Vaara](https://vaara.io/products/gate.html): Checks every action against your rules before it runs.
+- [Receipts | Vaara](https://vaara.io/products/receipts.html): The proof: one signed record per decision, checkable years later without us.
+- [The cage | Vaara](https://vaara.io/products/cage.html): Choose the sandbox your agents run in, and record which one it was.
+- [The desktop app | Vaara](https://vaara.io/products/app.html): See decisions as they happen and answer the ones that need you.
+- [Test it yourself | Vaara](https://vaara.io/products/test-it-yourself.html): Run the published tests on your own machine and get the same answers we do.
+- [Under the hood, in plain words. | Vaara](https://vaara.io/under-the-hood.html): Everything technical about Vaara, translated. Each line says what the thing does for you, with the technical term underneath for your engineers.
+- [Everything Vaara publishes | Vaara](https://vaara.io/surfaces.html): Every page, record and package Vaara publishes, each in one line: independent reproductions of the conformance tests, the receipt Internet-Draft, the explorer, the packages and the documents.
+- [Receipt explorer | Vaara](https://vaara.io/verify.html): Check a Vaara receipt in your own browser, offline, or look one up in the public log. Nothing is uploaded.
+- [Conformance results | Vaara](https://vaara.io/conformance.html): Every suite, its verdict, and everyone who reproduced it in public.
+
+Every page above also exists in Finnish under https://vaara.io/fi/.
+The whole site as one plain-text file: https://vaara.io/llms-full.txt
 
 Vaara intercepts agent tool calls, scores each one with a conformal risk interval, and writes a hash-chained audit record. Online learning across five expert signals via Multiplicative Weight Update. Distribution-free conformal coverage on the score. An external auditor can verify these properties without trusting your stack.
 
@@ -12,17 +36,70 @@ Vaara is built and maintained by Henri Sirkkavaara, an independent developer in
 Finland, working on how an autonomous action can be proved to a party that has
 no reason to trust the operator. He is the sole author and copyright holder.
 
-The following are records held by other parties, not claims made on this site.
-Each is checkable at the link:
+The following are records held by other parties. Each is checkable at the link:
 
-- [draft-sirkkavaara-vaara-receipt](https://datatracker.ietf.org/doc/draft-sirkkavaara-vaara-receipt/): IETF Internet-Draft, "The Vaara Receipt: A Recomputable Receipt Format for Decisions About Autonomous Actions". An active Internet-Draft, not an RFC and not an adopted standard.
+- [draft-sirkkavaara-vaara-receipt](https://datatracker.ietf.org/doc/draft-sirkkavaara-vaara-receipt/): IETF Internet-Draft, "The Vaara Receipt: A Recomputable Receipt Format for Decisions About Autonomous Actions".
 - [OpenSSF Best Practices project 12612](https://www.bestpractices.dev/projects/12612): passing badge, externally assessed project practices.
 - [GitHub Marketplace: Vaara Policy Check](https://github.com/marketplace/actions/vaara-policy-check): published action listing.
 - [PyPI](https://pypi.org/project/vaara/) and [npm](https://www.npmjs.com/package/@vaara/client): release history under his name.
-- Participant on the IETF scitt, agentproto and rats mailing lists, where the receipt format is discussed publicly by other participants. Participation in a working group discussion is not authorship of a standard.
-- Contributor to the European Commission's Apply AI Alliance community on Futurium, writing on EU AI Act Article 12 and Article 14. A community contributor, not a Commission official or appointee.
-- Vaara appears in the industry acknowledgements of Singapore IMDA's Model AI Governance Framework for Agentic AI v1.5 (20 May 2026). An acknowledgement of the project, not an advisory role.
-- Subject of an AMD AI Developer Program testimonial (May 2026). A testimonial about his work. He is not and has never been employed by AMD.
+- Participant on the IETF scitt, agentproto and rats mailing lists, where the receipt format is discussed publicly by other participants.
+- Contributor to the European Commission's Apply AI Alliance community on Futurium, writing on EU AI Act Article 12, Article 14 and sovereign proof for the Act.
+- Vaara appears in the industry acknowledgements of Singapore IMDA's Model AI Governance Framework for Agentic AI v1.5 (20 May 2026).
+- Vaara is listed in the [OECD.AI Catalogue of Tools & Metrics](https://oecd.ai/en/catalogue/tools/vaara) for trustworthy AI.
+- Subject of an AMD AI Developer Program testimonial (May 2026).
+- Red Hat partner in the Sell With module of the Red Hat Partner Program since October 2026.
+- Listed in [Ratkaisuja Suomesta](https://ratkaisujasuomesta.fi/ratkaisu/vaara/), the catalogue of software made in Finland run by Koodia Suomesta ry.
+
+## What Vaara does
+
+Each line names the code that does it in https://github.com/vaaraio/vaara.
+
+- Enforcement: every agent tool call and model call is checked against the organisation's policy and allowed, held for a human, or denied before it runs. A call that cannot be scored or recorded is refused. `src/vaara/pipeline.py`, `src/vaara/deny_rules.py`
+- Where it runs: MCP proxy (`integrations/mcp_proxy.py`), model and LLM API proxies (`integrations/infer_proxy.py`, `integrations/llm_proxy.py`), Claude Code hook layer (`integrations/claude_code_hooks.py`), shell proxy (`vaara proxy-shell`), whole-machine install (`vaara init`).
+- Human oversight, EU AI Act Article 14: held calls go to a review queue with their risk interval and signals, and the approval or refusal is recorded. `audit/review_queue.py`
+- Identity and delegated authority: a short-lived scoped credential per allowed call, and a delegated agent never holds more authority than the agent that delegated to it. W3C Verifiable Credential and DID identity binding. `credential/gateway.py`, `attestation/_receipt_vc.py`
+- The record: signed, hash-chained and recomputable from its bytes. An auditor, regulator or counterparty verifies it offline with no Vaara software.
+- Time and witness anchors: RFC 3161 timestamps, self-hosted or eIDAS qualified (validated by the EC DSS as PASSED QTSA); RFC 9162 transparency log and SCITT-compatible COSE receipts; TPM 2.0 hardware binding; AMD SEV-SNP attestation (experimental). `audit/receipt_anchor.py`, `attestation/`
+- Post-quantum signatures and zero-knowledge attribute proofs. `attestation/_receipt_pq.py`, `attestation/zk/`
+- Regulatory coverage: EU AI Act Article 12 record-keeping export, Article 14 human oversight, Article 50 transparency disclosures, Article 73 serious-incident report; DORA Articles 9, 10 and 13; GDPR Chapter V data locality and Article 17 erasure; eIDAS 2.0 qualified electronic ledger profile; W3C PROV export. `audit/`, `compliance/`, `docs/COMPLIANCE.md`
+- Threat mappings: OWASP Top 10 for Agentic Applications 2026 (`docs/OWASP_AGENTIC.md`), MITRE ATLAS (`tests/vectors/atlas_threat_v0/`), MIT AI Risk Repository (`docs/mit_ai_risk_repository_mapping.md`).
+- Payment rails: accountability bindings for x402, Google AP2, Visa TAP and the Agentic Commerce Protocol, each with conformance vectors in `tests/vectors/`.
+- Packages and deployment: Python (`pip install vaara`), TypeScript client (`@vaara/client` on npm), Helm chart (`deploy/helm/vaara`), GitHub Action (Vaara Policy Check on the GitHub Marketplace).
+
+<!-- generated: conformance register, by scripts/stamp_site.py -->
+## Conformance results
+
+Vaara publishes a results register: every conformance suite, its verdict,
+and every party other than the maintainer who ran the checkers and reported
+the outcome in public. Each suite ships an independent checker that imports
+no Vaara code and recomputes its verdicts from the bytes of its own case
+files, so a stranger can disagree with an expected result and show their work.
+
+- [Conformance results](https://vaara.io/conformance.html): the register as a page, generated from the runner's own report
+- [conformance.json](https://vaara.io/conformance.json): the same register as one machine-readable file
+- [Row request form](https://github.com/vaaraio/vaara/issues/new?template=conformance-row.yml): open to anyone who ran the checkers, free, no approval step
+- Concept DOI for the corpus: [10.5281/zenodo.22027975](https://doi.org/10.5281/zenodo.22027975)
+
+What a row is, stated exactly. It records that a named party ran the checkers
+at a commit on a date and said so somewhere public. It is not a certification,
+it does not say Vaara is compliant with anything, and it does not say the party
+endorses Vaara. The vectors are Vaara's own and no ratification body stands
+behind them, which is a real limit on any neutrality claim. Rows are permanent
+and chained, and each published head is recorded in a public transparency log
+the maintainer does not operate.
+
+Every row names what kind of run it was, because what a run establishes is a
+property of who wrote the verifier and who wrote the vectors rather than of how
+well the run went. A reproduction is the author's checkers over the author's
+vectors. An independent implementation from the text, run against the author's
+vectors, establishes something about the text. An independent implementation run
+against independently constructed vectors establishes something about both. A row
+that does not name its kind reads as the first, the weakest of the three.
+
+No independent reproduction is recorded yet. A row appears when someone
+other than the maintainer runs the checkers, reports the result somewhere
+public, and asks to be listed.
+<!-- end generated -->
 
 ## Repo and packages
 - [GitHub source](https://github.com/vaaraio/vaara): code, releases, issue tracker
@@ -31,6 +108,8 @@ Each is checkable at the link:
 
 ## Docs
 - [README](https://github.com/vaaraio/vaara/blob/main/README.md): install, quick start, evidence specimen, integrations
+- [What Vaara does](https://github.com/vaaraio/vaara/blob/main/docs/capabilities.md): every capability by area, each entry naming the code that implements it
+- [Prior art](https://github.com/vaaraio/vaara/blob/main/docs/PRIOR_ART.md): when each concept first shipped in a tagged public release
 - [AGENTS.md](https://github.com/vaaraio/vaara/blob/main/AGENTS.md): instructions for coding agents integrating or contributing to Vaara
 - [Prove it yourself](https://github.com/vaaraio/vaara/tree/main/examples/prove-it-yourself): one runnable file; produce a signed hash-chained trail, verify it offline, watch a forged byte get caught
 - [How to prove what an AI agent did](https://github.com/vaaraio/vaara/blob/main/docs/prove-what-an-ai-agent-did.md): the four properties a provable record needs and how verification works
@@ -41,6 +120,7 @@ Each is checkable at the link:
 - [Vaara vs observability vs GRC](https://github.com/vaaraio/vaara/blob/main/docs/vaara-vs-observability-vs-grc.md): three different questions; comparison table and how they stack
 - [Our marketing runs under the gate](https://github.com/vaaraio/vaara/tree/main/docs/dogfood): the signed trail of Vaara's own marketing pipeline, with the policy and public key to verify it offline
 - [COMPLIANCE.md](https://github.com/vaaraio/vaara/blob/main/docs/COMPLIANCE.md): EU AI Act (Art. 9, 11 to 15, 61) and DORA (Art. 10, 12, 13) article-level mapping
+- [EU Product Liability Directive 2024/2853](https://github.com/vaaraio/vaara/blob/main/docs/COMPLIANCE.md#eu-product-liability-directive-20242853): applies to software and AI systems from 9 December 2026; Article 9 disclosure order and Article 10 presumption of defect when evidence cannot be produced, and what a receipt supplies for that
 - [Formal specification](https://github.com/vaaraio/vaara/blob/main/docs/formal_specification.md): MWU regret bound O(sqrt(T log N)), conformal coverage, security properties
 - [vaara-bench-v1](https://github.com/vaaraio/vaara/blob/main/bench/vaara-bench-v1.md): 77-trace synthetic benchmark, frozen methodology
 - [CHANGELOG](https://github.com/vaaraio/vaara/blob/main/CHANGELOG.md): version-by-version evolution
@@ -53,14 +133,15 @@ Each is checkable at the link:
 - OVERT 1.0 emitter, verifier CLI, S3P (MEA-2) emitter with Clopper-Pearson intervals, experimental AMD SEV-SNP TEE attestation hook
 
 ## Numbers
-- 12,155-entry adversarial corpus (250 hand-curated + 11,905 LLM-generated), 70/15/15 split stratified by (category, source)
-- Classifier v9 (236 hand-features + 384-dim MiniLM embeddings) at calibrated threshold 0.9150: held-out TEST recall 84.7% [82.4, 86.7] at FPR 4.1% [2.9, 5.7], n=1,827
-- Cross-model held-out recall 66.8% [64.9, 68.7] over n=2,277 with no eval-set attacker model in TRAIN; weakest sub-cell (data_exfil, closed-weight) 38.9% [35.3, 42.5]
-- BIPIA-pressure FPR on benign tool calls 1.2% [0.4, 3.6] across four agent backends
-- Multi-attacker PAIR ASR 0/25 per attacker across Qwen2.5-32B, Qwen2.5-72B, Llama-3.3-70B at identical seeds
-- 140 µs mean / 210 µs p99 for the hot-path rule scorer, commodity CPU; the MiniLM classifier is opt-in (`vaara[ml]`) and not in that path
+- 25,556-entry adversarial corpus (250 hand-curated + 25,306 LLM-generated), split leak-free by (category, generation batch) cell
+- Classifier v11 (254 hand-features + 384-dim MiniLM embeddings) at threshold 0.8800 on held-out TEST n=1,827: recall 85.6% [83.4, 87.6] at FPR 5.1% [3.8, 6.9]
+- Cross-model held-out recall 86.3% over n=5,600, against attacks written by Qwen2.5-72B, a model absent from TRAIN
+- BIPIA-pressure FPR on benign tool calls 0.0% [0.0, 0.5]: none of 704 calls flagged across four agent backends
+- Multi-attacker PAIR robustness, measured on v0.31: 0/25 successes per attacker across Qwen2.5-32B, Qwen2.5-72B, Llama-3.3-70B at identical seeds
+- 140 µs mean per call for the hot-path rule scorer on commodity CPU; the MiniLM classifier is opt-in (`vaara[ml]`) and not in that path
 
 ## Optional
 - [Article 14 runtime](https://futurium.ec.europa.eu/ga/apply-ai-alliance/community-content/article-14-runtime-why-oversight-agentic-ai-has-be-evidenced-action-not-model): position post on EU Apply AI Alliance Futurium
+- [Article 12 and the difference between a log and evidence](https://futurium.ec.europa.eu/en/apply-ai-alliance/community-content/article-12-and-difference-between-log-and-evidence): companion position post on EU Apply AI Alliance Futurium
+- [Sovereign proof for the AI Act](https://futurium.ec.europa.eu/en/apply-ai-alliance/community-content/sovereign-proof-ai-act): position post on EU Apply AI Alliance Futurium
 - [OVERT 1.0 spec](https://overt.is/): open runtime-trust standard Vaara implements as Arbiter
-- [Microsoft Agent Governance Toolkit](https://github.com/microsoft/agent-governance-toolkit): broader agent-governance reference (zero-trust identity, capability-based access control)

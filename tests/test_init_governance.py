@@ -2,26 +2,35 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
+import pytest
+
+from vaara.integrations import _hook_gate
 from vaara.integrations import init_governance as ig
 
 
 def _read(path: Path) -> dict:
-    return json.loads(path.read_text())
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 # --- Claude Code hooks -----------------------------------------------------
 
 
-def test_write_claude_hooks_creates_all_three_events(tmp_path):
+def test_write_claude_hooks_creates_every_event(tmp_path):
     settings = tmp_path / "settings.json"
     changed = ig.write_claude_hooks(settings, "/usr/bin/vaara")
     assert changed is True
     hooks = _read(settings)["hooks"]
-    assert set(hooks) == {"SessionStart", "PreToolUse", "PostToolUse"}
+    assert set(hooks) == {"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
+                          "PostToolUseFailure", "PermissionDenied"}
+    assert hooks["UserPromptSubmit"][0]["hooks"][0]["command"].endswith(
+        "hook user-prompt-submit")
+    assert "matcher" not in hooks["UserPromptSubmit"][0]
     cmd = hooks["PreToolUse"][0]["hooks"][0]["command"]
-    assert cmd == "/usr/bin/vaara hook pre-tool-use"
+    assert cmd == _hook_gate.pre_command("/usr/bin/vaara")
+    assert hooks["PreToolUse"][0]["hooks"][0]["timeout"] == _hook_gate.HOST_TIMEOUT
     assert hooks["PreToolUse"][0]["matcher"] == ig.HOOK_MATCHER
     # SessionStart has no matcher.
     assert "matcher" not in hooks["SessionStart"][0]
@@ -65,7 +74,7 @@ def test_write_claude_hooks_preserves_foreign_hooks_and_settings(tmp_path):
         for h in group["hooks"]
     ]
     assert "/opt/other-tool run" in commands
-    assert "/usr/bin/vaara hook pre-tool-use" in commands
+    assert _hook_gate.pre_command("/usr/bin/vaara") in commands
 
 
 def test_rewriting_with_new_binary_path_does_not_duplicate(tmp_path):
@@ -75,7 +84,7 @@ def test_rewriting_with_new_binary_path_does_not_duplicate(tmp_path):
     hooks = _read(settings)["hooks"]
     commands = [h["command"] for h in hooks["PreToolUse"][0]["hooks"]]
     # Old entry stripped, only the new one remains.
-    assert commands == ["/new/vaara hook pre-tool-use"]
+    assert commands == [_hook_gate.pre_command("/new/vaara")]
 
 
 def test_remove_claude_hooks_leaves_foreign_hooks(tmp_path):
@@ -121,7 +130,7 @@ def test_write_hook_config_merges_audit_db(tmp_path):
     ig.write_hook_config(config, tmp_path / "trail" / "audit.db")
     data = _read(config)
     assert data["mode"] == "watch"  # preserved
-    assert data["audit_db"].endswith("trail/audit.db")
+    assert Path(data["audit_db"]).as_posix().endswith("trail/audit.db")
 
 
 # --- MCP govern / restore --------------------------------------------------
@@ -149,15 +158,15 @@ def test_govern_mcp_rewrites_naked_server(tmp_path):
 
 def test_govern_mcp_writes_backup_once(tmp_path):
     config = _mcp_config(tmp_path, {"fs": {"command": "npx"}})
-    original = config.read_text()
+    original = config.read_text(encoding="utf-8")
     trail = tmp_path / "audit.db"
     ig.govern_mcp_config(config, "/usr/bin/vaara-mcp-proxy", trail)
     backup = config.with_name(config.name + ".vaara-backup")
     assert backup.exists()
-    assert backup.read_text() == original
+    assert backup.read_text(encoding="utf-8") == original
     # Second govern must not overwrite the pristine backup.
     ig.govern_mcp_config(config, "/usr/bin/vaara-mcp-proxy", trail)
-    assert backup.read_text() == original
+    assert backup.read_text(encoding="utf-8") == original
 
 
 def test_govern_mcp_skips_already_governed(tmp_path):
@@ -170,11 +179,11 @@ def test_govern_mcp_skips_already_governed(tmp_path):
 
 def test_restore_mcp_config_recovers_original(tmp_path):
     config = _mcp_config(tmp_path, {"fs": {"command": "npx"}})
-    original = config.read_text()
+    original = config.read_text(encoding="utf-8")
     ig.govern_mcp_config(config, "/usr/bin/vaara-mcp-proxy", tmp_path / "a.db")
-    assert config.read_text() != original
+    assert config.read_text(encoding="utf-8") != original
     assert ig.restore_mcp_config(config) is True
-    assert config.read_text() == original
+    assert config.read_text(encoding="utf-8") == original
 
 
 def test_restore_mcp_config_no_backup(tmp_path):
@@ -207,7 +216,7 @@ def test_run_init_and_ungovern_roundtrip(tmp_path, monkeypatch):
     trail = tmp_path / "trail" / "audit.db"
 
     mcp = _mcp_config(tmp_path, {"fs": {"command": "npx"}})
-    original_mcp = mcp.read_text()
+    original_mcp = mcp.read_text(encoding="utf-8")
     monkeypatch.setattr(ig, "KNOWN_MCP_CLIENTS", [("Test", str(mcp))])
     # Pretend the proxy is installed so MCP rewrite runs.
     monkeypatch.setattr(ig.shutil, "which",
@@ -227,7 +236,7 @@ def test_run_init_and_ungovern_roundtrip(tmp_path, monkeypatch):
     assert ung.hooks_changed is True
     assert ung.mcp_restored == ["Test"]
     assert "hooks" not in _read(settings)
-    assert mcp.read_text() == original_mcp
+    assert mcp.read_text(encoding="utf-8") == original_mcp
 
 
 def test_run_init_warns_when_proxy_missing(tmp_path, monkeypatch):
@@ -244,9 +253,10 @@ def test_run_init_warns_when_proxy_missing(tmp_path, monkeypatch):
     assert any("vaara-mcp-proxy not found" in w for w in report.warnings)
     assert report.mcp_rewritten == {}
     # MCP config left untouched.
-    assert "vaara-mcp-proxy" not in mcp.read_text()
+    assert "vaara-mcp-proxy" not in mcp.read_text(encoding="utf-8")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="a systemd unit is written on Linux only")
 def test_run_init_installs_proxy_service_when_asked(tmp_path, monkeypatch):
     from vaara.integrations import proxy_service as ps
     settings = tmp_path / "settings.json"
@@ -267,7 +277,7 @@ def test_run_init_installs_proxy_service_when_asked(tmp_path, monkeypatch):
     assert unit.exists()
     assert ["systemctl", "--user", "enable", "--now", ps.SYSTEMD_UNIT] in calls
     # trail path is threaded into the unit
-    assert str(tmp_path / "trail" / "audit.db") in unit.read_text()
+    assert str(tmp_path / "trail" / "audit.db") in unit.read_text(encoding="utf-8")
 
 
 def test_run_init_without_flag_installs_no_service(tmp_path, monkeypatch):
@@ -345,6 +355,7 @@ def test_cli_ungovern_reports_service_removed(monkeypatch, capsys):
 # --- Enforce mode threaded through init to the installed service ------------
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="a systemd unit is written on Linux only")
 def test_run_init_proxy_enforce_threads_gate_flags_into_unit(tmp_path, monkeypatch):
     from vaara.integrations import proxy_service as ps
     monkeypatch.setattr(ig, "KNOWN_MCP_CLIENTS", [])
@@ -361,7 +372,7 @@ def test_run_init_proxy_enforce_threads_gate_flags_into_unit(tmp_path, monkeypat
         service_home=tmp_path, service_system="linux",
         service_runner=lambda cmd, **kw: None,
     )
-    text = ps.unit_path("linux", tmp_path).read_text()
+    text = ps.unit_path("linux", tmp_path).read_text(encoding="utf-8")
     assert report.service_path is not None
     assert "--enforce" in text
     assert "--allow mcp__github__*" in text

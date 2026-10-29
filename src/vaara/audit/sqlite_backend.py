@@ -21,6 +21,7 @@ posing a risk.  SQLite's ACID guarantees that no event is silently lost.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -29,15 +30,23 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from vaara.audit.trail import AuditRecord, AuditTrail, EventType
-from vaara.auth import APIKey, Role, _hash_key, generate_api_key
+from vaara.audit.trail import (
+    AuditRecord,
+    AuditTrail,
+    ChainVerdict,
+    EventType,
+    _GapLedger,
+    erasure_pointer,
+    stored_event_type,
+)
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # How many individual corrupt rows get a detailed log line before the rest
 # collapse into a single count. A trail damaged by an older writer holds tens
@@ -139,7 +148,7 @@ def _fstype_for(path: Path) -> Optional[str]:
     than pretending to a coverage it does not have.
     """
     try:
-        raw = _PROC_MOUNTS.read_text()
+        raw = _PROC_MOUNTS.read_text(encoding="utf-8")
     except OSError:
         return None
 
@@ -192,6 +201,63 @@ def _journal_mode_for(db_path: Path, in_memory: bool = False) -> str:
         return "delete"
     return "wal"
 
+
+def journal_mode_warning(db_path: Any) -> Optional[str]:
+    """``None`` when this trail's journal mode is safe on its filesystem.
+
+    Asks the question the backend cannot answer from inside a hook process.
+    ``_set_journal_mode`` gives up after half a second of retries and keeps
+    whatever mode the file is in, reporting that through ``logger``, which
+    from a hook reaches nobody: the hook is a fresh process per tool call
+    with no logging configured and its stderr read as tool noise. So a trail
+    could run WAL on a filesystem that corrupts it with nothing saying so.
+
+    Deliberately phrased as "is the file in WAL on a WAL-unsafe mount",
+    not "did the conversion fail". That catches the same hazard from the
+    other direction too: an operator who set ``VAARA_TRAIL_JOURNAL_MODE=wal``
+    on a virtiofs or NFS mount gets the mode they asked for, and it is still
+    the mode that eats the evidence.
+
+    Read-only and cheap. It opens nothing it does not close, and it never
+    raises: a check on the trail's health must not become the reason a
+    session fails.
+    """
+    if db_path is None:
+        return None
+    text = str(db_path)
+    if not text or text == ":memory:" or text.startswith("file::memory:"):
+        return None
+
+    try:
+        path = Path(text).expanduser()
+        if not path.is_file():
+            return None
+        fstype = _fstype_for(path.resolve())
+        if not _is_wal_unsafe(fstype):
+            return None
+        uri = f"{path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+    except (OSError, ValueError, sqlite3.Error):
+        # Unreadable is a different fault with its own report. Saying
+        # nothing here leaves that one the only message, which is correct.
+        return None
+
+    try:
+        row = conn.execute("PRAGMA journal_mode").fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+    actual = str(row[0]).lower() if row else ""
+    if actual != "wal":
+        return None
+    return (
+        f"it is in WAL journal mode on a {fstype} filesystem. WAL needs "
+        "shared memory that filesystem cannot provide, so the trail can "
+        "corrupt and take the records with it"
+    )
+
 # Schema v2 — full DDL for fresh databases.
 # Migrations for v1 to v2 upgrades are in _MIGRATIONS below.
 SCHEMA_SQL = """
@@ -236,26 +302,9 @@ CREATE INDEX IF NOT EXISTS idx_tenant_id   ON audit_records(tenant_id);
 -- append scanned the whole table and built a temp B-tree to sort it, so the
 -- cost of writing one record grew with the number of records already there:
 -- 0.12 ms on an empty trail, 4.7 ms at 10k, 16 ms at 31k. With it, 0.13 ms
--- at 31k and flat.
-CREATE INDEX IF NOT EXISTS idx_seq         ON audit_records(seq);
-
--- GDPR Article 17 (Right to Erasure) redaction table.
-CREATE TABLE IF NOT EXISTS gdpr_redactions (
-    original_id  TEXT PRIMARY KEY,
-    replacement  TEXT NOT NULL DEFAULT '[REDACTED:GDPR-Art17]',
-    redacted_at  REAL NOT NULL
-);
-
--- API key store for role-based access control.
--- Plaintext keys are never stored — only PBKDF2-SHA256 hashes.
-CREATE TABLE IF NOT EXISTS api_keys (
-    key_id       TEXT PRIMARY KEY,
-    name         TEXT NOT NULL,
-    role         TEXT NOT NULL,
-    key_hash     TEXT NOT NULL UNIQUE,
-    created_at   REAL NOT NULL,
-    last_used_at REAL
-);
+-- at 31k and flat. UNIQUE since v7: a second record at one seq is a fork,
+-- so it fails the write instead (_constrain_seq).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_seq  ON audit_records(seq);
 
 -- Pending outcomes for cross-process tracking (v1.57.3).
 -- Allows vaara outcome to work across separate processes.
@@ -276,19 +325,6 @@ _MIGRATIONS: dict[int, str] = {
     1: """
     ALTER TABLE audit_records ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';
     CREATE INDEX IF NOT EXISTS idx_tenant_id ON audit_records(tenant_id);
-    CREATE TABLE IF NOT EXISTS gdpr_redactions (
-        original_id  TEXT PRIMARY KEY,
-        replacement  TEXT NOT NULL DEFAULT '[REDACTED:GDPR-Art17]',
-        redacted_at  REAL NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS api_keys (
-        key_id       TEXT PRIMARY KEY,
-        name         TEXT NOT NULL,
-        role         TEXT NOT NULL,
-        key_hash     TEXT NOT NULL UNIQUE,
-        created_at   REAL NOT NULL,
-        last_used_at REAL
-    );
     """,
     # v2 to v3: prEN ISO/IEC 12792 transparency taxonomy (item 1, v0.6).
     # Nullable columns. Pre-v0.6 records get NULL — their stored
@@ -340,6 +376,463 @@ class AuditBackendUnreadable(RuntimeError):
     """
 
 
+class RotationBoundaryError(ValueError):
+    """The records a rotation would purge are not a prefix of one unbroken chain."""
+
+
+@dataclass(frozen=True)
+class RotationBoundary:
+    """The prefix of the chain a retention rotation purges, fixed before it runs.
+
+    ``through_seq`` is the last record the purge removes: every record up to
+    it is older than ``cutoff``. ``last_hash`` is that record's hash, the one
+    the first survivor links to, so a rotation record can name it before the
+    purge happens. ``count`` is how many records go.
+    """
+
+    cutoff: float
+    through_seq: int
+    last_hash: str
+    count: int
+
+
+@dataclass
+class TrailRepair:
+    """What ``repair_trail_file`` did to one trail, and what it could not keep.
+
+    ``method`` is the step that left the file reading clean: ``"clean"`` when
+    nothing was wrong, ``"reindex"`` when rebuilding the indexes was enough
+    (no record is touched by that), ``"salvage"`` when rows had to be copied
+    out into a fresh file, and ``"failed"`` when no step produced a readable
+    trail and the file was left exactly where it was.
+
+    ``lost_seqs`` is exact within the range of sequence numbers that survived.
+    Records after the last readable one are named too when the damaged file's
+    ``idx_seq`` index still reads, because that index is a separate b-tree
+    that lists every seq the table held; ``tail_named`` says whether it did.
+    When it did not, records past the last readable row cannot be named.
+    ``unreadable_rowids`` counts row positions that raised on read and is an
+    upper bound, since a damaged interior page makes a whole range
+    unreachable whether or not every slot held a row.
+
+    After a salvage the fresh file's ``audit_meta`` holds ``seq_floor``, the
+    highest seq known to have existed, so the next record written, usually
+    the repair-gap declaration, takes a seq above every lost one instead of
+    reusing a lost record's number.
+    """
+
+    db: str
+    method: str
+    problem: Optional[str] = None
+    records_kept: int = 0
+    lost_seqs: list[int] = field(default_factory=list)
+    unreadable_rowids: int = 0
+    tables_damaged: list[str] = field(default_factory=list)
+    duplicate_rows: int = 0
+    damaged_copy: Optional[str] = None
+    error: Optional[str] = None
+    tail_named: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return self.method != "failed"
+
+    @property
+    def lost(self) -> bool:
+        return bool(self.lost_seqs or self.unreadable_rowids or self.tables_damaged)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "db": self.db, "method": self.method, "problem": self.problem,
+            "records_kept": self.records_kept, "lost_seqs": list(self.lost_seqs),
+            "unreadable_rowids": self.unreadable_rowids,
+            "tables_damaged": list(self.tables_damaged),
+            "duplicate_rows": self.duplicate_rows,
+            "damaged_copy": self.damaged_copy, "error": self.error,
+            "tail_named": self.tail_named,
+        }
+
+
+#: Rows read per query while salvaging. A range that raises is split in half
+#: until the rows that cannot be read are isolated one position at a time.
+_SALVAGE_CHUNK = 256
+
+#: Tables besides ``audit_records`` carried over by a salvage. ``audit_meta``
+#: is not among them: the fresh file writes its own schema version.
+_SALVAGE_SIDE_TABLES = ("pending_outcomes",)
+
+
+def _integrity_problem(conn: sqlite3.Connection) -> Optional[str]:
+    """``None`` when ``PRAGMA integrity_check`` reads clean, else what it said.
+
+    The full check, not ``quick_check``: only the full one compares each
+    index against its table, and an index out of step with the table is the
+    commonest damage these trails have taken. Repair runs after a failure or
+    by hand, never per write, so it can afford the whole-file read.
+    """
+    try:
+        rows = conn.execute("PRAGMA integrity_check(3)").fetchall()
+    except sqlite3.Error as exc:
+        return f"{type(exc).__name__}: {exc}"
+    results = [str(r[0]) for r in rows if r]
+    if not results or results == ["ok"]:
+        return None
+    return "; ".join(results)[:500]
+
+
+def _read_rows(conn: sqlite3.Connection, table: str, cols: list[str],
+               lo: int, hi: int) -> tuple[list[tuple], int]:
+    """Every row of ``table`` with rowid in ``[lo, hi]`` that can be read.
+
+    Seeks by rowid, which walks the table b-tree and never an index, so index
+    damage cannot hide a row here. A range that raises is halved until the
+    failing positions stand alone; those are counted and skipped.
+    """
+    select = f"SELECT {', '.join(cols)} FROM {table} WHERE rowid BETWEEN ? AND ?"
+    rows: list[tuple] = []
+    unreadable = 0
+    stack = [(lo, hi)]
+    while stack:
+        a, b = stack.pop()
+        try:
+            rows.extend(conn.execute(select, (a, b)).fetchall())
+        except sqlite3.DatabaseError:
+            if a == b:
+                # A range scan steps past its last row to find the end, and
+                # past the last row of a leaf that step reads the next page.
+                # When that page is gone the row still reads by an exact seek.
+                try:
+                    rows.extend(conn.execute(
+                        f"SELECT {', '.join(cols)} FROM {table} WHERE rowid = ?", (a,)
+                    ).fetchall())
+                except sqlite3.DatabaseError:
+                    unreadable += 1
+            else:
+                mid = (a + b) // 2
+                stack.append((mid + 1, b))
+                stack.append((a, mid))
+    return rows, unreadable
+
+
+def _constrain_seq(conn: sqlite3.Connection) -> list[int]:
+    """Make a second record at an existing seq a failed write, not a fork.
+
+    Every append takes seq as max(seq) + 1 inside ``BEGIN IMMEDIATE``, which
+    is correct only while every writer shares one SQLite lock. When they do
+    not, two writers read the same max and both insert at it: two records at
+    one seq, both chained to the same parent. With ``idx_seq`` UNIQUE the
+    second INSERT fails and the fork never reaches the file.
+
+    A trail that already holds a fork keeps it; those rows are evidence and
+    are never rewritten. It keeps the plain ``idx_seq`` and gains a partial
+    unique index over every seq above its last fork, so new writes are still
+    constrained. Returns the seqs held by more than one record.
+    """
+    forks = [int(r[0]) for r in conn.execute(
+        "SELECT seq FROM audit_records GROUP BY seq HAVING COUNT(*) > 1 ORDER BY seq"
+    )]
+    indexes = {r[1]: bool(r[2]) for r in conn.execute("PRAGMA index_list(audit_records)")}
+    if not forks:
+        if not indexes.get("idx_seq"):
+            conn.execute("DROP INDEX IF EXISTS idx_seq")
+            conn.execute("CREATE UNIQUE INDEX idx_seq ON audit_records(seq)")
+        return forks
+    logger.error(
+        "audit trail has %d seq(s) held by more than one record (a fork): %s. "
+        "Those rows are kept; seq is unique from %d on",
+        len(forks), forks[:20], forks[-1] + 1,
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_seq ON audit_records(seq)")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_seq_after_fork "
+        f"ON audit_records(seq) WHERE seq > {forks[-1]:d}"
+    )
+    return forks
+
+
+# Migrations that need code rather than a fixed script, keyed like _MIGRATIONS
+# and run after that version's script.
+# v6 to v7: seq becomes unique (v1.97.0), see _constrain_seq.
+_CODE_MIGRATIONS = {6: _constrain_seq}
+
+
+#: ``audit_meta`` key for the chain head as last written: the seq and
+#: record_hash of the newest record, set in the transaction that inserts it. A
+#: tenant-scoped backend keeps its own under ``chain_head:<tenant>``.
+#:
+#: The chain alone cannot show that its newest records were deleted: what is
+#: left still links from genesis to a shorter tail. The recorded head names the
+#: record that should be there. It lives in the same file, so someone who
+#: rewrites it along with the rows defeats it, exactly as someone who rehashes
+#: the rows defeats the chain; against that, the signed receipts beside the
+#: trail are the check (``vaara receipt verify-decision --db``).
+_HEAD_KEY = "chain_head"
+
+
+def _read_head(conn: sqlite3.Connection, key: str) -> Optional[dict]:
+    """The head recorded under ``key``, or ``None`` when none is recorded.
+
+    A value that does not parse comes back as ``{"unreadable": value}``. This
+    code never writes one, so it is reported rather than skipped.
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM audit_meta WHERE key = ?", (key,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None:
+        return None
+    try:
+        head = json.loads(row[0])
+        if (not isinstance(head["seq"], int) or isinstance(head["seq"], bool)
+                or not isinstance(head["hash"], str)):
+            raise TypeError("seq or hash has the wrong type")
+    except (ValueError, TypeError, KeyError):
+        return {"unreadable": _as_text(row[0])[:200]}
+    return head
+
+
+def _stored_hash_at(conn: sqlite3.Connection, seq: int) -> Optional[str]:
+    """``record_hash`` at ``seq``. No tenant clause: seq is unique in the file,
+    and a tenant-scoped backend can write records carrying another tenant."""
+    row = conn.execute(
+        "SELECT record_hash FROM audit_records WHERE seq = ?", (seq,)
+    ).fetchone()
+    return None if row is None else _as_text(row[0])
+
+
+def _head_problem(conn: sqlite3.Connection, key: str, t_clause: str,
+                  t_params: list) -> Optional[str]:
+    """Why the recorded head is not on the stored chain, or ``None``.
+
+    The record at the recorded seq must still be there with the recorded
+    hash. Records past it are fine: a vaara older than the head record writes
+    without moving it. A head a purge removed is retention, not loss.
+    """
+    head = _read_head(conn, key)
+    if head is None or head.get("purged"):
+        return None
+    if "unreadable" in head:
+        return f"Chain head record in audit_meta is unreadable: {head['unreadable']!r}"
+    seq, digest = head["seq"], head["hash"]
+    stored = _stored_hash_at(conn, seq)
+    if stored == digest:
+        return None
+    if stored is not None:
+        return (
+            f"Chain head replaced: the record stored at seq {seq} is not the one "
+            f"written there (recorded hash {digest[:16]}..., stored "
+            f"{stored[:16]}...)"
+        )
+    newest = conn.execute(
+        f"SELECT MAX(seq) FROM audit_records WHERE {t_clause}", t_params
+    ).fetchone()[0]
+    left = "the trail is empty" if newest is None else f"the newest stored record is seq {newest}"
+    return (
+        f"Tail truncated: seq {seq} (record_hash {digest[:16]}...) was the newest "
+        f"record when it was written and is no longer stored; {left}"
+    )
+
+
+def _indexed_seqs(conn: sqlite3.Connection) -> Optional[set[int]]:
+    """Every seq ``idx_seq`` lists, read from the index alone, or ``None``.
+
+    Selecting only the indexed column makes this a covering scan of the
+    index b-tree, which lives on its own pages, so it can list rows whose
+    table leaf is gone. ``None`` when the index is missing or unreadable;
+    index damage drops entries, it does not invent them.
+    """
+    try:
+        return {
+            int(r[0]) for r in conn.execute(
+                "SELECT seq FROM audit_records INDEXED BY idx_seq WHERE seq IS NOT NULL"
+            )
+        }
+    except sqlite3.DatabaseError:
+        return None
+
+
+def _salvage(path: Path, problem: str) -> TrailRepair:
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    tmp = path.with_name(f"{path.name}.repair-{stamp}.tmp")
+    damaged = path.with_name(f"{path.name}.corrupt-{stamp}")
+    report = TrailRepair(db=str(path), method="salvage", problem=problem)
+
+    try:
+        src = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=5.0)
+        # A file shorter than the page count in its header, the last pages of
+        # a commit that never reached the disk, is refused as malformed before
+        # any row is read. writable_schema skips that check; the connection is
+        # read-only, so it cannot write the schema or anything else.
+        src.execute("PRAGMA writable_schema=ON")
+    except sqlite3.Error as exc:
+        return TrailRepair(db=str(path), method="failed", problem=problem,
+                           error=f"cannot open for salvage: {exc}")
+    try:
+        cols = [r[1] for r in src.execute("PRAGMA table_info(audit_records)")]
+        if "seq" not in cols:
+            raise sqlite3.DatabaseError("audit_records schema is unreadable")
+        try:
+            hi = src.execute("SELECT max(rowid) FROM audit_records").fetchone()[0] or 0
+        except sqlite3.DatabaseError:
+            # The rightmost path is damaged. Bound the scan by what the file
+            # could physically hold; empty ranges cost one query each.
+            page_count = src.execute("PRAGMA page_count").fetchone()[0]
+            hi = max(1, page_count) * 64
+
+        if tmp.exists():
+            tmp.unlink()
+        fresh = SQLiteAuditBackend(tmp)
+        try:
+            dst = fresh._conn
+            dst_cols = {r[1] for r in dst.execute("PRAGMA table_info(audit_records)")}
+            use = [c for c in cols if c in dst_cols]
+            rows, report.unreadable_rowids = _read_rows(src, "audit_records", use, 1, hi)
+            # A damaged interior page can point at a subtree another page
+            # already points at ("2nd reference to page N"), and a scan then
+            # returns those rows twice. A byte-identical repeat is the same
+            # record read again and is kept once. Two different rows under one
+            # record_id still stop the salvage on the unique constraint.
+            seen: set[tuple] = set()
+            unique: list[tuple] = []
+            for row in rows:
+                if row in seen:
+                    report.duplicate_rows += 1
+                    continue
+                seen.add(row)
+                unique.append(row)
+            rows = unique
+            witness = _indexed_seqs(src)
+            seq_at = use.index("seq")
+            present = {int(r[seq_at]) for r in rows}
+            known = present | (witness or set())
+            if known:
+                report.lost_seqs = [s for s in range(min(known), max(known) + 1)
+                                    if s not in present]
+            report.tail_named = witness is not None
+            placeholders = ", ".join("?" for _ in use)
+            dst.execute("BEGIN")
+            # A fork already in the file is kept like any other readable row,
+            # so the unique seq index comes back after the copy, not before.
+            dst.execute("DROP INDEX IF EXISTS idx_seq")
+            dst.executemany(
+                f"INSERT INTO audit_records ({', '.join(use)}) VALUES ({placeholders})",
+                rows,
+            )
+            _constrain_seq(dst)
+            for table in _SALVAGE_SIDE_TABLES:
+                try:
+                    # The names come from the damaged file. Only the ones the
+                    # fresh table has are read or written, like audit_records.
+                    side_dst = {r[1] for r in dst.execute(f"PRAGMA table_info({table})")}
+                    side_cols = [r[1] for r in src.execute(f"PRAGMA table_info({table})")
+                                 if r[1] in side_dst]
+                    if not side_cols:
+                        continue
+                    side_hi = src.execute(f"SELECT max(rowid) FROM {table}").fetchone()[0] or 0
+                    side_rows, side_bad = _read_rows(src, table, side_cols, 1, side_hi)
+                except sqlite3.DatabaseError:
+                    report.tables_damaged.append(table)
+                    continue
+                if side_bad:
+                    report.tables_damaged.append(table)
+                if side_rows:
+                    marks = ", ".join("?" for _ in side_cols)
+                    dst.execute(f"DELETE FROM {table}")
+                    dst.executemany(
+                        f"INSERT OR IGNORE INTO {table} ({', '.join(side_cols)}) "
+                        f"VALUES ({marks})",
+                        side_rows,
+                    )
+            if report.lost_seqs and (not present or max(report.lost_seqs) > max(present)):
+                dst.execute(
+                    "INSERT OR REPLACE INTO audit_meta (key, value) VALUES ('seq_floor', ?)",
+                    (str(max(report.lost_seqs)),),
+                )
+            dst.execute("COMMIT")
+            still = _integrity_problem(dst)
+            if still is not None:
+                raise sqlite3.DatabaseError(f"salvaged copy does not read clean: {still}")
+        finally:
+            fresh.close()
+    except sqlite3.Error as exc:
+        src.close()
+        for leftover in (tmp, tmp.with_name(tmp.name + "-journal")):
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
+        return TrailRepair(db=str(path), method="failed", problem=problem,
+                           error=f"{type(exc).__name__}: {exc}")
+    src.close()
+
+    report.records_kept = len(rows)
+
+    # The damaged file is kept beside the trail, never deleted: it is the
+    # original evidence, and a later, better tool may read more of it.
+    # Windows refuses to move a file another process holds open. Undo any
+    # move already made and report the repair as failed, leaving the trail
+    # where it was.
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            src_file = path.with_name(path.name + suffix)
+            if src_file.exists():
+                target = damaged.with_name(damaged.name + suffix)
+                os.replace(src_file, target)
+                moved.append((target, src_file))
+        os.replace(tmp, path)
+    except OSError as exc:
+        for target, src_file in reversed(moved):
+            with contextlib.suppress(OSError):
+                os.replace(target, src_file)
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        return TrailRepair(db=str(path), method="failed", problem=problem,
+                           error=f"{type(exc).__name__}: {exc}")
+    report.damaged_copy = str(damaged)
+    return report
+
+
+def repair_trail_file(db_path: str | Path) -> TrailRepair:
+    """Bring a trail back to reading clean without losing a readable record.
+
+    Tries the cheap fix first. ``REINDEX`` rebuilds every index from the
+    table and touches no record, and every index-level corruption seen on
+    this project's own machines so far was cleared by it. Only when the
+    table itself is damaged does it salvage: every row that can still be
+    read is copied into a fresh file in its original order with its original
+    hashes, the damaged file is kept beside it, and the report names each
+    sequence number that did not survive so the caller can declare it.
+
+    Operates on the file, not on an open backend, so it also works on a
+    trail that no backend can open. Callers holding a connection must close
+    it first; ``SQLiteAuditBackend.repair`` does that.
+    """
+    path = Path(db_path).expanduser().resolve()
+    if not path.is_file():
+        return TrailRepair(db=str(path), method="failed", error="no such file")
+    try:
+        conn = sqlite3.connect(str(path), isolation_level=None, timeout=5.0)
+    except sqlite3.Error as exc:
+        return TrailRepair(db=str(path), method="failed", error=str(exc))
+    try:
+        problem = _integrity_problem(conn)
+        if problem is None:
+            return TrailRepair(db=str(path), method="clean")
+        try:
+            conn.execute("REINDEX")
+            after = _integrity_problem(conn)
+        except sqlite3.Error as exc:
+            after = f"{type(exc).__name__}: {exc}"
+        if after is None:
+            return TrailRepair(db=str(path), method="reindex", problem=problem)
+    finally:
+        conn.close()
+    return _salvage(path, problem)
+
+
 class SQLiteAuditBackend:
     """Persistent audit trail backed by SQLite.
 
@@ -385,17 +878,27 @@ class SQLiteAuditBackend:
                 "path traversal detected. Ensure this location is intentional.",
                 str(db_path), self._db_path,
             )
+        self._lock = threading.Lock()
+        self._corrupt_query_rows = 0
+        self.last_purge_scrubbed: Optional[bool] = None
+        self._in_memory = str(db_path) == ":memory:"
+        self._open()
+
+    def _open(self) -> None:
+        """Connect, set pragmas, bring the schema current.
+
+        Split out of ``__init__`` so ``repair`` can reopen the file it swapped
+        in through exactly the path a fresh start takes.
+        """
         # check_same_thread=False lets us use this connection from any
         # thread (LangChain tool execution, web servers, async workers).
-        # The Lock below serializes all access to the connection, which
-        # is the SQLite python binding's thread-safety contract.
+        # The Lock serializes all access to the connection, which is the
+        # SQLite python binding's thread-safety contract.
         self._conn = sqlite3.connect(
             str(self._db_path),
             isolation_level=None,  # Autocommit for WAL mode
             check_same_thread=False,
         )
-        self._lock = threading.Lock()
-        self._corrupt_query_rows = 0
         # sqlite3.connect() does not touch the file, so a damaged database
         # first surfaces here, on the pragma that reads page 1. The raw
         # DatabaseError ("file is not a database") names neither the path nor
@@ -403,7 +906,7 @@ class SQLiteAuditBackend:
         # investigation after the wrong thing. Say what broke and where.
         try:
             self._set_journal_mode(
-                _journal_mode_for(self._db_path, in_memory=str(db_path) == ":memory:")
+                _journal_mode_for(self._db_path, in_memory=self._in_memory)
             )
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
@@ -413,14 +916,43 @@ class SQLiteAuditBackend:
                 f"the audit trail at {self._db_path} could not be opened "
                 f"({exc}). The evidence chain is the product, so this fails "
                 "rather than starting with a fresh trail and a silent gap. "
-                "Move the file aside to start a new trail, or point VAARA_DB "
-                "at a known-good one. Do not delete it: `sqlite3 <file> "
-                "'PRAGMA integrity_check'` and `.recover` often get the "
-                "records back, and they are the evidence."
+                "Run `vaara trail repair --db <file>`, which keeps every readable "
+                "record and declares the rest, or point VAARA_DB at a "
+                "known-good trail. Do not delete it: the records are the "
+                "evidence."
             ) from exc
         self._init_schema()
-        # Load GDPR redaction map into memory for O(1) read-time substitution.
-        self._redaction_cache: dict[str, str] = self._load_redaction_cache()
+        self._inode = self._current_inode()
+
+    def _current_inode(self) -> Optional[tuple[int, int]]:
+        if self._in_memory:
+            return None
+        try:
+            st = os.stat(self._db_path)
+        except OSError:
+            return None
+        return (st.st_dev, st.st_ino)
+
+    def _reopen_if_replaced_locked(self) -> None:
+        """Follow the path when the file under it was swapped out.
+
+        A trail repaired by hand, or moved aside and replaced, leaves an
+        open connection writing into the old inode: on 2026-09-22 the
+        llm-proxy kept appending to ``audit.db.corrupt-*`` until the process
+        was restarted. The path is the trail, so a write goes where the path
+        points now. One ``stat`` per write.
+        """
+        current = self._current_inode()
+        if current is None or current == self._inode:
+            return
+        logger.warning(
+            "the audit trail at %s was replaced on disk; reopening it", self._db_path,
+        )
+        try:
+            self._conn.close()
+        except sqlite3.Error:
+            pass
+        self._open()
 
     # Switching journal mode needs a brief exclusive lock, and SQLite answers
     # SQLITE_BUSY for it without consulting the busy handler, so the
@@ -428,6 +960,17 @@ class SQLiteAuditBackend:
     # retries covers a peer that is mid schema-init.
     _WAL_RETRIES = 10
     _WAL_RETRY_SLEEP = 0.05
+
+    @property
+    def db_path(self) -> Path:
+        """The file this trail is stored in.
+
+        Public because callers outside the backend need to name the trail:
+        the failure marker in :mod:`vaara.audit.write_failure` lives beside
+        it, and an operator-facing message about a trail that is not
+        recording is not much use without the path.
+        """
+        return self._db_path
 
     @property
     def journal_mode(self) -> str:
@@ -450,19 +993,38 @@ class SQLiteAuditBackend:
         a real change of mode. If the lock is still held after that, the
         database opens in the journal mode it is already in: worse
         concurrency, but recording evidence beats refusing to.
+
+        The result row is read back, because the pragma is allowed to
+        decline silently. Without that, a WAL trail on a filesystem that
+        cannot support WAL could fail to convert and report success. The
+        log line here reaches nobody from a hook process, so the operator
+        signal is :func:`journal_mode_warning`, read at session start.
         """
+        wanted = mode.lower()
         statement = f"PRAGMA journal_mode={mode.upper()}"
-        last: Optional[sqlite3.OperationalError] = None
+        last: Optional[str] = None
         for _ in range(self._WAL_RETRIES):
             try:
-                self._conn.execute(statement)
-                return
+                row = self._conn.execute(statement).fetchone()
             except sqlite3.OperationalError as exc:
                 msg = str(exc).lower()
                 if "locked" not in msg and "busy" not in msg:
                     raise
-                last = exc
+                last = f"{type(exc).__name__}: {exc}"
                 time.sleep(self._WAL_RETRY_SLEEP)
+                continue
+            actual = str(row[0]).lower() if row else ""
+            # An in-memory database answers "memory" whatever it is asked
+            # for, and that is the correct mode for it, not a refusal.
+            if actual in (wanted, "memory"):
+                return
+            # The pragma can decline without raising: a mode change needs a
+            # brief exclusive lock, and SQLite may simply answer with the
+            # mode the file is still in. That reads as success to a caller
+            # that does not look at the row, which is how a WAL to DELETE
+            # conversion could quietly not happen.
+            last = f"journal_mode stayed {actual or 'unknown'}"
+            time.sleep(self._WAL_RETRY_SLEEP)
         logger.warning(
             "audit DB %s stayed locked while setting journal mode %s (%s); "
             "continuing in the existing journal mode. Another Vaara process is "
@@ -632,8 +1194,9 @@ class SQLiteAuditBackend:
         version the database was actually at rather than a half-migrated one.
         """
         for v in range(from_version, to_version):
-            sql = _MIGRATIONS.get(v)
-            if not sql:
+            sql = _MIGRATIONS.get(v, "")
+            step = _CODE_MIGRATIONS.get(v)
+            if not sql and step is None:
                 continue
             logger.info(
                 "Migrating audit DB schema v%d to v%d at %s",
@@ -651,6 +1214,8 @@ class SQLiteAuditBackend:
                         )
                         continue
                     raise
+            if step is not None:
+                step(self._conn)
             # Bump schema_version per-migration, not once at the end. If
             # v to v+1 succeeds but v+1 to v+2 fails, the DB ends up correctly
             # marked at v+1 instead of stuck at the original from_version.
@@ -659,13 +1224,6 @@ class SQLiteAuditBackend:
                 (str(v + 1),),
             )
         logger.info("Audit DB schema migrated to v%d", to_version)
-
-    def _get_max_seq(self) -> int:
-        """Get the highest sequence number in the DB (diagnostic / tests)."""
-        row = self._conn.execute(
-            "SELECT COALESCE(MAX(seq), -1) FROM audit_records"
-        ).fetchone()
-        return row[0]
 
     # ── Write path ────────────────────────────────────────────────
 
@@ -705,7 +1263,9 @@ class SQLiteAuditBackend:
                     chain_version)
                    VALUES (
                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                     COALESCE((SELECT MAX(seq) FROM audit_records), -1) + 1,
+                     MAX(COALESCE((SELECT MAX(seq) FROM audit_records), -1),
+                         COALESCE((SELECT CAST(value AS INTEGER) FROM audit_meta
+                                   WHERE key = 'seq_floor'), -1)) + 1,
                      ?, ?, ?, ?, ?, ?
                    )""",
                 (
@@ -772,6 +1332,68 @@ class SQLiteAuditBackend:
         ).fetchone()
         return (row[0] or "") if row else ""
 
+    def _head_key(self) -> str:
+        return f"{_HEAD_KEY}:{self._tenant_id}" if self._tenant_id else _HEAD_KEY
+
+    def _resume_head_locked(self, tail_hash: str) -> str:
+        """The hash the next record chains to. Caller holds the write lock.
+
+        The stored tail, unless the head recorded at the last write is gone.
+        Then the next record chains to the recorded head and takes a seq above
+        it, so the missing records stay a break in the chain that every later
+        verify reports. Chaining to the shortened tail instead would bury the
+        loss: the new record would overwrite the recorded head, and the chain
+        would verify clean from genesis to it.
+        """
+        recorded = _read_head(self._conn, self._head_key())
+        if recorded is None or "unreadable" in recorded or recorded["hash"] == tail_hash:
+            return tail_hash
+        t_clause, t_params = self._tenant_clause()
+        if _stored_hash_at(self._conn, recorded["seq"]) == recorded["hash"]:
+            return tail_hash
+        if not recorded.get("purged"):
+            logger.error(
+                "audit trail %s: %s. The next record chains to the recorded head, "
+                "so the loss stays a break in the chain",
+                self._db_path,
+                _head_problem(self._conn, self._head_key(), t_clause, t_params),
+            )
+        row = self._conn.execute(
+            "SELECT value FROM audit_meta WHERE key = 'seq_floor'"
+        ).fetchone()
+        try:
+            floor = int(row[0]) if row else -1
+        except (TypeError, ValueError):
+            floor = -1
+        if recorded["seq"] > floor:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO audit_meta (key, value) VALUES ('seq_floor', ?)",
+                (str(recorded["seq"]),),
+            )
+        return recorded["hash"]
+
+    def _record_head_locked(self, record: AuditRecord) -> None:
+        """Record ``record`` as the head, inside the transaction that wrote it."""
+        seq = self._conn.execute(
+            "SELECT seq FROM audit_records WHERE record_id = ?", (record.record_id,)
+        ).fetchone()[0]
+        self._conn.execute(
+            "INSERT OR REPLACE INTO audit_meta (key, value) VALUES (?, ?)",
+            (self._head_key(),
+             json.dumps({"seq": seq, "hash": record.record_hash}, sort_keys=True)),
+        )
+
+    def head_problem(self) -> Optional[str]:
+        """Why the recorded chain head is not stored, or ``None`` when it is.
+
+        See ``_HEAD_KEY``. ``load_trail`` and ``verify_chain_streaming`` fold
+        this into their verdict; it is exposed for callers that only want the
+        tail checked.
+        """
+        t_clause, t_params = self._tenant_clause()
+        with self._lock:
+            return _head_problem(self._conn, self._head_key(), t_clause, t_params)
+
     def append_record(self, record: AuditRecord, stamp) -> str:
         """Read the chain head and insert, atomically against other writers.
 
@@ -793,12 +1415,21 @@ class SQLiteAuditBackend:
         Returns the ``previous_hash`` actually used.
         """
         with self._lock:
+            self._reopen_if_replaced_locked()
             self._conn.execute("BEGIN IMMEDIATE")
             with self._rollback_on_failure():
-                head = self._chain_head_locked()
+                head = self._resume_head_locked(self._chain_head_locked())
                 stamp(head)
                 self._insert_record(record)
-            return head
+                self._record_head_locked(record)
+        # The first record this process writes lists the trail in
+        # ~/.vaara/sources.json, which is where the macOS app looks.
+        if not getattr(self, "_registered", False):
+            self._registered = True
+            from vaara.audit import sources
+
+            sources.register(self._db_path)
+        return head
 
     # ── Read path ─────────────────────────────────────────────────
 
@@ -818,6 +1449,10 @@ class SQLiteAuditBackend:
         export) fail loud rather than silently consuming tampered
         evidence.
 
+        A gap a REPAIR_GAP record declares is not a compromise: it is logged
+        at INFO, does not raise under ``strict``, and stays readable on
+        ``trail._load_verdict``. The trail still does not verify as intact.
+
         A single row with a corrupt ``data``/``regulatory`` JSON column
         no longer DoSes the entire load — that row is logged and loaded
         with empty dicts; the subsequent hash-chain verification will
@@ -825,15 +1460,34 @@ class SQLiteAuditBackend:
         """
         t_clause, t_params = self._tenant_clause()
         with self._lock:
-            rows = self._conn.execute(
-                f"SELECT * FROM audit_records WHERE {t_clause} ORDER BY seq ASC",
-                t_params,
-            ).fetchall()
+            # One read transaction, so the head check and the rows come from
+            # the same snapshot and a deletion cannot land between them.
+            self._conn.execute("BEGIN")
+            try:
+                head_error = _head_problem(self._conn, self._head_key(), t_clause, t_params)
+                # NOT INDEXED reads the table itself. Walking idx_seq for the
+                # order would drop any row a damaged index has lost, and the
+                # chain check would then report that record as missing when
+                # only the index is wrong.
+                rows = self._conn.execute(
+                    f"SELECT * FROM audit_records NOT INDEXED WHERE {t_clause} "
+                    "ORDER BY seq ASC",
+                    t_params,
+                ).fetchall()
+            finally:
+                self._rollback_quietly()
 
         trail = AuditTrail(on_record=self.write_record)
+        trail._store_head_error = head_error
         # Expose the backend so the pipeline can use cross-process features
         # like pending outcomes persistence.
         trail._backend = self
+        # Each decision appended from here on also leaves a signed receipt
+        # beside the database (off, with a warning, without the signing
+        # libraries; off with VAARA_RECEIPTS=0).
+        from vaara.audit.decision_receipts import default_sink
+
+        trail._receipt_sink = default_sink(self._db_path)
 
         corrupt_rows = 0
         for row in rows:
@@ -868,10 +1522,19 @@ class SQLiteAuditBackend:
                     previous_hash=_as_text(row[8]),
                     record_hash=_as_text(row[9]),
                 )
-            # Inject directly into the trail (bypass on_record to avoid re-write)
-            trail._records.append(record)
-            trail._by_action[record.action_id].append(record)
+            # Inject directly into the trail (bypass on_record to avoid
+            # re-write), but go through _index_record rather than appending to
+            # _records by hand. Reloaded records never pass through _append, so
+            # this is the path that decides whether a reloaded trail can still
+            # answer find_prior_approval. Appending to _records alone leaves
+            # every prior approval invisible after a restart, which fails
+            # closed and silently: the action escalates to a human a second
+            # time instead of being auto-allowed.
+            trail._index_record(record)
             trail._last_hash = record.record_hash
+            if isinstance(row[10], int):
+                trail._store_seqs[record.record_id] = row[10]
+        trail._store_seqs_whole_table = not self._tenant_id
 
         # Expose the skeleton-row count on the returned trail so callers
         # can observe reload-time corruption without parsing logs. This
@@ -882,13 +1545,20 @@ class SQLiteAuditBackend:
         if corrupt_rows > CORRUPT_ROW_LOG_LIMIT:
             logger.error(
                 "load_trail: %d corrupt record rows in %s (%d detailed above, "
-                "%d not logged) — loaded as skeletons; run `vaara verify-chain` "
-                "for the full picture",
+                "%d not logged) — loaded as skeletons; the chain check below "
+                "flags them by hash mismatch",
                 corrupt_rows, self._db_path, CORRUPT_ROW_LOG_LIMIT,
                 corrupt_rows - CORRUPT_ROW_LOG_LIMIT,
             )
 
-        chain_error = trail.verify_chain()
+        verdict = trail.verify_chain_verdict()
+        trail._load_verdict = verdict
+        chain_error = verdict.error
+        if verdict.declared_gaps or verdict.erased:
+            # Known, declared, and reported once per session by whoever owns
+            # the operator's attention (the hook's session start). Logging it
+            # at ERROR on every open printed the same line on every tool call.
+            logger.info("audit chain: %s", verdict.summary())
         if chain_error:
             logger.error("AUDIT CHAIN INTEGRITY FAILURE: %s", chain_error)
             if strict:
@@ -901,7 +1571,182 @@ class SQLiteAuditBackend:
             "Loaded %d audit records from %s (corrupt_rows=%d)",
             len(rows), self._db_path, corrupt_rows,
         )
+        # The outside witnesses (head publishing, time anchoring) are
+        # switched on here, the one door every surface opens a trail through,
+        # so VAARA_AUTO_PUBLISH_EVERY and VAARA_AUTO_ANCHOR_EVERY mean the
+        # same thing for the CLI, the hooks and the proxies. Off unless set.
+        from vaara.audit import witness
+
+        if witness.requested():
+            witness.configure_from_env(trail)
         return trail
+
+    def verify_chain_streaming(
+        self,
+        *,
+        start_seq: int = 0,
+        expected_previous_hash: str = "",
+        on_progress: Optional[Any] = None,
+        progress_every: int = 100_000,
+    ) -> Optional[str]:
+        """Verify the stored chain without materialising it. None if intact.
+
+        ``load_trail`` cannot answer this question at scale: it does
+        ``fetchall``, builds every ``AuditRecord``, and appends each to both
+        ``_records`` and ``_by_action``. A year of records at eHealth rates is
+        roughly 201 million, and no amount of care in the walk helps once the
+        rows are already in a list.
+
+        This iterates the cursor row by row and keeps exactly one record and
+        one hash alive, so peak memory is flat in the row count. The
+        arithmetic was never the problem: measured elsewhere at 4.99 us per
+        record, 201 million records is about 17 minutes of hashing, which is
+        tolerable for an annual audit. Holding them was the problem.
+
+        ``start_seq`` and ``expected_previous_hash`` restart the walk part way,
+        so a long verify can checkpoint instead of starting over. Rows below
+        ``start_seq`` are NOT verified and nothing is claimed about them. The
+        caller supplies the hash it expects rather than having one read out of
+        the rows being skipped, because reading it from there would let a
+        rewritten prefix authenticate itself.
+
+        ``on_progress(seq, record_hash)`` fires every ``progress_every`` rows
+        and at the end. Each callback carries a valid restart point, which is
+        what makes a multi-hour verify resumable across a crash.
+
+        A corrupt ``data`` column is a verification FAILURE here, not a
+        skeleton row. ``load_trail`` reconstructs skeletons so one bad row
+        cannot DoS a reload; this call exists to answer whether the chain is
+        intact, and a row whose content cannot be read cannot be shown to be
+        the row that was written.
+
+        **It does not hold the write lock.** A 17-minute walk holding
+        ``self._lock`` would stall every recording thread for 17 minutes, which
+        would make verification something an operator learns not to run. A
+        file-backed store is read through a SEPARATE read-only connection so
+        Python-side writers are never blocked. Database-level concurrency is
+        then whatever the journal mode gives: WAL lets the reader run beside
+        writers, and the DELETE fallback used on filesystems without shared
+        memory (see ``_journal_mode_for``) does not, so on those a long verify
+        does still contend. An in-memory store has no second connection to
+        open and is read under the lock.
+
+        A gap a REPAIR_GAP record declares returns a string starting "Chain
+        not intact", never None; ``verify_chain_streaming_verdict`` tells it
+        apart from a break.
+        """
+        return self.verify_chain_streaming_verdict(
+            start_seq=start_seq,
+            expected_previous_hash=expected_previous_hash,
+            on_progress=on_progress,
+            progress_every=progress_every,
+        ).summary()
+
+    def verify_chain_streaming_verdict(
+        self,
+        *,
+        start_seq: int = 0,
+        expected_previous_hash: str = "",
+        on_progress: Optional[Any] = None,
+        progress_every: int = 100_000,
+    ) -> ChainVerdict:
+        """The walk behind ``verify_chain_streaming``, declared gaps apart.
+
+        Same rule as ``AuditTrail.verify_chain_verdict``: a break is declared
+        only across missing seqs that a later REPAIR_GAP record names in full.
+        Only the declarations themselves are held, not the records.
+
+        A recorded chain head that is no longer stored is broken too (see
+        ``_HEAD_KEY``): the walk alone cannot see records missing from the end.
+        """
+        t_clause, t_params = self._tenant_clause()
+        whole_table = not self._tenant_id
+        ledger = _GapLedger()
+        prev_hash = expected_previous_hash
+        prev_seq: Optional[int] = None
+        seen = 0
+        last_seq = start_seq - 1
+        # NOT INDEXED, as in load_trail: a row a damaged idx_seq has lost is
+        # still a stored record and must be walked, not reported missing.
+        sql = (f"SELECT * FROM audit_records NOT INDEXED WHERE {t_clause} AND seq >= ? "
+               "ORDER BY seq ASC")
+        params = (*t_params, start_seq)
+
+        in_memory = str(self._db_path) == ":memory:"
+        if in_memory:
+            self._lock.acquire()
+            conn = self._conn
+        else:
+            conn = sqlite3.connect(
+                f"file:{self._db_path}?mode=ro", uri=True, check_same_thread=False,
+                isolation_level=None,
+            )
+            # The head check and the walk read one snapshot. The connection
+            # is read-only and closed below, which ends the transaction.
+            conn.execute("BEGIN")
+        try:
+            head_error = _head_problem(conn, self._head_key(), t_clause, t_params)
+            for row in conn.execute(sql, params):
+                seq = row[10]
+                try:
+                    record = self._row_to_record(row)
+                except (json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
+                    return ChainVerdict(error=(
+                        f"Unreadable record at seq {seq} ({row[0]}): "
+                        f"{type(exc).__name__}: {exc}"
+                    ))
+                if record.previous_hash != prev_hash:
+                    error = (
+                        f"Chain broken at seq {seq} ({record.record_id}): "
+                        f"expected previous_hash={prev_hash!r}, "
+                        f"got {record.previous_hash!r}"
+                    )
+                    if prev_seq is None and start_seq == 0 and not prev_hash and record.previous_hash:
+                        # The walk opens on a record that links past the start
+                        # of the trail: a retention rotation, if the trail
+                        # holds the signed record that says so.
+                        ledger.hold_start(record.previous_hash, error)
+                    elif prev_seq is None or seq <= prev_seq + 1:
+                        return ChainVerdict(error=error)
+                    else:
+                        ledger.hold(seen, tuple(range(prev_seq + 1, seq)), seq, error)
+                elif whole_table and prev_seq is not None and seq > prev_seq + 1:
+                    # Linked across missing seqs, as a salvage that lost the
+                    # tail leaves it. Seqs span every tenant, so a tenant
+                    # walk skips this check.
+                    ledger.hold(seen, tuple(range(prev_seq + 1, seq)), seq, (
+                        f"Seqs missing before seq {seq} ({record.record_id}): "
+                        f"the chain links seq {prev_seq} to seq {seq}"
+                    ))
+                expected = record.compute_hash()
+                if record.record_hash != expected:
+                    error = (
+                        f"Hash mismatch at seq {seq} ({record.record_id}, "
+                        f"agent_id={record.agent_id!r}): expected {expected!r}, "
+                        f"got {record.record_hash!r}"
+                    )
+                    if erasure_pointer(record) is None:
+                        return ChainVerdict(error=error)
+                    ledger.hold_erased(seen, seq, record, error)
+                ledger.see(seen, seq, record)
+                prev_hash = record.record_hash
+                prev_seq = seq
+                last_seq = seq
+                seen += 1
+                if on_progress is not None and progress_every and \
+                        seen % progress_every == 0:
+                    on_progress(seq, prev_hash)
+        finally:
+            if in_memory:
+                self._lock.release()
+            else:
+                conn.close()
+        if on_progress is not None and seen:
+            on_progress(last_seq, prev_hash)
+        verdict = ledger.verdict()
+        if verdict.error is None and head_error is not None:
+            return ChainVerdict(error=head_error)
+        return verdict
 
     def count(self) -> int:
         """Total records (scoped to tenant_id if set)."""
@@ -1052,7 +1897,8 @@ class SQLiteAuditBackend:
         if not isinstance(limit, int) or limit < 0:
             raise ValueError(f"export_jsonl limit must be a non-negative int, got {limit!r}")
         t_clause, t_params = self._tenant_clause()
-        query = f"SELECT * FROM audit_records WHERE {t_clause} ORDER BY seq ASC"
+        # NOT INDEXED, as in load_trail: an export holds every stored record.
+        query = f"SELECT * FROM audit_records NOT INDEXED WHERE {t_clause} ORDER BY seq ASC"
         params = t_params[:]
         if limit > 0:
             query += " LIMIT ?"
@@ -1072,66 +1918,10 @@ class SQLiteAuditBackend:
                 exported += 1
         return exported
 
-    # ── GDPR Article 17 ───────────────────────────────────────────
-
-    def _load_redaction_cache(self) -> dict[str, str]:
-        rows = self._conn.execute(
-            "SELECT original_id, replacement FROM gdpr_redactions"
-        ).fetchall()
-        return {r[0]: r[1] for r in rows}
-
-    def redact_agent_pii(
-        self,
-        original_id: str,
-        replacement: str = "[REDACTED:GDPR-Art17]",
-    ) -> int:
-        """Redact all occurrences of an agent_id from read results (GDPR Art. 17).
-
-        The stored records and hash chain are NOT modified — append-only
-        immutability is preserved for regulatory evidence integrity. Redaction
-        is applied at read time: every call to query_*, load_trail, and
-        export_jsonl substitutes ``replacement`` wherever ``original_id``
-        appears as agent_id.
-
-        **Hash chain note:** after redaction, chain verification will report
-        a mismatch for redacted records because agent_id contributes to the
-        hash input. This is expected and correct — the erasure event is itself
-        compliance evidence. Surface ``trail.chain_intact=False`` in the
-        conformity report with a note about GDPR redaction.
-
-        Returns the number of records that will be affected by the redaction.
-        """
-        if not isinstance(original_id, str) or not original_id:
-            raise ValueError("original_id must be a non-empty string")
-        with self._lock:
-            count = self._conn.execute(
-                "SELECT COUNT(*) FROM audit_records WHERE agent_id = ?",
-                (original_id,),
-            ).fetchone()[0]
-            self._conn.execute(
-                "INSERT OR REPLACE INTO gdpr_redactions "
-                "(original_id, replacement, redacted_at) VALUES (?, ?, ?)",
-                (original_id, replacement, time.time()),
-            )
-            self._redaction_cache[original_id] = replacement
-        logger.info(
-            "GDPR Art.17 redaction: agent_id %r to %r affects %d records",
-            original_id, replacement, count,
-        )
-        return count
-
-    def list_redactions(self) -> list[dict]:
-        """Return all active GDPR redactions (original_id redacted, not shown)."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT replacement, redacted_at FROM gdpr_redactions"
-            ).fetchall()
-        return [{"replacement": r[0], "redacted_at": r[1]} for r in rows]
-
     # ── Internal ──────────────────────────────────────────────────
 
     def _row_to_record(self, row: tuple) -> AuditRecord:
-        """Convert a database row to an AuditRecord, applying GDPR redactions.
+        """Convert a database row to an AuditRecord.
 
         Column layout (schema v4):
           row[0..9]  record_id, action_id, event_type, timestamp, agent_id,
@@ -1149,8 +1939,6 @@ class SQLiteAuditBackend:
         the chain re-verifies exactly as written.
         """
         agent_id = row[4]
-        if self._redaction_cache and agent_id in self._redaction_cache:
-            agent_id = self._redaction_cache[agent_id]
         # Defensive indexing: rows from older queries may not include
         # later-schema columns. Use a guard so loading old DBs still works.
         tenant_id = row[11] if len(row) > 11 else ""
@@ -1165,7 +1953,7 @@ class SQLiteAuditBackend:
         return AuditRecord(
             record_id=row[0],
             action_id=row[1],
-            event_type=EventType(row[2]),
+            event_type=stored_event_type(row[2]),
             timestamp=row[3],
             agent_id=agent_id,
             tool_name=row[5],
@@ -1209,24 +1997,79 @@ class SQLiteAuditBackend:
             row = self._conn.execute("PRAGMA wal_checkpoint(FULL)").fetchone()
         return (row[1], row[2]) if row else (0, 0)
 
+    def rotation_boundary(self, retention_seconds: int) -> Optional[RotationBoundary]:
+        """The prefix of the chain a rotation would purge, or None when it is empty.
+
+        Records older than ``retention_seconds`` are taken only up to the first
+        one that is not: a record written later with an old timestamp (a clock
+        that stepped back) stays until a later rotation. The purged records are
+        then an unbroken prefix, and the hash the first survivor links to is
+        known before anything is deleted. Tenant-scoped like the purge.
+
+        Raises :class:`RotationBoundaryError` when the first record kept does not
+        link to the last one that would go: purging then leaves a hole no
+        rotation record can name (records of other tenants share the chain).
+        """
+        if not isinstance(retention_seconds, int) or retention_seconds <= 0:
+            raise ValueError(
+                f"retention_seconds must be a positive int, got {retention_seconds!r}"
+            )
+        cutoff = time.time() - retention_seconds
+        t_clause, t_params = self._tenant_clause()
+        with self._lock:
+            first_kept = self._conn.execute(
+                f"SELECT MIN(seq) FROM audit_records "
+                f"WHERE {t_clause} AND (timestamp IS NULL OR timestamp >= ?)",
+                t_params + [cutoff],
+            ).fetchone()[0]
+            bound = "" if first_kept is None else "AND seq < ?"
+            bound_params = [] if first_kept is None else [first_kept]
+            last = self._conn.execute(
+                f"SELECT seq, record_hash FROM audit_records "
+                f"WHERE {t_clause} {bound} ORDER BY seq DESC LIMIT 1",
+                t_params + bound_params,
+            ).fetchone()
+            if last is None:
+                return None
+            if first_kept is not None:
+                linked = self._conn.execute(
+                    "SELECT previous_hash FROM audit_records WHERE seq = ?", [first_kept],
+                ).fetchone()[0]
+                if linked != last[1]:
+                    raise RotationBoundaryError(
+                        "the records older than the cut-off are not a prefix of one "
+                        "unbroken chain: the first record kept does not link to the last "
+                        "one that would go (another tenant's records share this chain, "
+                        "or the chain is already broken there)"
+                    )
+            count = self._conn.execute(
+                f"SELECT COUNT(*) FROM audit_records WHERE {t_clause} AND seq <= ?",
+                t_params + [last[0]],
+            ).fetchone()[0]
+        return RotationBoundary(cutoff=cutoff, through_seq=last[0],
+                                last_hash=last[1] or "", count=count)
+
     def purge_older_than(
         self, retention_seconds: int, *, dry_run: bool = False,
+        boundary: Optional[RotationBoundary] = None,
     ) -> int:
         """Delete audit records older than ``retention_seconds`` from now.
 
-        Article 12(2) of the EU AI Act lets the deployer set the retention
-        period in accordance with the intended purpose and applicable law.
-        Vaara does not pick the policy. This method enforces it.
+        Articles 19(1) and 26(6) of the EU AI Act set the retention period:
+        appropriate to the intended purpose, at least six months unless
+        other Union or national law provides otherwise. Vaara does not
+        pick the policy. This method enforces it.
 
         HASH-CHAIN IMPACT — surviving records still reference deleted
         predecessors via ``previous_hash``, so ``vaara trail verify`` will
-        report a chain break at the retention boundary. The intended
-        workflow is to export a signed handoff zip BEFORE purging, archive
-        the zip externally for long-tail audit history, then purge the
-        live DB. The signed zip remains self-consistent forever; the live
-        DB chain has a documented seam at the retention boundary. See
-        research/severable_bundles_sketch.md for the v0.7+ design that
-        eliminates the seam.
+        report a chain break at the retention boundary, unless the trail
+        holds a signed ``trail_rotated`` record naming the hash the first
+        survivor links to. ``vaara trail rotate`` writes that record, from
+        :meth:`rotation_boundary`, before it calls this with ``boundary``;
+        a bare purge leaves nothing that accounts for the break. The intended
+        workflow is ``trail rotate``: a signed archive, verified, then the
+        purge, with the seam declared in the trail. See
+        research/severable_bundles_sketch.md for the v0.7+ design.
 
         Tenant-scoped — when ``tenant_id`` is set on this backend instance,
         only that tenant's records are subject to purging.
@@ -1236,6 +2079,17 @@ class SQLiteAuditBackend:
                 are deleted. Must be > 0.
             dry_run: If True, return the count that would be deleted without
                 modifying the database.
+            boundary: The prefix :meth:`rotation_boundary` fixed. When given,
+                exactly the records up to ``boundary.through_seq`` are deleted
+                (and ``retention_seconds`` is only validated), so the hash the
+                rotation record named is the hash the first survivor links to.
+
+        The delete runs with ``secure_delete`` on and a TRUNCATE checkpoint
+        follows, so the purged bytes leave the page and the WAL. A reader
+        holding an old snapshot keeps the WAL frames until it lets go;
+        ``last_purge_scrubbed`` is False then, and the caller reports it
+        rather than claiming the bytes are gone. It is None for a dry run
+        and for a purge that deleted nothing.
 
         Returns:
             Number of records deleted (or that would be deleted in dry_run mode).
@@ -1245,24 +2099,45 @@ class SQLiteAuditBackend:
                 f"retention_seconds must be a positive int, got {retention_seconds!r}"
             )
 
-        cutoff = time.time() - retention_seconds
+        cutoff = time.time() - retention_seconds if boundary is None else boundary.cutoff
         t_clause, t_params = self._tenant_clause()
+        scrubbed: Optional[bool] = None
+        if boundary is None:
+            where, params = f"timestamp < ? AND {t_clause}", [cutoff] + t_params
+        else:
+            where, params = f"seq <= ? AND {t_clause}", [boundary.through_seq] + t_params
 
         with self._lock:
             if dry_run:
                 row = self._conn.execute(
-                    f"SELECT COUNT(*) FROM audit_records "
-                    f"WHERE timestamp < ? AND {t_clause}",
-                    [cutoff] + t_params,
+                    f"SELECT COUNT(*) FROM audit_records WHERE {where}", params,
                 ).fetchone()
                 count = row[0]
             else:
-                cursor = self._conn.execute(
-                    f"DELETE FROM audit_records "
-                    f"WHERE timestamp < ? AND {t_clause}",
-                    [cutoff] + t_params,
-                )
-                count = cursor.rowcount
+                self._conn.execute("PRAGMA secure_delete = ON")
+                self._conn.execute("BEGIN IMMEDIATE")
+                with self._rollback_on_failure():
+                    heads = self._heads_on_chain_locked()
+                    cursor = self._conn.execute(
+                        f"DELETE FROM audit_records WHERE {where}", params,
+                    )
+                    count = cursor.rowcount
+                    # A head this purge deleted is retention, not truncation.
+                    # Only heads that were stored before the DELETE are
+                    # marked, so a purge cannot launder an earlier loss.
+                    for key, head in heads:
+                        if _stored_hash_at(self._conn, head["seq"]) is None:
+                            self._conn.execute(
+                                "UPDATE audit_meta SET value = ? WHERE key = ?",
+                                (json.dumps({**head, "purged": True}, sort_keys=True), key),
+                            )
+                if count > 0:
+                    if self._in_memory:
+                        scrubbed = True
+                    else:
+                        row = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                        scrubbed = bool(row) and row[0] == 0
+            self.last_purge_scrubbed = scrubbed
 
         if count > 0:
             verb = "Would purge" if dry_run else "Purged"
@@ -1272,80 +2147,48 @@ class SQLiteAuditBackend:
             )
         return count
 
-    # ── API Key management ────────────────────────────────────────
+    def erase_record_data(self, record_id: str, tombstone: dict) -> bool:
+        """Overwrite one stored record's ``data`` with ``tombstone`` and scrub it.
 
-    def create_api_key(self, name: str, role: "Role") -> str:
-        """Create a new API key with the given role. Returns the plaintext key (shown once)."""
-        import uuid as _uuid
-
-        from vaara.auth import Role as _Role
-        plaintext = generate_api_key()
-        key_id = str(_uuid.uuid4())
-        key_hash = _hash_key(plaintext)
-        role_value = role.value if isinstance(role, _Role) else str(role)
+        Only ``data`` changes. ``record_hash`` stays as written, so the next
+        record still chains to it, and the RECORD_ERASED record that
+        ``vaara.audit.erase`` appends first is what accounts for the slot.
+        ``secure_delete`` zeroes the old bytes in the page, and a TRUNCATE
+        checkpoint moves the page out of the WAL. Returns whether that
+        checkpoint completed: a reader holding an old snapshot keeps the WAL
+        frames until it lets go, and the caller reports that rather than
+        claiming the bytes are gone.
+        """
+        payload = json.dumps(tombstone, sort_keys=True)
+        t_clause, t_params = self._tenant_clause()
         with self._lock:
-            self._conn.execute(
-                "INSERT INTO api_keys (key_id, name, role, key_hash, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (key_id, name, role_value, key_hash, time.time()),
-            )
-        logger.info("API key created: name=%r role=%s key_id=%s", name, role_value, key_id)
-        return plaintext
-
-    def authenticate_api_key(self, plaintext_key: str) -> Optional["APIKey"]:
-        """Validate a plaintext key and return its APIKey metadata, or None."""
-        if not isinstance(plaintext_key, str) or not plaintext_key:
-            return None
-        key_hash = _hash_key(plaintext_key)
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT key_id, name, role, created_at, last_used_at "
-                "FROM api_keys WHERE key_hash=?",
-                (key_hash,),
-            ).fetchone()
-            if row:
-                self._conn.execute(
-                    "UPDATE api_keys SET last_used_at=? WHERE key_hash=?",
-                    (time.time(), key_hash),
+            self._conn.execute("PRAGMA secure_delete = ON")
+            self._conn.execute("BEGIN IMMEDIATE")
+            with self._rollback_on_failure():
+                cursor = self._conn.execute(
+                    f"UPDATE audit_records SET data = ? WHERE record_id = ? AND {t_clause}",
+                    [payload, record_id] + t_params,
                 )
-        if not row:
-            return None
-        try:
-            role = Role(row[2])
-        except ValueError:
-            role = Role.READER
-        return APIKey(
-            key_id=row[0], name=row[1], role=role,
-            created_at=row[3], last_used_at=row[4],
-        )
+                if cursor.rowcount != 1:
+                    raise KeyError(record_id)
+            if self._in_memory:
+                return True
+            row = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        return bool(row) and row[0] == 0
 
-    def revoke_api_key(self, key_id: str) -> bool:
-        """Revoke an API key by key_id. Returns True if a key was removed."""
-        with self._lock:
-            cursor = self._conn.execute(
-                "DELETE FROM api_keys WHERE key_id=?", (key_id,)
-            )
-        if cursor.rowcount:
-            logger.info("API key revoked: key_id=%s", key_id)
-        return bool(cursor.rowcount)
-
-    def list_api_keys(self) -> list["APIKey"]:
-        """Return metadata for all active API keys (no hashes or plaintext)."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT key_id, name, role, created_at, last_used_at FROM api_keys"
-            ).fetchall()
-        result = []
-        for row in rows:
-            try:
-                role = Role(row[2])
-            except ValueError:
-                role = Role.READER
-            result.append(APIKey(
-                key_id=row[0], name=row[1], role=role,
-                created_at=row[3], last_used_at=row[4],
-            ))
-        return result
+    def _heads_on_chain_locked(self) -> list[tuple[str, dict]]:
+        """Every recorded head, any tenant, whose record is stored right now."""
+        rows = self._conn.execute(
+            "SELECT key FROM audit_meta WHERE key = ? OR key LIKE ?",
+            (_HEAD_KEY, _HEAD_KEY + ":%"),
+        ).fetchall()
+        heads = []
+        for (key,) in rows:
+            head = _read_head(self._conn, key)
+            if (head is not None and "unreadable" not in head
+                    and _stored_hash_at(self._conn, head["seq"]) == head["hash"]):
+                heads.append((key, head))
+        return heads
 
     # ── Pending outcomes for cross-process tracking ────────────────
 
@@ -1402,22 +2245,56 @@ class SQLiteAuditBackend:
             )
         return bool(cursor.rowcount)
 
-    def purge_stale_pending_outcomes(self, max_age_seconds: int = 86400) -> int:
-        """Remove pending outcomes older than max_age_seconds (default 24h).
+    def list_pending_outcomes(
+        self, tool_name: Optional[str] = None,
+        created_before: Optional[float] = None,
+    ) -> list[dict]:
+        """Pending outcomes, optionally for one tool and older than a time.
 
-        Prevents unbounded growth if outcomes are never reported (crashes,
-        abandoned workflows). Returns count of purged entries.
+        Lets a restarting process find the rows a dead one left behind.
         """
-        cutoff = time.time() - max_age_seconds
+        sql = ("SELECT action_id, agent_id, tool_name, risk_score, created_at "
+               "FROM pending_outcomes WHERE 1=1")
+        args: list = []
+        if tool_name is not None:
+            sql += " AND tool_name=?"
+            args.append(tool_name)
+        if created_before is not None:
+            sql += " AND created_at < ?"
+            args.append(created_before)
+        sql += " ORDER BY created_at"
         with self._lock:
-            cursor = self._conn.execute(
-                "DELETE FROM pending_outcomes WHERE created_at < ?",
-                (cutoff,),
-            )
-        count = cursor.rowcount
-        if count > 0:
-            logger.info("Purged %d stale pending outcomes older than %d seconds", count, max_age_seconds)
-        return count
+            rows = self._conn.execute(sql, args).fetchall()
+        return [{"action_id": r[0], "agent_id": r[1], "tool_name": r[2],
+                 "risk_score": r[3], "created_at": r[4]} for r in rows]
+
+    def repair(self) -> TrailRepair:
+        """Repair this trail in place and reopen it; see ``repair_trail_file``.
+
+        Holds the lock across close, repair and reopen, so no writer in this
+        process can touch the file while it is being swapped. When the repair
+        fails and the file will not reopen either, the connection stays
+        closed and every later write raises, which is the honest state for a
+        trail that cannot record.
+        """
+        if self._in_memory:
+            return TrailRepair(db=":memory:", method="clean")
+        with self._lock:
+            try:
+                self._conn.close()
+            except sqlite3.Error:
+                pass
+            report = repair_trail_file(self._db_path)
+            try:
+                self._open()
+            except (AuditBackendUnreadable, sqlite3.Error) as exc:
+                if report.ok:
+                    report = TrailRepair(
+                        db=report.db, method="failed", problem=report.problem,
+                        damaged_copy=report.damaged_copy,
+                        error=f"repaired file did not reopen: {exc}",
+                    )
+            return report
 
     def close(self) -> None:
         """Close the database connection."""

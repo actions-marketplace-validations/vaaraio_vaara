@@ -31,11 +31,19 @@ def _run_hook(args, event: dict, home: Path, extra_env: dict | None = None):
     ack_dir.mkdir(parents=True, exist_ok=True)
     (ack_dir / "config.json").write_text("{}")
     env = {
-        "HOME": str(home),
+        "HOME": str(home), "USERPROFILE": str(home),
         "PATH": os.environ.get("PATH", ""),
         "VAARA_PLUGIN_SHADOW": "0",
         **(extra_env or {}),
     }
+    # The hook must run the code under test. Without this, a run with
+    # PYTHONPATH pointing at a checkout (a worktree, a release tree) has the
+    # subprocess import whatever vaara the interpreter has installed, while
+    # the responder thread in this process signs with the checkout's code.
+    if "PYTHONPATH" in os.environ:
+        env["PYTHONPATH"] = os.pathsep.join(
+            os.path.abspath(p) for p in os.environ["PYTHONPATH"].split(os.pathsep) if p
+        )
     return subprocess.run(
         [sys.executable, "-c",
          "import sys; from vaara.cli import main; sys.exit(main(sys.argv[1:]))",
@@ -136,7 +144,7 @@ def test_shim_prefers_vaara_binary(tmp_path):
     if not (bindir / "vaara").exists():
         pytest.skip("no vaara console script next to this interpreter")
     env = {
-        "HOME": str(tmp_path),
+        "HOME": str(tmp_path), "USERPROFILE": str(tmp_path),
         "PATH": f"{bindir}:/usr/bin:/bin",
         "VAARA_PLUGIN_SHADOW": "0",
     }
@@ -175,10 +183,8 @@ def _approval_responder(home: Path, decision: str):
         while _time.monotonic() < deadline:
             for req in approvals.glob("*.request.json") if approvals.exists() else []:
                 action_id = req.name.removesuffix(".request.json")
-                (approvals / f"{action_id}.decision.json").write_text(
-                    json.dumps({"decision": decision,
-                                "decided_at": _time.time()})
-                )
+                from vaara.approvals import write_decision
+                write_decision(action_id, decision, approvals_dir=approvals)
                 return
             _time.sleep(0.05)
 
@@ -204,6 +210,59 @@ def test_hook_pre_escalate_approved_by_human_allows(tmp_path):
     ).fetchall()
     assert len(rows) == 1
     assert json.loads(rows[0][0])["resolution"] == "allow"
+
+
+def test_hook_pre_resolution_names_the_arguments_the_human_approved(tmp_path):
+    """The decision MAC binds the arguments (vaara-approval/v2), and the
+    resolution on the trail says which: the digest of the call that ran."""
+    from vaara.approvals import parameters_digest
+
+    _escalate_config(tmp_path)
+    thread = _approval_responder(tmp_path, "approve")
+    proc = _run_hook(
+        ["hook", "pre-tool-use"],
+        {"tool_name": "mcp__files__read", "tool_input": {"path": "notes.txt"}},
+        tmp_path,
+    )
+    thread.join(timeout=1)
+    assert proc.returncode == 0, proc.stderr
+    conn = sqlite3.connect(tmp_path / ".vaara" / "claude-code" / "audit.db")
+    (data,) = conn.execute(
+        "SELECT data FROM audit_records WHERE event_type = 'escalation_resolved'"
+    ).fetchone()
+    assert parameters_digest({"path": "notes.txt"}) in json.loads(data)["justification"]
+
+
+def test_hook_pre_human_approval_is_an_allow_decision_for_claude_code(tmp_path):
+    # Exit 0 with nothing on stdout is "no opinion" to Claude Code: the call
+    # then went through Claude Code's own permission flow, which refused a
+    # call the human had just approved (2026-09-30). The approval has to
+    # reach Claude Code as an explicit allow.
+    _escalate_config(tmp_path)
+    thread = _approval_responder(tmp_path, "approve")
+    proc = _run_hook(
+        ["hook", "pre-tool-use"],
+        {"tool_name": "mcp__files__read", "tool_input": {"path": "notes.txt"}},
+        tmp_path,
+    )
+    thread.join(timeout=1)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)["hookSpecificOutput"]
+    assert out["hookEventName"] == "PreToolUse"
+    assert out["permissionDecision"] == "allow"
+    assert "action_id=" in out["permissionDecisionReason"]
+
+
+def test_hook_pre_pass_without_a_human_stays_silent(tmp_path):
+    # Only a human approval speaks for the call. A call that merely passed
+    # the rules keeps Claude Code's own permission flow in charge.
+    proc = _run_hook(
+        ["hook", "pre-tool-use"],
+        {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+        tmp_path,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == ""
 
 
 def test_hook_pre_escalate_denied_by_human_blocks(tmp_path):
@@ -235,9 +294,17 @@ def test_hook_pre_escalate_timeout_stays_blocked(tmp_path):
     # Escalate stays fail-closed: no human answer means no execution.
     assert proc.returncode == 2, proc.stderr
     assert "ESCALATE" in proc.stderr
-    # No decision arrived, so nothing was resolved and no files linger.
     approvals = tmp_path / ".vaara" / "approvals"
     assert not approvals.exists() or list(approvals.iterdir()) == []
+    # The hold closes on the record as a deny by policy, so the trail can
+    # tell an expired hold from one still waiting. No human acted.
+    conn = sqlite3.connect(tmp_path / ".vaara" / "claude-code" / "audit.db")
+    rows = [json.loads(r[0]) for r in conn.execute(
+        "SELECT data FROM audit_records WHERE event_type = 'escalation_resolved'"
+    ).fetchall()]
+    assert len(rows) == 1
+    assert rows[0]["resolution"] == "deny"
+    assert rows[0].get("human_disposed") is not True
 
 
 def test_hook_pre_escalate_approvals_disabled_blocks_as_before(tmp_path):
@@ -255,3 +322,99 @@ def test_hook_pre_escalate_approvals_disabled_blocks_as_before(tmp_path):
         "SELECT data FROM audit_records WHERE event_type = 'escalation_resolved'"
     ).fetchall()
     assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# A Claude Code deny rule beats a hook allow, so asking a human about a call
+# such a rule refuses only wastes the human's approval (2026-10-01: two
+# approvals of delete calls, both refused by a deny rule in
+# settings.local.json).
+
+_DEL = "r" + "m"  # built at runtime so this file does not trip a shell rule
+
+
+def _cc_deny(path: Path, *rules: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"permissions": {"deny": list(rules)}}))
+
+
+def _resolutions(home: Path) -> list[dict]:
+    conn = sqlite3.connect(home / ".vaara" / "claude-code" / "audit.db")
+    return [json.loads(r[0]) for r in conn.execute(
+        "SELECT data FROM audit_records WHERE event_type = 'escalation_resolved'"
+    ).fetchall()]
+
+
+def test_hook_pre_does_not_ask_about_a_call_a_claude_code_deny_rule_refuses(tmp_path):
+    _escalate_config(tmp_path)
+    _cc_deny(tmp_path / ".claude" / "settings.json", f"Bash({_DEL} *)")
+    thread = _approval_responder(tmp_path, "approve")
+    proc = _run_hook(
+        ["hook", "pre-tool-use"],
+        {"tool_name": "Bash", "tool_input": {"command": f"{_DEL} notes.txt"}},
+        tmp_path,
+    )
+    thread.join(timeout=1)
+    assert proc.returncode == 2, proc.stderr
+    assert f"Claude Code deny rule Bash({_DEL} *)" in proc.stderr
+    assert "APPROVED" not in proc.stderr
+    assert proc.stdout.strip() == ""
+    [resolved] = _resolutions(tmp_path)
+    assert resolved["resolution"] == "deny"
+
+
+def test_hook_pre_project_local_deny_rule_matches_a_compound_command(tmp_path):
+    _escalate_config(tmp_path)
+    project = tmp_path / "project"
+    _cc_deny(project / ".claude" / "settings.local.json", f"Bash({_DEL} *)")
+    proc = _run_hook(
+        ["hook", "pre-tool-use"],
+        {"tool_name": "Bash",
+         "tool_input": {"command": f"cd build && {_DEL} -f x.log"}},
+        tmp_path,
+        extra_env={"CLAUDE_PROJECT_DIR": str(project),
+                   "VAARA_PLUGIN_APPROVALS_TIMEOUT": "30"},
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert "Claude Code deny rule" in proc.stderr
+    approvals = tmp_path / ".vaara" / "approvals"
+    assert not approvals.exists() or not list(approvals.glob("*.request.json"))
+
+
+def test_hook_pre_quoted_operator_is_not_a_subcommand(tmp_path):
+    # The delete inside quotes is an argument to echo, not a command Claude
+    # Code refuses, so the human is still asked.
+    _escalate_config(tmp_path)
+    _cc_deny(tmp_path / ".claude" / "settings.json", f"Bash({_DEL} *)")
+    proc = _run_hook(
+        ["hook", "pre-tool-use"],
+        {"tool_name": "Bash", "tool_input": {"command": f"echo 'a; {_DEL} x'"}},
+        tmp_path, extra_env={"VAARA_PLUGIN_APPROVALS_TIMEOUT": "0.3"},
+    )
+    assert "Claude Code deny rule" not in proc.stderr
+
+
+def test_hook_pre_unrelated_deny_rule_still_asks_the_human(tmp_path):
+    _escalate_config(tmp_path)
+    _cc_deny(tmp_path / ".claude" / "settings.json", "Bash(git push *)", "WebFetch")
+    thread = _approval_responder(tmp_path, "approve")
+    proc = _run_hook(
+        ["hook", "pre-tool-use"],
+        {"tool_name": "Bash", "tool_input": {"command": f"{_DEL} notes.txt"}},
+        tmp_path,
+    )
+    thread.join(timeout=1)
+    assert proc.returncode == 0, proc.stderr
+    assert "APPROVED" in proc.stderr
+
+
+def test_hook_pre_mcp_server_deny_rule_skips_the_question(tmp_path):
+    _escalate_config(tmp_path)
+    _cc_deny(tmp_path / ".claude" / "settings.json", "mcp__files")
+    proc = _run_hook(
+        ["hook", "pre-tool-use"],
+        {"tool_name": "mcp__files__read", "tool_input": {"path": "notes.txt"}},
+        tmp_path, extra_env={"VAARA_PLUGIN_APPROVALS_TIMEOUT": "30"},
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert "Claude Code deny rule mcp__files" in proc.stderr

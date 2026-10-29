@@ -380,3 +380,211 @@ class TestAddRequirementIdempotent:
         assert after[0].title == "Custom override"
         # Built-in count for same article + domain was replaced, not duplicated
         assert before_count >= 1
+
+
+class TestArticleNumbersFollowTheFinalText:
+    """The engine and the record tags cite the Regulation as published.
+
+    Up to v1.96 they carried numbers from the 2021 proposal: 9(4)(a) and
+    9(7) for risk mitigation and testing (final 9(5)(a) and 9(6)), 61(1)
+    for post-market monitoring (final 72(1); final 61 is informed consent
+    for real-world testing) and 26(10) for deployer log keeping (final
+    26(6); final 26(10) is post-remote biometric identification). The DORA
+    bundle cited 10(1) for protection and 12(1) for detection, which are
+    Articles 9 and 10 in Regulation (EU) 2022/2554.
+    """
+
+    def test_eu_ai_act_requirement_articles(self):
+        assert [r.article for r in EU_AI_ACT_REQUIREMENTS] == [
+            "Article 9(1)", "Article 9(2)(a)", "Article 9(5)(a)",
+            "Article 9(6)", "Article 11(1)", "Article 12(1)",
+            "Article 13(1)", "Article 14(1)", "Article 14(4)(d)",
+            "Article 15(1)", "Article 72(1)", "Article 50(1)",
+            "Article 73(1)", "Article 26(6)",
+        ]
+
+    def test_dora_requirement_articles(self):
+        assert [r.article for r in DORA_REQUIREMENTS] == [
+            "Article 9(1)", "Article 10(1)", "Article 13(1)",
+        ]
+
+    def test_new_records_carry_final_text_tags(self):
+        from vaara.audit.trail import DORA_MAPPINGS, EU_AI_ACT_MAPPINGS
+
+        tags = {
+            a.article
+            for mapping in (EU_AI_ACT_MAPPINGS, DORA_MAPPINGS)
+            for articles in mapping.values()
+            for a in articles
+        }
+        proposal_era = {
+            "Article 9(4)(a)", "Article 9(7)", "Article 9(2)(b)",
+            "Article 61(1)", "Article 26(10)", "Article 12(1)",
+        }
+        eu_tags = {
+            a.article for articles in EU_AI_ACT_MAPPINGS.values() for a in articles
+        }
+        dora_tags = {
+            a.article for articles in DORA_MAPPINGS.values() for a in articles
+        }
+        # Article 12(1) is right for the AI Act (logging) and wrong for DORA.
+        assert not (eu_tags & (proposal_era - {"Article 12(1)"}))
+        assert not (dora_tags & proposal_era)
+        assert {"Article 9(5)(a)", "Article 9(6)", "Article 72(1)"} <= tags
+
+
+class TestSOC2TrustServicesCriteria:
+    """SOC 2 TSC (AICPA 2017, points of focus 2022): six common criteria a
+    service auditor asks runtime evidence for. Same two surfaces as the
+    EU AI Act and DORA: requirement rows in the engine, article tags on
+    the records of actions that carry the SOC2 domain."""
+
+    def test_requirement_criteria(self):
+        from vaara.compliance.engine import SOC2_REQUIREMENTS
+        assert [r.article for r in SOC2_REQUIREMENTS] == [
+            "CC6.1", "CC6.2", "CC6.3", "CC7.2", "CC7.3", "CC8.1",
+        ]
+        assert all(r.domain == RegulatoryDomain.SOC2 for r in SOC2_REQUIREMENTS)
+        assert all(r.evidence_event_types for r in SOC2_REQUIREMENTS)
+
+    def test_default_engine_assesses_soc2(self, engine, populated_trail):
+        report = engine.assess(populated_trail)
+        soc2 = [a for a in report.articles
+                if a.requirement.domain == RegulatoryDomain.SOC2]
+        assert [a.requirement.article for a in soc2] == [
+            "CC6.1", "CC6.2", "CC6.3", "CC7.2", "CC7.3", "CC8.1",
+        ]
+        by_article = {a.requirement.article: a for a in soc2}
+        # Decisions were made, so the access and monitoring criteria have evidence
+        assert by_article["CC6.1"].evidence_count > 0
+        assert by_article["CC7.2"].evidence_count > 0
+        # No key change in this trail: the criterion says so, it does not pass by default
+        assert by_article["CC6.2"].status == EvidenceStatus.EVIDENCE_INSUFFICIENT
+        assert "soc2" in report.narrative.lower() or "SOC2" in report.narrative
+
+    def test_soc2_actions_carry_criterion_tags(self, trail):
+        from vaara.taxonomy.actions import create_default_registry
+        registry = create_default_registry()
+        at = registry.classify("data.read")
+        assert RegulatoryDomain.SOC2 in at.regulatory_domains
+        action_id = trail.record_action_requested(
+            ActionRequest(agent_id="a", tool_name="data.read", action_type=at)
+        )
+        trail.record_risk_scored(
+            action_id=action_id, agent_id="a", tool_name="data.read",
+            assessment={"risk": 0.1}, regulatory_domains=at.regulatory_domains,
+        )
+        trail.record_decision(
+            action_id=action_id, agent_id="a", tool_name="data.read",
+            decision="allow", reason="ok", risk_score=0.1,
+            regulatory_domains=at.regulatory_domains,
+        )
+        tags = {
+            et: {(a["domain"], a["article"]) for a in rec.regulatory_articles}
+            for et in (EventType.ACTION_REQUESTED, EventType.RISK_SCORED,
+                       EventType.DECISION_MADE)
+            for rec in trail.get_records_by_type(et)
+        }
+        assert ("soc2", "CC7.2") in tags[EventType.ACTION_REQUESTED]
+        assert ("soc2", "CC7.2") in tags[EventType.RISK_SCORED]
+        assert {("soc2", "CC6.1"), ("soc2", "CC6.3")} <= tags[EventType.DECISION_MADE]
+        # The EU AI Act tags are still there beside them
+        assert ("eu_ai_act", "Article 12(1)") in tags[EventType.ACTION_REQUESTED]
+
+    def test_untagged_actions_carry_no_soc2(self, trail):
+        from vaara.taxonomy.actions import create_default_registry
+        at = create_default_registry().classify("comm.send_email")
+        assert RegulatoryDomain.SOC2 not in at.regulatory_domains
+        trail.record_action_requested(
+            ActionRequest(agent_id="a", tool_name="comm.send_email", action_type=at)
+        )
+        rec = trail.get_records_by_type(EventType.ACTION_REQUESTED)[0]
+        assert not [a for a in rec.regulatory_articles if a["domain"] == "soc2"]
+
+    def test_blocked_action_is_cc73_evidence(self, trail):
+        from vaara.taxonomy.actions import create_default_registry
+        at = create_default_registry().classify("infra.config_change")
+        trail.record_decision(
+            action_id="x", agent_id="a", tool_name="infra.config_change",
+            decision="deny", reason="policy", risk_score=0.9,
+            regulatory_domains=at.regulatory_domains,
+        )
+        rec = trail.get_records_by_type(EventType.ACTION_BLOCKED)[0]
+        soc2 = {a["article"] for a in rec.regulatory_articles if a["domain"] == "soc2"}
+        assert soc2 == {"CC6.1", "CC7.3"}
+
+    def test_taxonomy_tags_the_soc2_action_classes(self):
+        from vaara.taxonomy.actions import BUILTIN_ACTIONS
+        tagged = {a.name for a in BUILTIN_ACTIONS
+                  if RegulatoryDomain.SOC2 in a.regulatory_domains}
+        assert tagged == {
+            "data.read", "data.write", "data.delete", "data.export",
+            "infra.deploy", "infra.config_change", "infra.terminate",
+            "id.grant_permission", "id.create_key", "id.revoke",
+        }
+
+    def test_the_trails_own_control_events_are_soc2_evidence(self, trail):
+        trail.record_escalation(
+            action_id="e", agent_id="a", tool_name="t",
+            risk_score=0.5, escalation_target="ops",
+        )
+        trail.record_escalation_resolved(
+            action_id="e", agent_id="a", tool_name="t",
+            resolution="deny", reviewer="jane", justification="no",
+        )
+        sent = trail.get_records_by_type(EventType.ESCALATION_SENT)[0]
+        resolved = trail.get_records_by_type(EventType.ESCALATION_RESOLVED)[0]
+        for rec in (sent, resolved):
+            assert ("soc2", "CC7.3") in {
+                (a["domain"], a["article"]) for a in rec.regulatory_articles
+            }
+
+
+class TestSOC2RowsAreNotCriticalByDefault:
+    """Audit 2026-10-10 (R1): 2.8.0 added SOC 2 to the default engine with
+    four rows critical, so a trail that reported no critical gaps on 2.7.1
+    reported SOC 2 critical gaps on 2.8.0 with nothing changed on the
+    operator's side. The rows are assessed in every default report; they
+    move the overall status only when a deployer marks them critical."""
+
+    def test_soc2_rows_are_assessed_but_not_critical(self):
+        from vaara.compliance.engine import SOC2_REQUIREMENTS
+        assert not any(r.is_critical for r in SOC2_REQUIREMENTS)
+
+    def test_a_small_trail_reports_the_same_overall_status_as_before_soc2(self):
+        from vaara.audit.trail import AuditTrail
+        from vaara.compliance.engine import (
+            DORA_REQUIREMENTS, EU_AI_ACT_REQUIREMENTS, ComplianceEngine,
+        )
+        trail = AuditTrail()
+        at = ActionType(
+            "data.read", ActionCategory.DATA, Reversibility.FULLY,
+            BlastRadius.LOCAL, UrgencyClass.DEFERRABLE,
+            frozenset({RegulatoryDomain.EU_AI_ACT, RegulatoryDomain.SOC2}),
+        )
+        for n in range(5):
+            req = ActionRequest(agent_id="ag", tool_name="data.read", action_type=at,
+                                parameters={"n": n}, confidence=0.8)
+            action_id = trail.record_action_requested(req)
+            trail.record_risk_scored(
+                action_id=action_id, agent_id="ag", tool_name="data.read",
+                assessment={"risk": 0.1}, regulatory_domains=at.regulatory_domains)
+            trail.record_decision(
+                action_id=action_id, agent_id="ag", tool_name="data.read",
+                decision="allow", reason="routine", risk_score=0.1,
+                regulatory_domains=at.regulatory_domains)
+        with_soc2 = ComplianceEngine().assess(trail)
+        without = ComplianceEngine(EU_AI_ACT_REQUIREMENTS + DORA_REQUIREMENTS).assess(trail)
+        assert with_soc2.overall_status == without.overall_status
+        assert with_soc2.critical_gaps == without.critical_gaps
+        assert any(a.requirement.domain == RegulatoryDomain.SOC2 for a in with_soc2.articles)
+
+    def test_a_deployer_can_mark_a_criterion_critical(self):
+        from vaara.audit.trail import AuditTrail
+        from vaara.compliance.engine import SOC2_REQUIREMENTS, ComplianceEngine
+        import dataclasses
+        engine = ComplianceEngine(
+            [dataclasses.replace(r, is_critical=True) for r in SOC2_REQUIREMENTS])
+        report = engine.assess(AuditTrail())
+        assert report.overall_status == EvidenceStatus.EVIDENCE_INSUFFICIENT
+        assert any(g.startswith("CC7.2") for g in report.critical_gaps)

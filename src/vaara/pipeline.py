@@ -42,11 +42,15 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
-from vaara._sanitize import json_safe
+from vaara import _disposition
+from vaara._decision_vocabulary import FINE_TO_COARSE
+from vaara._sanitize import json_safe, log_safe
 from pathlib import Path
 
 from vaara.audit.sqlite_backend import SQLiteAuditBackend
 from vaara.audit.trail import AuditTrail, EventType
+from vaara.authority import AuthorityPolicy, policy_from_env
+from vaara.authority import check as _authority_check
 
 if TYPE_CHECKING:
     # Capability appears only in annotations, which `from __future__ import
@@ -71,15 +75,26 @@ logger = logging.getLogger(__name__)
 # would otherwise grow the dict unboundedly across a long-running
 # agent session. Evicting the oldest entry keeps memory bounded;
 # late report_outcome calls after eviction no-op with a warning.
+# Earlier actions of a session replayed into a fresh scorer's sequence
+# window; the scorer keeps no more than this per agent.
+_REPLAY_WINDOW = 50
 _MAX_PENDING_OUTCOMES = 50_000
 
 # Cap on the action -> granted-capability map used for delegated-privilege
 # attenuation. Same unbounded-growth concern as pending outcomes: an agent
 # session that threads capabilities through many intercepts would grow the
-# map one entry per action. Oldest-first eviction keeps it bounded; a child
-# whose parent grant was evicted simply cannot be attenuation-checked and is
-# handled fail-open on the lookup (the parent grant is unknown, not broadened).
+# map one entry per action. Oldest-first eviction keeps it bounded; the map
+# is only a cache: a parent grant it no longer holds is read back from the
+# parent's action_requested record on the trail.
 _MAX_TRACKED_GRANTS = 50_000
+
+# What a child carrying a grant gets when its parent's grant is in neither
+# memory nor the trail: refused (default), or let through marked unverified.
+_UNKNOWN_PARENT_MODES = ("deny", "allow")
+
+# What a child presenting no grant gets when the parent it names ran under
+# one: refused (default), or let through marked unverified.
+_GRANTLESS_CHILD_MODES = ("deny", "allow")
 
 
 # Length caps on caller-supplied string fields at the pipeline ingress.
@@ -120,6 +135,27 @@ _MAX_OVERRIDE_REASON_LEN = 8192
 _MAX_DECISION_LABEL_LEN = 64
 
 
+# The projection from the policy vocabulary onto the three words that are
+# recorded (see vaara._decision_vocabulary for the table and why it exists).
+#
+# Projecting HERE, at the pipeline boundary rather than downstream, is
+# deliberate. Eleven call sites across the integrations branch on
+# `result.decision == "escalate"` or `== "deny"` to decide whether to raise:
+# langchain.py:173,181,353,361, openai_agents.py:152,159,272,278,
+# claude_code_hooks.py:376, mcp_server.py:658, _infer_proxy_gate.py:104. A
+# fine-grained name flowing out of intercept() would miss every one of those
+# branches and read as a fall-through, which is a fail-OPEN in exactly the
+# code paths that exist to stop an action. `InterceptionResult.decision`
+# therefore keeps returning the coarse word and `decision_detail` carries the
+# refinement for callers that know to look.
+_FINE_TO_COARSE = FINE_TO_COARSE
+
+# JSON-serialized bytes for a gate-proposed argument set. Same amplification
+# concern as _MAX_PARAMS_JSON_BYTES: this value is scorer-controlled, lands
+# on the hash chain, and goes back to the caller.
+_MAX_MODIFIED_PARAMS_JSON_BYTES = 64 * 1024
+
+
 def _cap_str(value: Any, max_len: int, field_name: str) -> str:
     """Truncate a caller-supplied string to max_len with a TRUNCATED marker.
 
@@ -141,6 +177,55 @@ def _cap_str(value: Any, max_len: int, field_name: str) -> str:
     if keep <= 0:
         return value[:max_len]
     return value[:keep] + marker
+
+
+def _sequence_steps(scorer_result: Any) -> Optional[dict[str, list[str]]]:
+    """The scorer's ``sequence_steps``, kept only in its documented shape.
+
+    A third-party scorer can return anything here, and the value goes into a
+    hash-chained record, so only a mapping of pattern name to a list of
+    action-id strings passes; anything else is left out of the record.
+    """
+    steps = scorer_result.get("sequence_steps") if isinstance(scorer_result, dict) else None
+    if not isinstance(steps, dict):
+        return None
+    kept = {
+        str(name): [i for i in ids if isinstance(i, str) and i]
+        for name, ids in steps.items()
+        if isinstance(ids, (list, tuple))
+    }
+    return {name: ids for name, ids in kept.items() if ids} or None
+
+
+def _value_origin(raw: Any) -> Optional[dict[str, dict[str, Any]]]:
+    """A caller's ``value_origin``, kept only in its documented shape.
+
+    It goes into a hash-chained record, so only argument name to
+    ``{"seen_in": [action-id strings], "source": str}`` passes, plus
+    ``"rule": "strict"`` when strict mode held the value.
+    """
+    if not isinstance(raw, dict):
+        return None
+    kept: dict[str, dict[str, Any]] = {}
+    for name, info in raw.items():
+        if not isinstance(info, dict):
+            continue
+        ids = info.get("seen_in")
+        source = info.get("source")
+        kept[str(name)[:_MAX_TOOL_NAME_LEN]] = {
+            "seen_in": [i[:_MAX_TOOL_NAME_LEN] for i in ids if isinstance(i, str) and i][:5]
+            if isinstance(ids, (list, tuple)) else [],
+            "source": source[:_MAX_TOOL_NAME_LEN] if isinstance(source, str) else "",
+        }
+        if info.get("rule") == "strict":
+            kept[str(name)[:_MAX_TOOL_NAME_LEN]]["rule"] = "strict"
+    return kept or None
+
+
+def _describe_origin(held: dict[str, dict[str, Any]]) -> str:
+    from vaara.scorer.value_origin import describe
+
+    return describe(held)
 
 
 def _json_safe_dict(d: Optional[dict]) -> dict:
@@ -215,13 +300,22 @@ class InterceptionResult:
     """Result of intercepting an action request."""
     allowed: bool
     action_id: str              # For tracking outcome later
-    decision: str               # "allow", "deny", "escalate"
+    decision: str               # "allow", "deny", "escalate" — always coarse
     risk_score: float           # Point estimate
     risk_interval: tuple[float, float]  # Conformal (lower, upper)
     reason: str
     action_type: ActionType
     signals: dict[str, float]   # Contributing risk signals
     evaluation_ms: float
+    # The AARM Core R4 refinement behind `decision`, when there is one:
+    # "modify", "step_up" or "defer". None when the decision was already
+    # one of the coarse three. `decision` stays coarse so existing callers
+    # keep working; read this when the finer answer matters.
+    decision_detail: Optional[str] = None
+    # Only set alongside decision_detail == "modify": the arguments the gate
+    # is willing to permit. The original call is denied. Resubmit these
+    # through intercept() to get a decision bound to them.
+    modified_parameters: Optional[dict] = None
 
 
 class InterceptionPipeline:
@@ -239,6 +333,10 @@ class InterceptionPipeline:
         compliance: Optional[ComplianceEngine] = None,
         enforce: bool = True,
         review_queue: Optional[Any] = None,
+        authority: Optional[AuthorityPolicy] = None,
+        require_delegatee_binding: bool = False,
+        unknown_parent: str = "deny",
+        grantless_child: str = "deny",
     ) -> None:
         """
         Args:
@@ -263,7 +361,44 @@ class InterceptionPipeline:
                 with its conformal interval and signals. Default ``None``
                 preserves prior behaviour — pipeline writes the
                 ``ESCALATION_SENT`` audit record only.
+            authority: Authority decay for sessions (see
+                ``vaara.authority``). Defaults to the policy
+                ``VAARA_AUTHORITY_BUDGET`` describes: on, budget 3.0.
+            require_delegatee_binding: When True, a child action is denied
+                unless its parent was recorded naming it in ``delegatees``.
+                Default False: a parent that names nobody leaves its
+                children as before, and the delegation graph reports
+                them as unbound.
+            unknown_parent: What a child carrying a capability grant gets
+                when the parent it names has no grant on record, in memory
+                or on the trail (an invented id, another tenant's action, a
+                trail rotated past it). ``"deny"`` (default) refuses it with
+                ``violation_type`` ``privilege_attenuation``. ``"allow"``
+                lets the scorer decide, for deployments whose parents run
+                behind another gate; the decision record still says
+                ``attenuation.status`` ``unverified``.
+            grantless_child: What a child presenting no capability grant
+                gets when the parent it names ran under one. Without a grant
+                the child has no bound, so it would exceed its parent's.
+                ``"deny"`` (default) refuses it with ``violation_type``
+                ``privilege_attenuation`` and ``attenuation.reason``
+                ``child_without_grant``. ``"allow"`` lets the scorer decide;
+                the decision record still says ``attenuation.status``
+                ``unverified``.
         """
+        if unknown_parent not in _UNKNOWN_PARENT_MODES:
+            raise ValueError(
+                f"unknown_parent must be one of {_UNKNOWN_PARENT_MODES}, "
+                f"not {unknown_parent!r}"
+            )
+        if grantless_child not in _GRANTLESS_CHILD_MODES:
+            raise ValueError(
+                f"grantless_child must be one of {_GRANTLESS_CHILD_MODES}, "
+                f"not {grantless_child!r}"
+            )
+        self._unknown_parent = unknown_parent
+        self._grantless_child = grantless_child
+        self.authority = authority if authority is not None else policy_from_env()
         self.registry = registry or create_default_registry()
         self.scorer = scorer or AdaptiveScorer()
         if trail is None:
@@ -275,6 +410,7 @@ class InterceptionPipeline:
         self.compliance = compliance or ComplianceEngine()
         self._enforce = enforce
         self._review_queue = review_queue
+        self._require_delegatee_binding = bool(require_delegatee_binding)
 
         # Track action_id to (predicted_risk, signals) for outcome feedback.
         # When the trail has a SQLite backend, pending outcomes persist to
@@ -285,17 +421,119 @@ class InterceptionPipeline:
             str, tuple[float, dict[str, float]]
         ] = OrderedDict()
         self._pending_outcomes_lock = threading.Lock()
+        # action_id -> (agent_id, tool_name) for the pending entries that also
+        # reached the database. For those the database row is the claim: only
+        # the caller whose DELETE removes it may record the outcome, so two
+        # threads or two processes cannot both write one.
+        self._pending_in_db: dict[str, tuple[str, str]] = {}
+        # Serialises resolve_escalation's "already resolved?" check with its
+        # write, so two concurrent resolvers cannot both pass the check.
+        self._resolve_lock = threading.Lock()
 
-        # Delegated-privilege attenuation: action_id -> the capability grant
-        # under which that action ran. A child action carrying its own grant
-        # plus a parent_action_id is checked so its authority never exceeds
-        # the parent grant (see capability_subsumes). Bounded FIFO eviction.
+        # Delegated-privilege attenuation: action_id -> (tenant, the capability
+        # grant under which that action ran). A child action carrying its own
+        # grant plus a parent_action_id is checked so its authority never
+        # exceeds the parent grant (see capability_subsumes). Bounded FIFO
+        # eviction; a miss falls through to the trail (_parent_grant).
         self._grants_for_action: OrderedDict[
-            str, tuple[Capability, ...]
+            str, tuple[str, tuple[Capability, ...]]
         ] = OrderedDict()
         self._grants_lock = threading.Lock()
+        # Delegatee binding: action_id -> the agents it named as delegates,
+        # or None when it named nobody. Same lock and bound as the grants.
+        self._delegatees_for_action: OrderedDict[
+            str, Optional[frozenset[str]]
+        ] = OrderedDict()
         self._metrics = PipelineMetrics()
         self._metrics_lock = threading.Lock()
+        # The digest of the decision state last written to the trail, so the
+        # full state rides only on the first decision after it changes.
+        self._last_policy_digest = ""
+        self._policy_digest_lock = threading.Lock()
+
+    def _replay_session(self, agent_id: str, session_id: str, tenant_id: str,
+                        action_id: str) -> None:
+        seed = getattr(self.scorer, "seed_session", None)
+        seen = getattr(self.scorer, "session_seen", None)
+        if seed is None or seen is None or seen(agent_id, session_id):
+            return
+        try:
+            entries = []
+            for r in self.trail.get_session_records(agent_id, session_id, tenant_id):
+                if r.event_type != EventType.ACTION_REQUESTED or r.action_id == action_id:
+                    continue
+                params = (r.data or {}).get("parameters") or {}
+                entries.append((r.tool_name, params, r.action_id))
+            entries = entries[-_REPLAY_WINDOW:]
+            seed(agent_id, session_id, [
+                (tool, self.registry.classify(tool, params).name, params, aid)
+                for tool, params, aid in entries
+            ])
+        except Exception:
+            logger.exception("session replay failed for %s/%s; scoring without it",
+                             log_safe(agent_id), log_safe(session_id))
+
+    def _parent_grant(self, parent_action_id: str, tenant_id: str
+                      ) -> tuple[tuple[Capability, ...] | str, str]:
+        """The parent's capability grant and where it came from.
+
+        Returns ``(grant, "memory" | "trail")``, or ``(why, "")`` when the
+        check cannot run: ``parent_unknown`` (no request with that id in this
+        tenant), ``parent_no_grant`` (the parent ran under no grant) or
+        ``parent_grant_unreadable`` (the recorded grant does not parse).
+        """
+        with self._grants_lock:
+            held = self._grants_for_action.get(parent_action_id)
+        if held is not None and held[0] == tenant_id:
+            return held[1], "memory"
+        try:
+            records = self.trail.get_action_trail(parent_action_id)
+        except Exception:
+            logger.exception("parent grant lookup failed for %s",
+                             log_safe(parent_action_id))
+            return "parent_unknown", ""
+        request = next((r for r in records if "parameters" in (r.data or {})), None)
+        if request is None or (request.tenant_id or "") != (tenant_id or ""):
+            return "parent_unknown", ""
+        if "capabilities" not in request.data:
+            return "parent_no_grant", ""
+        from vaara.attestation._attest_types import AttestationError
+        from vaara.credential._grant_capability import capability_from_dict
+        wire = request.data["capabilities"]
+        try:
+            if not isinstance(wire, list) or not wire:
+                raise AttestationError("recorded grant is not a list")
+            return tuple(capability_from_dict(d) for d in wire), "trail"
+        except AttestationError:
+            return "parent_grant_unreadable", ""
+
+    def _scorer_policy_id(self) -> str:
+        return f"scorer:{type(self.scorer).__name__}"
+
+    def _policy_snapshot(self) -> tuple[str, Optional[dict]]:
+        """The digest of the decision state, and the state when it changed.
+
+        Never blocks a decision: a state that cannot be described or digested
+        leaves the record without either key.
+        """
+        from vaara import __version__
+        from vaara.policy_state import digest, engine_state
+
+        try:
+            state = engine_state(version=__version__, enforce=self._enforce,
+                                 scorer=self.scorer, authority=self.authority,
+                                 require_delegatee_binding=self._require_delegatee_binding,
+                                 unknown_parent=self._unknown_parent,
+                                 grantless_child=self._grantless_child)
+            policy_digest = digest(state)
+        except Exception:
+            logger.warning("decision state could not be digested; recording "
+                           "the decision without policy_digest", exc_info=True)
+            return "", None
+        with self._policy_digest_lock:
+            changed = policy_digest != self._last_policy_digest
+            self._last_policy_digest = policy_digest
+        return policy_digest, (state if changed else None)
 
     def intercept(
         self,
@@ -310,6 +548,12 @@ class InterceptionPipeline:
         tenant_id: str = "",
         capabilities: Optional[Sequence[Capability]] = None,
         _event_type_override: Optional[EventType] = None,
+        policy_decision: Optional[str] = None,
+        policy_reason: str = "",
+        policy_id: str = "",
+        value_origin: Optional[dict] = None,
+        delegatees: Optional[Sequence[str]] = None,
+        enforcement: Optional[str] = None,
     ) -> InterceptionResult:
         """Intercept an agent action request.
 
@@ -321,11 +565,54 @@ class InterceptionPipeline:
         enforces delegated-privilege attenuation: the action's grant must be a
         subset of the parent action's grant, so authority never grows down a
         delegation chain. A broadening grant is denied fail-closed regardless
-        of risk score. With no capabilities the behaviour is unchanged.
+        of risk score. The grant is recorded on the action's request, so the
+        parent grant is read back from the trail when this process does not
+        hold it; a parent with no request on record is denied unless the
+        pipeline was built with ``unknown_parent="allow"``. The decision
+        record's ``attenuation`` says whether the check held, was violated or
+        could not run. With no capabilities the behaviour is unchanged.
+
+        ``policy_decision`` is a verdict a rule in front of the pipeline has
+        already reached (``"deny"`` from a deny rule). The action is still
+        scored, and the score is recorded, but the decision on the chain is
+        that verdict with ``policy_reason``. Without it a call a rule blocked
+        was recorded as the scorer's allow, which is evidence of the opposite
+        of what happened. ``policy_id`` names the rule that reached it.
+
+        Every deny on the chain carries ``policy_id`` (which policy denied)
+        and ``violation_type`` (on what ground): ``policy_rule``,
+        ``privilege_attenuation``, ``risk_threshold``, ``invalid_decision``
+        or ``scorer_failure``. A scorer may name its own by returning
+        ``policy_id`` and ``violation_type`` string keys.
+
+        ``value_origin`` names the authority arguments whose value the caller
+        saw only in external tool results, as ``{arg: {"seen_in": [action
+        ids], "source": tool}}`` (:func:`vaara.scorer.value_origin.origin_hold`).
+        An allow becomes an escalate, the reason names the result the value
+        came from, and the record carries the mapping. A prior approval of the
+        same call still replays.
+
+        ``delegatees`` names the agents this action may hand work to, as the
+        gate records their ``agent_id`` (where agents authenticate by key,
+        the key's RFC 7638 thumbprint). It lands in the hash-covered request.
+        A child whose parent named delegates must be one of them, or it is
+        denied fail-closed with ``violation_type`` ``delegation_binding``:
+        knowing a parent's action id is not enough to act under it.
+
+        ``enforcement`` is what the decision record says about whether this
+        verdict could stop the action: ``could_block`` when the pipeline
+        enforces, ``shadow`` when it does not. A caller whose own verdict
+        decides, or who records an action it cannot hold, names the mode
+        itself (``could_block``, ``shadow``, ``recorded_only``).
 
         Returns an InterceptionResult — check .allowed before executing.
         """
-        start = time.monotonic()
+        start = time.perf_counter()
+        value_origin = _value_origin(value_origin)
+        if enforcement is None:
+            enforcement = "could_block" if self._enforce else "shadow"
+        if policy_decision is not None and policy_decision not in _FINE_TO_COARSE:
+            raise ValueError(f"policy_decision must be a decision, not {policy_decision!r}")
 
         # Cap oversized caller-supplied strings BEFORE classify/audit so
         # a 50MB tool_name cannot land in the hash chain, export, or
@@ -337,6 +624,12 @@ class InterceptionPipeline:
             parent_action_id = _cap_str(
                 parent_action_id, _MAX_PARENT_ACTION_ID_LEN, "parent_action_id"
             )
+        if delegatees is not None:
+            if isinstance(delegatees, str):
+                raise ValueError("delegatees must be a sequence of agent ids, not a string")
+            delegatees = tuple(sorted({
+                _cap_str(str(d), _MAX_AGENT_ID_LEN, "delegatees") for d in delegatees
+            }))
 
         # 1. Classify the action
         action_type = self.registry.classify(tool_name, parameters)
@@ -353,6 +646,14 @@ class InterceptionPipeline:
             _json_safe_dict(context), _MAX_CONTEXT_JSON_BYTES, "context"
         )
 
+        child_caps = tuple(capabilities) if capabilities else None
+        wire_caps = None
+        if child_caps is not None:
+            # Lazy import: only when a caller actually uses capability grants,
+            # which already live in the credential/attestation extra.
+            from vaara.credential._grant_capability import capability_to_dict
+            wire_caps = tuple(capability_to_dict(c) for c in child_caps)
+
         # 2. Build the request envelope
         request = ActionRequest(
             agent_id=agent_id,
@@ -366,6 +667,8 @@ class InterceptionPipeline:
             sequence_position=sequence_position,
             timestamp_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             tenant_id=tenant_id,
+            delegatees=delegatees,
+            capabilities=wire_caps,
         )
 
         # 3. Record the request in audit trail
@@ -375,27 +678,79 @@ class InterceptionPipeline:
 
         # 3b. Delegated-privilege attenuation. Record this action's grant for
         # its own children to check against, then verify this action does not
-        # exceed the grant of the parent that delegated to it. Fail-closed on a
-        # broadening grant; fail-open when the parent grant is unknown (never
-        # recorded, or evicted) — absence of a parent grant is not evidence of
-        # a violation. Applied to the decision at step 6b.
-        child_caps = tuple(capabilities) if capabilities else None
+        # exceed the grant of the parent that delegated to it. The parent grant
+        # comes from memory, else from the parent's request on the trail (an
+        # evicted entry, another process). Fail-closed on a broadening grant,
+        # on an unreadable one, and on a parent in neither place unless the
+        # deployer chose unknown_parent="allow"; a child with no grant under a
+        # parent with one is refused unless grantless_child="allow". Every
+        # outcome is written to the decision record as `attenuation`. Applied
+        # at step 6b.
         attenuation_reason: Optional[str] = None
+        attenuation: Optional[dict] = None
         if child_caps is not None:
-            # Lazy import: only when a caller actually uses capability grants,
-            # which already live in the credential/attestation extra.
             from vaara.credential._grant_attenuation import capability_subsumes
             with self._grants_lock:
-                self._grants_for_action[action_id] = child_caps
+                self._grants_for_action[action_id] = (tenant_id, child_caps)
                 if len(self._grants_for_action) > _MAX_TRACKED_GRANTS:
                     self._grants_for_action.popitem(last=False)
             if parent_action_id:
-                with self._grants_lock:
-                    parent_caps = self._grants_for_action.get(parent_action_id)
-                if parent_caps is not None:
+                parent_caps, source = self._parent_grant(parent_action_id, tenant_id)
+                if isinstance(parent_caps, tuple):
                     ok, why = capability_subsumes(parent_caps, child_caps)
+                    attenuation = {"status": "held", "source": source}
                     if not ok:
                         attenuation_reason = why
+                        attenuation = {"status": "violated", "reason": why,
+                                       "source": source}
+                else:
+                    # parent_caps names why the check could not run.
+                    attenuation = {"status": "unverified", "reason": parent_caps}
+                    if parent_caps == "parent_grant_unreadable" or (
+                        parent_caps == "parent_unknown"
+                        and self._unknown_parent == "deny"
+                    ):
+                        attenuation_reason = parent_caps
+        elif parent_action_id:
+            # A child presenting no grant has no bound. Under a parent that
+            # ran under a grant it would exceed it, so it is refused unless
+            # the deployer chose grantless_child="allow". A parent with no
+            # grant, or one not found, leaves the child as before: there is
+            # no bound to exceed, or none known.
+            parent_caps, source = self._parent_grant(parent_action_id, tenant_id)
+            if isinstance(parent_caps, tuple):
+                why = "child_without_grant"
+                if self._grantless_child == "deny":
+                    attenuation_reason = why
+                    attenuation = {"status": "violated", "reason": why,
+                                   "source": source}
+                else:
+                    attenuation = {"status": "unverified", "reason": why,
+                                   "source": source}
+            elif parent_caps == "parent_grant_unreadable":
+                attenuation_reason = parent_caps
+                attenuation = {"status": "unverified", "reason": parent_caps}
+
+        # 3b2. Delegatee binding. A parent that named its delegates admits only
+        # them; anyone else holding its action id is refused. A parent that
+        # named nobody, or one this pipeline never saw, is refused only when
+        # the deployer requires the binding. Applied at step 6b.
+        binding_reason: Optional[str] = None
+        with self._grants_lock:
+            self._delegatees_for_action[action_id] = (
+                frozenset(delegatees) if delegatees is not None else None
+            )
+            if len(self._delegatees_for_action) > _MAX_TRACKED_GRANTS:
+                self._delegatees_for_action.popitem(last=False)
+            if parent_action_id:
+                known = parent_action_id in self._delegatees_for_action
+                bound = self._delegatees_for_action.get(parent_action_id)
+        if parent_action_id:
+            if bound is not None:
+                if agent_id not in bound:
+                    binding_reason = "delegatee_not_bound"
+            elif self._require_delegatee_binding:
+                binding_reason = "parent_unbound" if known else "parent_unknown"
 
         # 4. Score the risk. If the scorer raises — corrupt model bundle,
         # feature pipeline exception, any library bug — we've already
@@ -407,7 +762,15 @@ class InterceptionPipeline:
         # an explicit "scorer failure" reason so the hash chain stays
         # consistent, then re-raise so the caller knows the governance
         # system broke rather than that the action is simply high-risk.
+        # 3c. A scorer that has not seen this session yet (a hook is one
+        # process per call) gets the session's earlier actions from the trail,
+        # so a sequence spanning calls can match. Same source authority decay
+        # replays from. Never fatal: without it the call is scored as before.
+        if session_id:
+            self._replay_session(agent_id, session_id, tenant_id, action_id)
+
         policy_context = request.to_policy_context()
+        policy_context["action_id"] = action_id
         try:
             scorer_result = self.scorer.evaluate(policy_context)
         except Exception as exc:
@@ -426,6 +789,7 @@ class InterceptionPipeline:
                     _MAX_DECISION_REASON_LEN,
                     "reason",
                 )
+                fail_digest, fail_state = self._policy_snapshot()
                 self.trail.record_decision(
                     action_id=action_id,
                     agent_id=agent_id,
@@ -434,6 +798,13 @@ class InterceptionPipeline:
                     reason=fail_reason,
                     risk_score=1.0,
                     regulatory_domains=action_type.regulatory_domains,
+                    policy_id=self._scorer_policy_id(),
+                    violation_type="scorer_failure",
+                    unavailable_input=self._scorer_policy_id(),
+                    policy_digest=fail_digest,
+                    policy_state=fail_state,
+                    enforcement=enforcement,
+                    attenuation=attenuation,
                 )
             except Exception:
                 logger.exception(
@@ -538,20 +909,34 @@ class InterceptionPipeline:
         bucket_raw = raw.get("bucket_category")
         bucket_category = bucket_raw if isinstance(bucket_raw, str) and bucket_raw else None
 
+        # The thresholds this decision was made against. The receipt
+        # (`audit.receipts`) reads them off this record and, when they are
+        # absent, falls back to a legacy pair that matches no current mode.
+        # Every live receipt did exactly that until 2026-09-22, claiming
+        # 0.4 / 0.7 for an engine deciding at 0.55 / 0.85. The scorer's
+        # `evaluate` puts them at the top of its result (`to_dict`, the
+        # shape the pipeline sees); the per-class path puts them inside
+        # raw_result. Read both, top level first; carry them as floats.
+        assessment = {
+            "point_estimate": point_estimate,
+            "conformal_lower": interval[0],
+            "conformal_upper": interval[1],
+            "signals": signals,
+            "calibration_size": raw.get("calibration_size", 0),
+            "effective_alpha": effective_alpha,
+            "bucket_category": bucket_category,
+        }
+        for key in ("threshold_allow", "threshold_deny"):
+            value = scorer_result.get(key, raw.get(key))
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                assessment[key] = float(value)
+
         # 5. Record risk scoring in audit
         self.trail.record_risk_scored(
             action_id=action_id,
             agent_id=agent_id,
             tool_name=tool_name,
-            assessment={
-                "point_estimate": point_estimate,
-                "conformal_lower": interval[0],
-                "conformal_upper": interval[1],
-                "signals": signals,
-                "calibration_size": raw.get("calibration_size", 0),
-                "effective_alpha": effective_alpha,
-                "bucket_category": bucket_category,
-            },
+            assessment=assessment,
             regulatory_domains=action_type.regulatory_domains,
         )
 
@@ -564,18 +949,75 @@ class InterceptionPipeline:
         # Normalise to a known vocabulary; anything unrecognised fails
         # closed to "deny" — this preserves the pipeline's fail-closed
         # invariant established on the scorer-exception path above.
-        raw_decision = scorer_result.get("action", "deny")
+        raw_decision = scorer_result.get("action")
         if isinstance(raw_decision, str):
             decision_str = raw_decision.strip().lower()
         else:
-            decision_str = "deny"
-        if decision_str not in ("allow", "deny", "escalate"):
+            decision_str = ""
+        # Which policy a deny came from and on what ground. The scorer's
+        # thresholds are the policy unless the scorer names its own.
+        deny_policy_id = scorer_result.get("policy_id")
+        if not isinstance(deny_policy_id, str) or not deny_policy_id:
+            deny_policy_id = self._scorer_policy_id()
+        violation_type = scorer_result.get("violation_type")
+        if not isinstance(violation_type, str) or not violation_type:
+            violation_type = "risk_threshold"
+        # A scorer that failed closed names what it could not reach. Without
+        # it, a deny from a scorer that never got an answer would be recorded
+        # on the same ground as an action that was scored and found too risky.
+        unavailable_input = scorer_result.get("unavailable_input")
+        if not isinstance(unavailable_input, str):
+            unavailable_input = ""
+        unrecognised_decision: Optional[str] = None
+        if decision_str not in _FINE_TO_COARSE:
+            # No decision, or one outside the vocabulary: the scorer's answer
+            # could not be read, so no check completed on this action. The
+            # record names the value it could not read, so a reader can tell
+            # a refusal spelled in another vocabulary from no answer at all.
+            unrecognised_decision = (
+                "no decision" if raw_decision is None
+                else f"unrecognised decision {str(raw_decision)[:64]!r}"
+            )
+            violation_type = "invalid_decision"
+            unavailable_input = f"{self._scorer_policy_id()}.action"
             logger.warning(
                 "Scorer returned unknown action=%r for action_id=%s; "
                 "failing closed to 'deny'",
                 raw_decision, action_id,
             )
             decision_str = "deny"
+
+        # 6a. Project the R4 refinements onto the coarse three. `decision_str`
+        # stays coarse from here down, so every downstream branch, audit
+        # record and integration sees a vocabulary it already understands.
+        decision_detail: Optional[str] = None
+        modified_parameters: Optional[dict] = None
+        coarse = _FINE_TO_COARSE[decision_str]
+        if coarse != decision_str:
+            decision_detail = decision_str
+            decision_str = coarse
+
+        if decision_detail == "modify":
+            # A modify that carries no modification is malformed. Fall back to
+            # a plain deny rather than a deny the caller cannot act on: the
+            # action is already blocked either way, and claiming a refinement
+            # the scorer did not supply would put a false detail on the chain.
+            raw_modified = scorer_result.get("modified_parameters")
+            if isinstance(raw_modified, dict) and raw_modified:
+                modified_parameters = _cap_dict_bytes(
+                    _json_safe_dict(raw_modified),
+                    _MAX_MODIFIED_PARAMS_JSON_BYTES,
+                    "modified_parameters",
+                )
+            else:
+                logger.warning(
+                    "Scorer returned action='modify' without usable "
+                    "modified_parameters (%r) for action_id=%s; recording a "
+                    "plain deny",
+                    type(raw_modified).__name__, action_id,
+                )
+                decision_detail = None
+
         allowed = decision_str == "allow"
         reason = scorer_result.get("reason", "")
         if not isinstance(reason, str):
@@ -584,6 +1026,11 @@ class InterceptionPipeline:
         # output as a caller-controlled ingress point like any other
         # string that lands on the hash chain (see Loop 47/50 caps).
         reason = _cap_str(reason, _MAX_DECISION_REASON_LEN, "reason")
+        if unrecognised_decision:
+            reason = _cap_str(
+                unrecognised_decision + (f"; scorer: {reason}" if reason else ""),
+                _MAX_DECISION_REASON_LEN, "reason",
+            )
 
         # 6b. Attenuation override. A child grant that broadens its parent
         # forces a fail-closed deny regardless of the scored risk — authority
@@ -592,11 +1039,49 @@ class InterceptionPipeline:
         if attenuation_reason is not None:
             decision_str = "deny"
             allowed = False
+            # Attenuation outranks whatever the scorer proposed. A refinement
+            # left in place here would describe a decision that no longer
+            # applies, and a modification the caller must not retry.
+            decision_detail = None
+            modified_parameters = None
+            deny_policy_id = "capability_attenuation"
+            violation_type = "privilege_attenuation"
+            if attenuation is not None and attenuation["status"] == "unverified":
+                # The check could not run: the deny names what it lacked.
+                unavailable_input = "parent_grant"
             reason = _cap_str(
                 f"privilege attenuation violation ({attenuation_reason})"
                 + (f"; {reason}" if reason else ""),
                 _MAX_DECISION_REASON_LEN, "reason",
             )
+        # Who may act outranks how much: a child the parent never named is
+        # refused on that ground, and an attenuation reason stays in the text.
+        if binding_reason is not None:
+            decision_str = "deny"
+            allowed = False
+            decision_detail = None
+            modified_parameters = None
+            deny_policy_id = "delegatee_binding"
+            violation_type = "delegation_binding"
+            reason = _cap_str(
+                f"delegation binding violation ({binding_reason})"
+                + (f"; {reason}" if reason else ""),
+                _MAX_DECISION_REASON_LEN, "reason",
+            )
+
+        # 6c. Value origin. An authority argument (recipient, payee, endpoint)
+        # whose value the caller saw only in content the agent read is held
+        # for a human. Before the prior-approval replay, so a person who
+        # approved this exact call is not asked again.
+        if value_origin and decision_str in ("allow", "escalate"):
+            if decision_str == "allow":
+                decision_str = "escalate"
+                allowed = False
+                decision_detail = None
+                modified_parameters = None
+            reason = _cap_str(_describe_origin(value_origin)
+                              + (f"; scorer: {reason}" if reason else ""),
+                              _MAX_DECISION_REASON_LEN, "reason")
 
         # 7. Prior-approval check, BEFORE the decision hits the chain.
         #    When this tenant's agent + tool + argument shape was
@@ -607,6 +1092,13 @@ class InterceptionPipeline:
         #    case governance failure named in step 6: the record and
         #    the behaviour disagree.
         args_digest = ""
+        # Empty approver means the record carries no disposition keys and
+        # hashes exactly as it did before this vocabulary existed. Only the
+        # replay branch below fills it in, because that is the only place in
+        # intercept() where an allow means something other than "policy
+        # allowed it" and the difference is invisible in the word `allow`.
+        approver = ""
+        human_disposed = False
         if decision_str == "escalate":
             args_digest = hashlib.sha256(
                 json.dumps(safe_params or {}, sort_keys=True).encode()
@@ -619,14 +1111,75 @@ class InterceptionPipeline:
             if prior is not None:
                 decision_str = "allow"
                 allowed = True
+                # The recorded decision is now `allow`; a leftover step_up or
+                # defer detail would contradict the word next to it.
+                decision_detail = None
                 reason = _cap_str(
                     f"auto-allowed by prior approval "
                     f"(action_id={prior.action_id}, {prior.timestamp})",
                     _MAX_DECISION_REASON_LEN, "reason",
                 )
+                # A human approved the EARLIER action. This one was disposed
+                # of by a cache lookup, so the record says policy. The reason
+                # string above already back-references the approval it
+                # replayed; this makes the same fact a field, so a relying
+                # party separating "a human approved this" from "a human
+                # approved something shaped like this, yesterday" does not
+                # have to parse prose to do it.
+                approver = _disposition.POLICY
+                human_disposed = False
 
-        # 8. Record the decision in audit
+        # 7a. Authority decay. A session whose risk has added up past its
+        # budget gets its allows escalated until a person approves one. Placed
+        # after the prior-approval replay so a cached approval cannot undo it,
+        # and replayed from the session's own records so a hook that starts
+        # fresh per call sees the same budget. Only ever tightens.
+        if decision_str == "allow" and session_id and self.authority.enabled:
+            decay_reason = None
+            try:
+                decay_reason = _authority_check(
+                    self.trail.get_session_records(agent_id, session_id, tenant_id),
+                    session_id,
+                    point_estimate, self.authority, time.time(),
+                    exclude_action=action_id,
+                )
+            except Exception:
+                logger.exception("authority decay check failed for action_id=%s; "
+                                 "leaving the decision as scored", action_id)
+            if decay_reason is not None:
+                decision_str = "escalate"
+                allowed = False
+                decision_detail = None
+                modified_parameters = None
+                approver = ""
+                human_disposed = False
+                reason = _cap_str(decay_reason + (f"; scorer: {reason}" if reason else ""),
+                                  _MAX_DECISION_REASON_LEN, "reason")
+
+        # 7b. A verdict a rule already reached is the decision, whatever the
+        # score said. Policy disposed of it, not a human.
+        if policy_decision is not None:
+            decision_str = _FINE_TO_COARSE[policy_decision]
+            allowed = decision_str == "allow"
+            decision_detail = None
+            modified_parameters = None
+            reason = _cap_str(policy_reason or f"policy: {decision_str}",
+                              _MAX_DECISION_REASON_LEN, "reason")
+            deny_policy_id = policy_id or "policy"
+            violation_type = "policy_rule"
+            approver = _disposition.POLICY
+            human_disposed = False
+
+        # 8. Record the decision in audit. `decision` stays inside the
+        # documented allow/escalate/deny enum; the refinement and any
+        # proposed arguments ride along as additional keys, which the 1.0
+        # data-payload schema explicitly permits (consumers MUST accept
+        # unknown keys). A record with no refinement gains no keys, so
+        # every existing record hashes exactly as it did before.
+        policy_digest, policy_state = self._policy_snapshot()
         self.trail.record_decision(
+            sequence_steps=_sequence_steps(scorer_result),
+            value_origin=value_origin,
             action_id=action_id,
             agent_id=agent_id,
             tool_name=tool_name,
@@ -634,6 +1187,17 @@ class InterceptionPipeline:
             reason=reason,
             risk_score=point_estimate,
             regulatory_domains=action_type.regulatory_domains,
+            decision_detail=decision_detail,
+            modified_parameters=modified_parameters,
+            approver=approver,
+            human_disposed=human_disposed,
+            policy_id=deny_policy_id,
+            violation_type=violation_type,
+            unavailable_input=unavailable_input,
+            policy_digest=policy_digest,
+            policy_state=policy_state,
+            enforcement=enforcement,
+            attenuation=attenuation,
         )
 
         if decision_str == "escalate":
@@ -678,7 +1242,16 @@ class InterceptionPipeline:
         # When the trail has a SQLite backend, persist to database for
         # cross-process tracking (vaara check in one process, vaara outcome
         # in another). Always keep in-memory dict as fallback for tests.
-        backend = getattr(self.trail, "_backend", None)
+        #
+        # Only an action that can run gets an outcome slot: allowed, any
+        # decision in shadow mode (the caller is told allowed=True), or an
+        # escalation, which runs if a reviewer approves it. A denied action
+        # under enforcement never ran, and an outcome reported for it would
+        # teach the scorer and the calibration set a result that never
+        # happened.
+        can_run = allowed or not self._enforce or decision_str == "escalate"
+        backend = getattr(self.trail, "_backend", None) if can_run else None
+        in_db = False
         if backend is not None:
             try:
                 backend.store_pending_outcome(
@@ -688,19 +1261,34 @@ class InterceptionPipeline:
                     risk_score=point_estimate,
                     signals=signals,
                 )
+                in_db = True
             except Exception:
                 logger.exception(
                     "backend.store_pending_outcome failed for action_id=%s; "
                     "falling back to in-memory dict",
                     action_id,
                 )
-                backend = None
-        with self._pending_outcomes_lock:
-            self._pending_outcomes[action_id] = (point_estimate, signals)
-            if len(self._pending_outcomes) > _MAX_PENDING_OUTCOMES:
-                self._pending_outcomes.popitem(last=False)
+        if can_run:
+            with self._pending_outcomes_lock:
+                self._pending_outcomes[action_id] = (point_estimate, signals)
+                if in_db:
+                    self._pending_in_db[action_id] = (agent_id, tool_name)
+                if len(self._pending_outcomes) > _MAX_PENDING_OUTCOMES:
+                    evicted, _ = self._pending_outcomes.popitem(last=False)
+                    self._pending_in_db.pop(evicted, None)
 
-        elapsed_ms = (time.monotonic() - start) * 1000
+        # 9b. A write the scorer saw plant an agent-persistent file after an
+        # outbound call is remembered for later sessions, but only when it
+        # can land: not denied, unless shadow mode lets it through. A deny a
+        # rule reached is a refusal the caller enforces whatever the mode.
+        lineage_mark = scorer_result.get("lineage_mark")
+        commit = getattr(self.scorer, "commit_lineage", None)
+        if lineage_mark is not None and commit is not None and (
+                decision_str != "deny"
+                or (not self._enforce and policy_decision is None)):
+            commit(lineage_mark, agent_id, session_id)
+
+        elapsed_ms = (time.perf_counter() - start) * 1000
 
         with self._metrics_lock:
             self._metrics.total_intercepts += 1
@@ -725,12 +1313,12 @@ class InterceptionPipeline:
             if not allowed:
                 logger.info(
                     "Shadow mode: %s/%s decision=%s but returning allowed=True",
-                    agent_id, tool_name, decision_str,
+                    log_safe(agent_id), log_safe(tool_name), decision_str,
                 )
 
         logger.info(
             "Intercepted %s/%s: %s (risk=%.3f [%.3f,%.3f], %.1fms)",
-            agent_id, tool_name, decision_str,
+            log_safe(agent_id), log_safe(tool_name), decision_str,
             point_estimate, interval[0], interval[1], elapsed_ms,
         )
 
@@ -744,6 +1332,8 @@ class InterceptionPipeline:
             action_type=action_type,
             signals=signals,
             evaluation_ms=elapsed_ms,
+            decision_detail=decision_detail,
+            modified_parameters=modified_parameters,
         )
 
     def report_outcome(
@@ -762,36 +1352,19 @@ class InterceptionPipeline:
         - Updates conformal calibration set
         - Records outcome in the audit trail
         """
-        # Peek rather than pop: if the audit-trail lookup below fails
-        # (transient backend error, partially-initialised trail on reload,
-        # caller race), a pop-first ordering destroys the pending entry so
-        # a retry with the same action_id becomes a silent no-op and the
-        # MWU/conformal learning signal is lost permanently. Only remove
-        # the entry once we've confirmed we can complete the outcome write.
-        #
-        # Cross-process support: when the in-memory dict doesn't have the
-        # pending outcome, check the database (if a backend is available).
-        # This allows vaara check in one process and vaara outcome in another.
-        with self._pending_outcomes_lock:
-            pending = self._pending_outcomes.get(action_id)
-        if pending is None:
-            backend = getattr(self.trail, "_backend", None)
-            if backend is not None:
-                try:
-                    db_entry = backend.get_pending_outcome(action_id)
-                    if db_entry is not None:
-                        pending = (db_entry["risk_score"], db_entry["signals"])
-                        # Restore to in-memory dict so subsequent lookups are fast
-                        with self._pending_outcomes_lock:
-                            self._pending_outcomes[action_id] = pending
-                except Exception:
-                    logger.exception(
-                        "backend.get_pending_outcome failed for action_id=%s",
-                        action_id,
-                    )
-        if pending is None:
+        # Claim first, write second. The claim is atomic: the in-memory
+        # entry is popped under the lock, and when the entry also lives in
+        # the database, the DELETE of its row decides. Only the claimant
+        # records, so two concurrent reports (threads, or `vaara outcome` in
+        # two processes) cannot both append an OUTCOME_RECORDED. A peek-then-
+        # pop ordering let both callers through (2026-09-26). If a later step
+        # fails the claim is put back, so a retry with the same action_id
+        # still works and the learning signal is not lost.
+        claim = self._claim_pending_outcome(action_id)
+        if claim is None:
             logger.warning("No pending outcome for action_id=%s", action_id)
             return
+        pending, db_ident = claim
 
         # Clamp severity to [0, 1]. MWU and conformal both assume this
         # range; out-of-range values would corrupt weight updates and
@@ -829,6 +1402,7 @@ class InterceptionPipeline:
         trail = self.trail.get_action_trail(action_id)
         if not trail:
             logger.warning("No audit trail for action_id=%s", action_id)
+            self._restore_pending_outcome(action_id, pending, db_ident)
             return
 
         agent_id = trail[0].agent_id
@@ -837,16 +1411,11 @@ class InterceptionPipeline:
         # Ordering matters for crash/error recovery:
         #   1. Trail write is authoritative for regulators — record it
         #      first so a later scorer failure never strands an outcome
-        #      out of the audit log.
+        #      out of the audit log. On failure the claim is restored for
+        #      a retry.
         #   2. Scorer update is best-effort — if it raises (corrupt
         #      bundle, malformed signals), log and continue; the audit
         #      record already exists and MWU divergence is advisory.
-        #   3. Pop last so that a failure on step 1 leaves the pending
-        #      entry in place for a retry. Popping earlier risks losing
-        #      both the learning signal and the audit record.
-        # Pre-pop-only-after-confirm (Loop 36) kept the pending entry
-        # safe on trail-read failure; this adds the same discipline on
-        # trail-WRITE failure and scorer-update failure.
         description = _cap_str(
             description, _MAX_OUTCOME_DESCRIPTION_LEN, "description"
         )
@@ -865,6 +1434,7 @@ class InterceptionPipeline:
                 "pending entry preserved for retry",
                 action_id,
             )
+            self._restore_pending_outcome(action_id, pending, db_ident)
             return
 
         try:
@@ -882,23 +1452,146 @@ class InterceptionPipeline:
                 action_id,
             )
 
-        # Both writes attempted — remove from both database and in-memory dict.
-        # A second report_outcome call after a successful trail write would
-        # otherwise append a duplicate OUTCOME_RECORDED row, inflating
-        # Article 61(1) post-market monitoring evidence.
+        with self._metrics_lock:
+            self._metrics.total_outcome_reports += 1
+
+    #: Closed by the surface that opened them, not by this sweep: the LLM
+    #: proxy closes its own ``llm.prompt`` outcomes against its process start.
+    _ORPHAN_SWEEP_LEAVES = frozenset({"llm.prompt"})
+
+    def close_orphaned_outcomes(
+        self,
+        max_age_seconds: float = 86400.0,
+        *,
+        severity: float = 0.5,
+        now: Optional[float] = None,
+    ) -> list[str]:
+        """Close every pending outcome older than ``max_age_seconds`` as
+        ``orphaned``, on the trail, and return the action ids closed.
+
+        A ``vaara check`` nobody follows with ``vaara outcome`` would stay
+        pending forever. An outcome record saying ``orphaned`` tells a reader
+        the action ran and nobody reported how it went, which is the truth;
+        a silent delete would tell them nothing. Runs at ``vaara check``
+        start. Rows another surface closes for itself are left alone.
+        """
         backend = getattr(self.trail, "_backend", None)
-        if backend is not None:
+        lister = getattr(backend, "list_pending_outcomes", None)
+        if lister is None:
+            return []
+        cutoff = (time.time() if now is None else now) - max_age_seconds
+        try:
+            rows = lister(created_before=cutoff)
+        except Exception:
+            logger.exception("could not list pending outcomes")
+            return []
+        closed: list[str] = []
+        for row in rows:
+            if row.get("tool_name") in self._ORPHAN_SWEEP_LEAVES:
+                continue
+            action_id = row["action_id"]
+            age_hours = max(0.0, (cutoff + max_age_seconds - float(row.get("created_at") or cutoff)) / 3600)
             try:
-                backend.remove_pending_outcome(action_id)
+                self.report_outcome(
+                    action_id, outcome_severity=severity,
+                    description=(f"orphaned: no outcome reported in {age_hours:.0f} h; "
+                                 f"closed by the next vaara check"),
+                )
+            except Exception:
+                logger.exception("could not close orphaned outcome %s", action_id)
+                continue
+            closed.append(action_id)
+        if closed:
+            logger.info("closed %d orphaned pending outcome(s)", len(closed))
+        return closed
+
+    def _claim_pending_outcome(
+        self, action_id: str,
+    ) -> Optional[tuple[tuple[float, dict[str, float]], Optional[tuple[str, str]]]]:
+        """Take the pending outcome for ``action_id``, or None if another
+        caller already took it or none exists.
+
+        Returns ``(pending, db_ident)``; ``db_ident`` is ``(agent_id,
+        tool_name)`` when the claim removed a database row, so a restore
+        can write it back.
+        """
+        with self._pending_outcomes_lock:
+            pending = self._pending_outcomes.pop(action_id, None)
+            db_ident = self._pending_in_db.pop(action_id, None)
+        backend = getattr(self.trail, "_backend", None)
+        if pending is not None and db_ident is None:
+            # Held in memory only (the database write failed at intercept, a
+            # caller placed the entry by hand, or there is no backend): the
+            # pop above was the claim. A row with the same id, if any, is
+            # cleared so it cannot be claimed a second time.
+            if backend is not None:
+                try:
+                    backend.remove_pending_outcome(action_id)
+                except Exception:
+                    logger.exception(
+                        "backend.remove_pending_outcome failed for action_id=%s",
+                        action_id,
+                    )
+            return pending, None
+        if backend is None:
+            return (pending, None) if pending is not None else None
+        # Cross-process support: an entry another process stored lives only
+        # in the database (vaara check in one process, vaara outcome in
+        # another).
+        try:
+            if pending is None:
+                db_entry = backend.get_pending_outcome(action_id)
+                if db_entry is None:
+                    return None
+                pending = (db_entry["risk_score"], db_entry["signals"])
+                db_ident = (db_entry["agent_id"], db_entry["tool_name"])
+            if not backend.remove_pending_outcome(action_id):
+                # Another thread or process deleted the row first: it owns
+                # this outcome.
+                return None
+        except Exception:
+            logger.exception(
+                "backend pending-outcome claim failed for action_id=%s",
+                action_id,
+            )
+            if db_ident is not None and pending is not None:
+                # The row is still there; put the memory entry back and let
+                # a retry claim it once the database answers.
+                self._restore_pending_outcome(action_id, pending, None)
+                with self._pending_outcomes_lock:
+                    self._pending_in_db[action_id] = db_ident
+            return None
+        return pending, db_ident
+
+    def _restore_pending_outcome(
+        self,
+        action_id: str,
+        pending: tuple[float, dict[str, float]],
+        db_ident: Optional[tuple[str, str]],
+    ) -> None:
+        """Undo a claim after a failed write, so a retry can succeed."""
+        restored_in_db = False
+        backend = getattr(self.trail, "_backend", None)
+        if db_ident is not None and backend is not None:
+            try:
+                backend.store_pending_outcome(
+                    action_id=action_id,
+                    agent_id=db_ident[0],
+                    tool_name=db_ident[1],
+                    risk_score=pending[0],
+                    signals=pending[1],
+                )
+                restored_in_db = True
             except Exception:
                 logger.exception(
-                    "backend.remove_pending_outcome failed for action_id=%s",
+                    "backend.store_pending_outcome failed restoring action_id=%s; "
+                    "kept in memory only",
                     action_id,
                 )
         with self._pending_outcomes_lock:
-            self._pending_outcomes.pop(action_id, None)
-        with self._metrics_lock:
-            self._metrics.total_outcome_reports += 1
+            self._pending_outcomes[action_id] = pending
+            if restored_in_db:
+                self._pending_in_db[action_id] = db_ident  # type: ignore[assignment]
 
     def resolve_escalation(
         self,
@@ -906,14 +1599,25 @@ class InterceptionPipeline:
         resolution: str,
         reviewer: str,
         justification: str = "",
+        approver: str = "",
+        human_disposed: bool = False,
     ) -> None:
-        """Record human resolution of an escalated action.
+        """Record resolution of an escalated action.
 
         Args:
             action_id: The action that was escalated.
             resolution: "allow" or "deny".
-            reviewer: Who made the decision.
+            reviewer: Who made the decision. Free text, and both shipped
+                call sites pass a mechanism name rather than a person, so it
+                answers who and never what kind.
             justification: Why.
+            approver: "human" or "policy". The closed vocabulary in
+                :mod:`vaara._disposition`. Left empty, the record carries no
+                disposition keys and hashes as it did before.
+            human_disposed: True ONLY when a human actually acted on this
+                action. Requires approver="human"; the pair is validated in
+                the trail rather than here, so every writer goes through the
+                same check.
         """
         # Narrow the resolution to the two values downstream compliance
         # queries assume. Unchecked, a typo like "alllow" or a caller
@@ -936,81 +1640,93 @@ class InterceptionPipeline:
         else:
             resolution = normalized
 
-        trail = self.trail.get_action_trail(action_id)
-        if not trail:
-            logger.warning("No audit trail for action_id=%s", action_id)
-            return
+        # The check below and the write at the end run under one lock: two
+        # resolvers reading "not resolved yet" at the same moment would
+        # otherwise both write ESCALATION_RESOLVED (2026-09-26).
+        with self._resolve_lock:
+            trail = self.trail.get_action_trail(action_id)
+            if not trail:
+                logger.warning("No audit trail for action_id=%s", action_id)
+                return
 
-        # Require a prior ESCALATION_SENT and reject duplicate resolutions.
-        # Without these guards an ESCALATION_RESOLVED record could appear
-        # without a matching ESCALATION_SENT (e.g., caller misuse, race
-        # where the initial decision was allow/deny), or a second
-        # resolution could silently overwrite the first in auditor-facing
-        # narratives. Both break Article 14(3)(a) evidence — the regulator
-        # dashboard assumes 1-to-1 sent/resolved pairing.
-        from vaara.audit.trail import EventType  # local import: avoid cycle
-        has_escalation = any(
-            r.event_type == EventType.ESCALATION_SENT for r in trail
-        )
-        already_resolved = any(
-            r.event_type == EventType.ESCALATION_RESOLVED for r in trail
-        )
-        if not has_escalation:
-            logger.warning(
-                "resolve_escalation called for action_id=%s that was never "
-                "escalated — ignoring to preserve trail integrity",
-                action_id,
+            # Require a prior ESCALATION_SENT and reject duplicate resolutions.
+            # Without these guards an ESCALATION_RESOLVED record could appear
+            # without a matching ESCALATION_SENT (e.g., caller misuse, race
+            # where the initial decision was allow/deny), or a second
+            # resolution could silently overwrite the first in auditor-facing
+            # narratives. Both break Article 14(3)(a) evidence — the regulator
+            # dashboard assumes 1-to-1 sent/resolved pairing.
+            from vaara.audit.trail import EventType  # local import: avoid cycle
+            has_escalation = any(
+                r.event_type == EventType.ESCALATION_SENT for r in trail
             )
-            return
-        if already_resolved:
-            logger.warning(
-                "resolve_escalation called twice for action_id=%s — ignoring "
-                "the second resolution; record a POLICY_OVERRIDE instead to "
-                "reverse a prior resolution",
-                action_id,
+            already_resolved = any(
+                r.event_type == EventType.ESCALATION_RESOLVED for r in trail
             )
-            return
+            if not has_escalation:
+                logger.warning(
+                    "resolve_escalation called for action_id=%s that was never "
+                    "escalated — ignoring to preserve trail integrity",
+                    action_id,
+                )
+                return
+            if already_resolved:
+                logger.warning(
+                    "resolve_escalation called twice for action_id=%s — ignoring "
+                    "the second resolution; record a POLICY_OVERRIDE instead to "
+                    "reverse a prior resolution",
+                    action_id,
+                )
+                return
 
-        agent_id = trail[0].agent_id
-        tool_name = trail[0].tool_name
+            agent_id = trail[0].agent_id
+            tool_name = trail[0].tool_name
 
-        # Carry the argument-shape digest from ESCALATION_SENT into the
-        # resolution record so find_prior_approval can require an exact
-        # shape match before auto-allowing. Records escalated before this
-        # field existed carry no digest; their resolutions simply never
-        # match a digested query (fail closed) and age out of the 24h
-        # window — no re-derivation from stored parameters, which could
-        # disagree with the intercept-time digest after caps/rounding.
-        args_digest = ""
-        for r in trail:
-            if r.event_type == EventType.ESCALATION_SENT:
-                data = r.data if isinstance(r.data, dict) else {}
-                digest = data.get("args_digest", "")
-                if isinstance(digest, str):
-                    args_digest = digest
-                break
+            # Carry the argument-shape digest from ESCALATION_SENT into the
+            # resolution record so find_prior_approval can require an exact
+            # shape match before auto-allowing. Records escalated before this
+            # field existed carry no digest; their resolutions simply never
+            # match a digested query (fail closed) and age out of the 24h
+            # window — no re-derivation from stored parameters, which could
+            # disagree with the intercept-time digest after caps/rounding.
+            args_digest = ""
+            for r in trail:
+                if r.event_type == EventType.ESCALATION_SENT:
+                    data = r.data if isinstance(r.data, dict) else {}
+                    digest = data.get("args_digest", "")
+                    if isinstance(digest, str):
+                        args_digest = digest
+                    break
 
-        # Cap free-text fields: resolution is already normalised to
-        # allow/deny above but a stray non-standard string gets a small
-        # label cap so it can't balloon the audit record. reviewer and
-        # justification are caller-controlled at the pipeline boundary
-        # and reach the hash chain like every other field — same L47
-        # amplification concern applies here.
-        resolution = _cap_str(resolution, _MAX_DECISION_LABEL_LEN, "resolution")
-        reviewer = _cap_str(reviewer, _MAX_REVIEWER_LEN, "reviewer")
-        justification = _cap_str(
-            justification, _MAX_JUSTIFICATION_LEN, "justification"
-        )
+            # Cap free-text fields: resolution is already normalised to
+            # allow/deny above but a stray non-standard string gets a small
+            # label cap so it can't balloon the audit record. reviewer and
+            # justification are caller-controlled at the pipeline boundary
+            # and reach the hash chain like every other field — same L47
+            # amplification concern applies here.
+            resolution = _cap_str(resolution, _MAX_DECISION_LABEL_LEN, "resolution")
+            reviewer = _cap_str(reviewer, _MAX_REVIEWER_LEN, "reviewer")
+            justification = _cap_str(
+                justification, _MAX_JUSTIFICATION_LEN, "justification"
+            )
 
-        self.trail.record_escalation_resolved(
-            action_id=action_id,
-            agent_id=agent_id,
-            tool_name=tool_name,
-            resolution=resolution,
-            reviewer=reviewer,
-            justification=justification,
-            args_digest=args_digest,
-        )
+            self.trail.record_escalation_resolved(
+                action_id=action_id,
+                agent_id=agent_id,
+                tool_name=tool_name,
+                resolution=resolution,
+                reviewer=reviewer,
+                justification=justification,
+                args_digest=args_digest,
+                approver=approver,
+                human_disposed=human_disposed,
+            )
+
+        if resolution == "deny":
+            # A denied escalation never runs, so it has no outcome to report.
+            claim = self._claim_pending_outcome(action_id)
+            if claim is not None:
+                logger.debug("dropped pending outcome of denied escalation %s", action_id)
 
     def run_compliance_assessment(
         self,

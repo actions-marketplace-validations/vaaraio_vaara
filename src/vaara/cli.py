@@ -15,6 +15,7 @@ Subcommands:
         Verify a signed trail zip.
 
     vaara trail export-prov --trail PATH --out PATH [--action-id ID] [--no-chain]
+    vaara trail export-ocsf (--trail PATH | --db PATH) --out PATH [--hostname NAME]
         Export the trail (or one action's slice) as W3C PROV-JSON.
 
     vaara trail export-incident --trail PATH --incident-meta PATH --out PATH \
@@ -37,7 +38,7 @@ Subcommands:
 
     vaara review resolve --db PATH --queue-id ID --reviewer NAME \
                           --resolution {allow,deny,abstain} \
-                          [--justification TEXT]
+                          [--justification TEXT] [--audit-db PATH --sign-key PEM]
         Mark a pending or claimed item as resolved. The ``allow`` and
         ``deny`` resolutions are operator decisions overriding the
         pipeline's ``escalate`` verdict; ``abstain`` leaves
@@ -380,6 +381,12 @@ def _keygen_attest(out: Path, pub_out: Path) -> int:
     return 0
 
 
+_WAL_NOT_TRUNCATED = (
+    "the WAL could not be truncated (another process holds the trail open): "
+    "the purged bytes stay in the -wal file until the next checkpoint"
+)
+
+
 def _cmd_trail_rotate(args: argparse.Namespace) -> int:
     from vaara.audit.rotate import rotate
 
@@ -395,18 +402,334 @@ def _cmd_trail_rotate(args: argparse.Namespace) -> int:
         retention_days=args.retention_days,
         tenant_id="" if args.all_tenants else args.tenant,
         dry_run=args.dry_run,
+        encrypt_to=Path(args.encrypt_to).expanduser() if args.encrypt_to else None,
     )
     if not result.ok:
         for err in result.errors:
             print(f"vaara trail rotate: {err}", file=sys.stderr)
         return 1
     print(f"Archived {result.exported_records} record(s) to {result.archive_path} (verified).")
+    if result.seal_path is not None:
+        print(f"Encrypted; public seal at {result.seal_path} (verified against the ciphertext).")
     if args.dry_run:
         print(f"Would purge {result.purged_records} record(s) older than {args.retention_days} day(s).")
         print("Run without --dry-run to apply.")
     else:
         print(f"Purged {result.purged_records} record(s) older than {args.retention_days} day(s).")
-        print("Archive the zip externally; the live DB now has a chain seam at the boundary.")
+        if result.seam_record_id is not None:
+            print(f"Archive the zip externally. The trail now begins at a rotation seam, "
+                  f"declared by a signed record ({result.seam_record_id}); "
+                  f"`vaara trail verify --archive` checks the archive against it.")
+        else:
+            print("Nothing was purged, so no rotation record was written.")
+        if not result.wal_scrubbed:
+            print(_WAL_NOT_TRUNCATED, file=sys.stderr)
+    return 0
+
+
+def _cmd_trail_seal_keygen(args: argparse.Namespace) -> int:
+    from vaara.audit.sealed_archive import generate_recipient_key
+
+    try:
+        fp = generate_recipient_key(Path(args.private).expanduser(),
+                                    Path(args.public).expanduser())
+    except FileExistsError as exc:
+        print(f"vaara trail seal-keygen: {exc}; not overwriting a key", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"vaara trail seal-keygen: {exc}", file=sys.stderr)
+        return 1
+    print(f"Recipient key {fp}: private {args.private} (0600), public {args.public}.")
+    print("Give the public key to whoever rotates; keep the private key with whoever may open archives.")
+    return 0
+
+
+def _cmd_trail_verify_seal(args: argparse.Namespace) -> int:
+    import json as _json
+
+    from vaara.audit.sealed_archive import verify_seal
+
+    verdict = verify_seal(
+        Path(args.seal).expanduser(),
+        Path(args.ciphertext).expanduser() if args.ciphertext else None,
+        expected_signer=Path(args.signer_pub).expanduser() if args.signer_pub else None,
+    )
+    if args.format == "json":
+        print(_json.dumps({"ok": verdict.ok, "errors": verdict.errors,
+                           "manifest": verdict.manifest}, indent=2))
+    else:
+        trail = verdict.manifest.get("trail") or {}
+        if verdict.ok:
+            print(f"Seal verifies: {trail.get('record_count')} record(s), chain "
+                  f"{trail.get('first_hash')} .. {trail.get('last_hash')}, sealed to "
+                  f"{verdict.manifest.get('recipient_fingerprint')}.")
+            if args.ciphertext is None:
+                print("Ciphertext not checked; pass --ciphertext to bind the seal to the file.")
+            if args.signer_pub is None:
+                print("Signer not pinned; pass --signer-pub to require a known key.")
+        for err in verdict.errors:
+            print(f"vaara trail verify-seal: {err}", file=sys.stderr)
+    return 0 if verdict.ok else 1
+
+
+def _cmd_trail_unseal(args: argparse.Namespace) -> int:
+    from vaara.audit.sealed_archive import SealError, unseal
+
+    if args.db is None and not args.no_access_record:
+        print("vaara trail unseal: pass --db TRAIL so the opening is recorded, or "
+              "--no-access-record to open it unrecorded", file=sys.stderr)
+        return 2
+    if args.db is not None and not (args.on_behalf_of and args.basis):
+        print("vaara trail unseal: --on-behalf-of and --basis are required with --db",
+              file=sys.stderr)
+        return 2
+    backend = trail = None
+    if args.db is not None:
+        from vaara.audit.sqlite_backend import SQLiteAuditBackend
+
+        backend = SQLiteAuditBackend(Path(args.db).expanduser())
+        trail = backend.load_trail()
+    try:
+        out = unseal(Path(args.sealed).expanduser(), Path(args.seal).expanduser(),
+                     Path(args.key).expanduser(), Path(args.out).expanduser(),
+                     expected_signer=Path(args.signer_pub).expanduser(),
+                     trail=trail, on_behalf_of=args.on_behalf_of or "",
+                     basis=args.basis or "")
+    except (SealError, OSError, ValueError, ImportError) as exc:
+        print(f"vaara trail unseal: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if backend is not None:
+            backend.close()
+    print(f"Unsealed to {out}; it matches the seal, is signed by the pinned key and "
+          "verifies as a signed export.")
+    if trail is not None:
+        print(f"The opening is recorded in {args.db}.")
+    return 0
+
+
+def _cmd_trail_repair(args: argparse.Namespace) -> int:
+    import json as _json
+
+    from vaara.audit.sqlite_backend import SQLiteAuditBackend, repair_trail_file
+    from vaara.audit.trail import AuditTrail
+
+    db_path = Path(args.db).expanduser()
+    if not db_path.is_file():
+        print(f"vaara trail repair: not a file: {db_path}", file=sys.stderr)
+        return 2
+    report = repair_trail_file(db_path)
+    if report.ok and report.lost:
+        # Declare the loss inside the chain, so the hole is part of the
+        # evidence and not something a verifier trips over later.
+        backend = SQLiteAuditBackend(db_path)
+        try:
+            AuditTrail(on_record=backend.write_record).record_repair_gap(report)
+        finally:
+            backend.close()
+
+    if args.format == "json":
+        print(_json.dumps(report.to_dict(), indent=2))
+    elif report.method == "clean":
+        print(f"{db_path}: reads clean, nothing to repair.")
+    elif report.method == "reindex":
+        print(f"{db_path}: indexes rebuilt, no record lost ({report.problem}).")
+    elif report.method == "salvage":
+        lost = report.lost_seqs
+        shown = ", ".join(str(s) for s in lost[:20]) + (" ..." if len(lost) > 20 else "")
+        print(f"{db_path}: salvaged {report.records_kept} record(s) into a fresh file.")
+        if lost:
+            print(f"  lost {len(lost)} record(s): seq {shown}")
+            print("  a repair_gap record naming them was appended to the trail")
+        if not report.tail_named:
+            print("  the seq index did not read, so records written after the last "
+                  "readable one, if any, cannot be named")
+        if report.unreadable_rowids:
+            print(f"  {report.unreadable_rowids} row position(s) could not be read")
+        if report.duplicate_rows:
+            print(f"  {report.duplicate_rows} row(s) read twice through a damaged page "
+                  "were kept once")
+        if report.tables_damaged:
+            print(f"  side tables with losses: {', '.join(report.tables_damaged)}")
+        print(f"  the damaged file is kept at {report.damaged_copy}")
+    else:
+        print(f"vaara trail repair: could not repair {db_path}: {report.error}. "
+              "The file was left exactly as it was.", file=sys.stderr)
+    return 0 if report.ok else 1
+
+
+def _cmd_trail_carve(args: argparse.Namespace) -> int:
+    import json as _json
+    import sqlite3
+
+    from vaara.audit.carve import carve_trail, write_jsonl
+
+    db_path = Path(args.db).expanduser()
+    if not db_path.is_file():
+        print(f"vaara trail carve: not a file: {db_path}", file=sys.stderr)
+        return 2
+    out = Path(args.out).expanduser()
+    if out.resolve() == db_path.resolve():
+        print("vaara trail carve: --out must not be the trail itself", file=sys.stderr)
+        return 2
+    try:
+        result = carve_trail(db_path)
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        print(f"vaara trail carve: cannot read {db_path}: {exc}", file=sys.stderr)
+        return 1
+    want = None
+    if args.seq_from is not None or args.seq_to is not None:
+        lo = args.seq_from if args.seq_from is not None else 0
+        hi = args.seq_to if args.seq_to is not None else max(result.seqs(), default=lo)
+        want = range(lo, hi + 1)
+    written = write_jsonl(result, out, want)
+    summary = result.summary(want)
+    summary["written"] = written
+    summary["out"] = str(out)
+    if args.format == "json":
+        print(_json.dumps(summary, indent=2))
+        return 0
+    print(f"{db_path}: {summary['records_recovered']} record(s) verify by hash "
+          f"across {summary['pages']} page(s); {written} written to {out}.")
+    if want is not None:
+        missing = summary["wanted_missing"]
+        shown = ", ".join(str(s) for s in missing[:20]) + (" ..." if len(missing) > 20 else "")
+        print(f"  seq {want.start}-{want.stop - 1}: {summary['wanted_recovered']} recovered"
+              + (f", missing {shown}" if missing else ", none missing"))
+    if summary["unlinked_seqs"]:
+        shown = ", ".join(str(s) for s in summary["unlinked_seqs"][:20])
+        print(f"  records whose predecessor is not among those recovered: {shown}")
+    if summary["conflicting_seqs"]:
+        print("  seqs with two different verified records: "
+              + ", ".join(str(s) for s in summary["conflicting_seqs"]))
+    print("  the damaged file was only read; nothing was written to it")
+    return 0
+
+
+def _cmd_trail_recover(args: argparse.Namespace) -> int:
+    import json as _json
+
+    from vaara.audit.carve import check_recovery, declare_recovery
+
+    db_path = Path(args.db).expanduser()
+    bundle = Path(args.bundle).expanduser()
+    for label, path in (("db", db_path), ("bundle", bundle)):
+        if not path.is_file():
+            print(f"vaara trail recover: {label} is not a file: {path}", file=sys.stderr)
+            return 2
+    check = check_recovery(bundle, db_path)
+    kept = None
+    if check.ok and not args.dry_run:
+        kept = declare_recovery(check, db_path, source=args.source)
+    report = check.to_dict()
+    report["dry_run"] = bool(args.dry_run)
+    report["kept"] = str(kept) if kept else None
+    if args.format == "json":
+        print(_json.dumps(report, indent=2))
+        return 0 if check.ok else 1
+    if not check.ok:
+        print(f"vaara trail recover: {bundle} was not declared recovered:", file=sys.stderr)
+        for problem in check.problems:
+            print(f"  {problem}", file=sys.stderr)
+        return 1
+    seqs = check.seqs
+    print(f"{bundle}: {len(seqs)} record(s), seq {seqs[0]}-{seqs[-1]}, every hash recomputes, "
+          f"{check.links_verified} link(s) verified.")
+    if check.anchored_to_seq is not None:
+        print(f"  the first names the trail's seq {check.anchored_to_seq}")
+    if args.dry_run:
+        print("  dry run: nothing was appended or copied")
+    else:
+        print(f"  kept at {kept}")
+        print("  a repair_recovered record naming it was appended to the trail")
+    return 0
+
+
+def _cmd_trail_declare_fork(args: argparse.Namespace) -> int:
+    import json as _json
+
+    from vaara.audit.fork import check_fork, declare_fork
+
+    db_path = Path(args.db).expanduser()
+    branch = Path(args.branch).expanduser()
+    for label, path in (("db", db_path), ("branch", branch)):
+        if not path.is_file():
+            print(f"vaara trail declare-fork: {label} is not a file: {path}", file=sys.stderr)
+            return 2
+    if db_path.resolve() == branch.resolve():
+        print("vaara trail declare-fork: --branch must not be the trail itself", file=sys.stderr)
+        return 2
+    check = check_fork(db_path, branch)
+    if check.ok and not args.dry_run:
+        declare_fork(check, db_path, source=args.source)
+    report = check.to_dict()
+    report["dry_run"] = bool(args.dry_run)
+    if args.format == "json":
+        print(_json.dumps(report, indent=2))
+        return 0 if check.ok else 1
+    if not check.ok:
+        print(f"vaara trail declare-fork: {branch} was not declared:", file=sys.stderr)
+        for problem in check.problems:
+            print(f"  {problem}", file=sys.stderr)
+        return 1
+    print(f"{branch}: shares the trail up to seq {check.fork_seq}, then runs on to seq "
+          f"{check.branch_head_seq} ({check.branch_record_count} record(s), "
+          f"{check.links_verified} link(s) verified).")
+    if check.branch_missing_seqs:
+        print(f"  {len(check.branch_missing_seqs)} seq(s) the branch declared lost")
+    print(f"  branch head {check.branch_head_hash}")
+    if args.dry_run:
+        print("  dry run: nothing was appended")
+    else:
+        print("  a trail_forked record naming it was appended to the trail")
+    return 0
+
+
+def _cmd_trail_erase(args: argparse.Namespace) -> int:
+    import json as _json
+
+    from vaara.audit.erase import ErasureRefused, erase_record
+
+    db_path = Path(args.db).expanduser()
+    if not db_path.is_file():
+        print(f"vaara trail erase: db is not a file: {db_path}", file=sys.stderr)
+        return 2
+    sign_key = None
+    if args.sign_key:
+        from cryptography.hazmat.primitives import serialization
+        try:
+            sign_key = serialization.load_pem_private_key(
+                Path(args.sign_key).expanduser().read_bytes(), password=None,
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"vaara trail erase: --sign-key: {exc}", file=sys.stderr)
+            return 2
+    try:
+        report = erase_record(db_path, args.record_id, reason=args.reason,
+                              legal_ground=args.legal_ground, erased_by=args.erased_by,
+                              sign_key=sign_key)
+    except ErasureRefused as exc:
+        print(f"vaara trail erase: {exc}", file=sys.stderr)
+        return 1
+    if args.format == "json":
+        print(_json.dumps(report, indent=2))
+        return 0
+    print(f"seq {report['erased_seq']} ({report['erased_record_id']}): data erased, "
+          f"record_hash {report['erased_record_hash']} kept.")
+    print(f"  erasure record {report['erasure_record_id']} names it on the chain")
+    if report["legal_ground"]:
+        print(f"  legal ground: {report['legal_ground']}")
+    if report["signed"]:
+        print(f"  signed by {report['erased_by']}; check with "
+              "`vaara trail verify --erasure-key <their public key>`")
+    elif report["erased_by"]:
+        print(f"  erased by {report['erased_by']} (unsigned)")
+    print("  `vaara trail verify` now reports the slot as erased: link verified, "
+          "content not checkable")
+    if not report["wal_scrubbed"]:
+        print("  the WAL could not be checkpointed (another process holds the trail "
+              "open): the old bytes stay in the -wal file until the next checkpoint",
+              file=sys.stderr)
     return 0
 
 
@@ -425,6 +748,166 @@ def _cmd_trail_shadow_report(args: argparse.Namespace) -> int:
     else:
         print(render_text(report))
     return 0
+
+
+def _cmd_trail_check_grant(args: argparse.Namespace) -> int:
+    """Judge every recorded call to a granted tool against the signed grant."""
+    from vaara.credential import check_trail_against_grant, grant_from_dict
+
+    try:
+        grant = grant_from_dict(_load_json_file(args.grant, "grant"))
+    except Exception as exc:
+        print(f"vaara trail check-grant: not a usable grant: {exc}", file=sys.stderr)
+        return 2
+    material, ok = _load_jws_verifying_material(args)
+    if not ok:
+        return 2
+    mismatch = _alg_material_mismatch(grant.alg, material)
+    if mismatch:
+        print(f"vaara trail check-grant: {mismatch}", file=sys.stderr)
+        return 2
+    trail, err = _load_trail_source(args)
+    if trail is None:
+        return err
+    report = check_trail_against_grant(trail, grant, verifying_material=material)
+    if args.format == "json":
+        print(json.dumps(report.to_dict(), indent=2))
+    else:
+        print(f"grant: {grant.asserted.iss} -> {grant.asserted.sub}, tool {grant.scope.tool_name}")
+        if report.chain_problem:
+            print(f"BROKEN chain: {report.chain_problem}; no call judged")
+        elif report.grant_problem:
+            print(f"BAD grant: {report.grant_problem}; no call judged")
+        else:
+            for call in report.calls:
+                if call.state in ("within", "outside_window"):
+                    continue
+                line = f"{call.state:<13} {call.action_id}  decision={call.decision or '-'}"
+                print(line + (f"  ({call.reason})" if call.reason else ""))
+            summary = ", ".join(f"{n} {s}" for s, n in sorted(report.counts.items()))
+            print(f"{'OK' if report.ok else 'FINDINGS'}: {summary or 'no calls to this tool'}")
+    return 0 if report.ok else 1
+
+
+def _reviewer_from_spec(entry: Any) -> Any:
+    """A spec reviewer: ``reviewer`` plus ``publicKeyFile`` (PEM) or ``publicKey``.
+
+    ``alg`` follows the key type unless the spec states it.
+    """
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    from vaara.credential import Reviewer
+
+    if not isinstance(entry, dict):
+        raise ValueError("each reviewer in the spec must be an object")
+    pem = entry.get("publicKey")
+    if entry.get("publicKeyFile"):
+        pem = Path(entry["publicKeyFile"]).expanduser().read_text(encoding="utf-8")
+    if not isinstance(pem, str):
+        raise ValueError("a reviewer needs publicKeyFile or publicKey (PEM)")
+    alg = entry.get("alg")
+    if alg is None:
+        key = serialization.load_pem_public_key(pem.encode())
+        alg = "ES256" if isinstance(key, ec.EllipticCurvePublicKey) else "RS256"
+    return Reviewer(reviewer=entry.get("reviewer", ""), alg=alg, public_key=pem)
+
+
+def _cmd_permission_sign(args: argparse.Namespace) -> int:
+    """Sign a standing permission from a JSON spec with the principal's key."""
+    from vaara.attestation._attest_types import AttestationError
+    from vaara.credential import Limit, sign_permission
+    from vaara.credential._grant_capability import capability_from_dict
+
+    try:
+        spec: Any = _load_json_file(args.spec, "spec")
+        if not isinstance(spec, dict):
+            raise ValueError("spec must be a JSON object")
+        material, alg, err = _resolve_ingest_signer(args)
+        if err:
+            raise ValueError(err)
+        permission = sign_permission(
+            principal=spec["principal"], key_id=spec.get("keyId", ""),
+            agent=spec["agent"], tool_name=spec["toolName"],
+            tenant_id=spec.get("tenantId", ""), not_before=spec["notBefore"],
+            not_after=spec["notAfter"], alg=alg, signing_material=material,
+            capabilities=[capability_from_dict(c) for c in spec.get("capabilities", [])],
+            limits=[Limit(kind=x.get("kind"), max=x.get("max"), arg=x.get("arg"),
+                          window_seconds=x.get("windowSeconds"))
+                    for x in spec.get("limits", [])],
+            reviewers=[_reviewer_from_spec(x) for x in spec.get("reviewers", [])],
+        )
+    except KeyError as exc:
+        print(f"vaara permission sign: spec is missing {exc}", file=sys.stderr)
+        return 2
+    except (ValueError, AttestationError, AttributeError, OSError) as exc:
+        print(f"vaara permission sign: {exc}", file=sys.stderr)
+        return 2
+    text = json.dumps(permission.to_dict(), indent=2)
+    if args.out:
+        Path(args.out).expanduser().write_text(text + "\n", encoding="utf-8", newline="\n")
+    else:
+        print(text)
+    return 0
+
+
+def _cmd_trail_check_permission(args: argparse.Namespace) -> int:
+    """Replay a trail against a principal's signed permission."""
+    from vaara.credential import (
+        check_review_resolutions,
+        check_trail_against_permission,
+        permission_from_dict,
+    )
+
+    try:
+        permission = permission_from_dict(_load_json_file(args.permission, "permission"))
+    except Exception as exc:
+        print(f"vaara trail check-permission: not a usable permission: {exc}", file=sys.stderr)
+        return 2
+    material, ok = _load_jws_verifying_material(args)
+    if not ok:
+        return 2
+    mismatch = _alg_material_mismatch(permission.alg, material)
+    if mismatch:
+        print(f"vaara trail check-permission: {mismatch}", file=sys.stderr)
+        return 2
+    trail, err = _load_trail_source(args)
+    if trail is None:
+        return err
+    report = check_trail_against_permission(trail, permission, verifying_material=material)
+    reviews = check_review_resolutions(trail, permission, verifying_material=material)
+    show_reviews = bool(reviews.reviews) or permission.reviewers
+    ok = report.ok and (reviews.ok or not show_reviews)
+    if args.format == "json":
+        out = report.to_dict()
+        if show_reviews:
+            out["reviews"] = reviews.to_dict()
+            out["ok"] = ok
+        print(json.dumps(out, indent=2))
+    else:
+        print(f"permission: {permission.principal} -> {permission.agent}, "
+              f"tool {permission.tool_name}, {permission.not_before} to {permission.not_after}")
+        if report.chain_problem:
+            print(f"BROKEN chain: {report.chain_problem}; no call judged")
+        elif report.grant_problem:
+            print(f"BAD permission: {report.grant_problem}; no call judged")
+        else:
+            for call in report.calls:
+                if call.state in ("within", "outside_window"):
+                    continue
+                line = f"{call.state:<13} {call.action_id}  decision={call.decision or '-'}"
+                print(line + (f"  ({call.reason})" if call.reason else ""))
+            summary = ", ".join(f"{n} {s}" for s, n in sorted(report.counts.items()))
+            print(f"{'OK' if report.ok else 'FINDINGS'}: {summary or 'no calls under this permission'}")
+            if show_reviews:
+                for rev in reviews.reviews:
+                    line = (f"review {rev.state:<17} {rev.action_id}  {rev.resolution} "
+                            f"by {rev.reviewer or '-'}")
+                    print(line + ("  (override)" if rev.override else ""))
+                summary = ", ".join(f"{n} {s}" for s, n in sorted(reviews.counts.items()))
+                print(f"reviews {'OK' if reviews.ok else 'FINDINGS'}: "
+                      f"{summary or 'no resolutions under this permission'}")
+    return 0 if ok else 1
 
 
 def _load_trail_source(args: argparse.Namespace):
@@ -476,6 +959,23 @@ def _add_trail_source_args(sub_parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _load_export_revocations(args: argparse.Namespace):
+    """Load the registry an export should pin, or None when none was given.
+
+    An export without a registry pins no revocation state, so a reader
+    recomputing a revocation-in-time verdict from the bundle has nothing to
+    recompute against. That is a valid choice; it just has to be a choice,
+    so a path that is supplied and unusable stops the export instead of
+    quietly producing an unpinned bundle.
+    """
+    path = getattr(args, "revocations", None)
+    if not path:
+        return None
+    from vaara.attestation import RevocationRegistry
+
+    return RevocationRegistry.from_dict(_load_json_file(path, "revocations"))
+
+
 def _cmd_trail_export(args: argparse.Namespace) -> int:
     try:
         from vaara.audit.export import export_signed
@@ -487,15 +987,42 @@ def _cmd_trail_export(args: argparse.Namespace) -> int:
     if trail is None:
         return err
 
+    try:
+        revocation = _load_export_revocations(args)
+    except (OSError, ValueError) as exc:
+        print(f"vaara trail export: --revocations: {exc}", file=sys.stderr)
+        return 2
+
+    # Missing extra first, so the install hint wins over any path complaint.
+    from vaara.audit import export as _export_mod
+    if not _export_mod._HAS_CRYPTO:
+        print(_INSTALL_HINT, file=sys.stderr)
+        return 2
+
+    key_path = Path(args.key).expanduser()
+    if not key_path.is_file():
+        print(f"vaara trail export: signing key not found: {key_path}",
+              file=sys.stderr)
+        return 2
+
     out = Path(args.out).expanduser()
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    result = export_signed(
-        trail,
-        out_path=out,
-        signer_key=Path(args.key).expanduser(),
-        agent_id=args.agent_id or "",
-    )
+    # The module imports without cryptography; the check fires on the call.
+    try:
+        result = export_signed(
+            trail,
+            out_path=out,
+            signer_key=key_path,
+            agent_id=args.agent_id or "",
+            revocation=revocation,
+        )
+    except ImportError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    except (OSError, ValueError) as exc:
+        print(f"vaara trail export: --key: {exc}", file=sys.stderr)
+        return 2
 
     print(f"Exported signed trail to {result.path}")
     print(f"  records:      {result.manifest['record_count']}")
@@ -510,7 +1037,7 @@ def _cmd_trail_export_threshold(args: argparse.Namespace) -> int:
             _load_private_key,
             export_signed_threshold,
         )
-        from vaara.audit.signer import Ed25519Signer
+        from vaara.audit.signer import Ed25519Signer, Signer
         from vaara.audit.trail import AuditRecord, AuditTrail
     except ImportError:
         print(_INSTALL_HINT, file=sys.stderr)
@@ -533,7 +1060,7 @@ def _cmd_trail_export_threshold(args: argparse.Namespace) -> int:
             if rec.record_hash:
                 trail._last_hash = rec.record_hash
 
-    signers = []
+    signers: list[Signer] = []
     for key_path in args.key:
         try:
             signers.append(Ed25519Signer(_load_private_key(Path(key_path).expanduser())))
@@ -551,8 +1078,9 @@ def _cmd_trail_export_threshold(args: argparse.Namespace) -> int:
             signers=signers,
             threshold_k=args.threshold_k,
             agent_id=args.agent_id or "",
+            revocation=_load_export_revocations(args),
         )
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
         print(f"threshold export failed: {exc}", file=sys.stderr)
         return 2
 
@@ -564,15 +1092,64 @@ def _cmd_trail_export_threshold(args: argparse.Namespace) -> int:
     return 0 if result.chain_intact else 1
 
 
+# What an OK proves and what it cannot: the chain catches an edit, insert or
+# deletion inside the export, not a tail cut before the export was signed.
+_TRAIL_VERIFY_SCOPE = (
+    "  covers: signatures and chain interior; a dropped tail before export "
+    "is not detected without an anchor or seal "
+    "(docs/prove-what-an-ai-agent-did.md)"
+)
+
+
 def _cmd_trail_verify(args: argparse.Namespace) -> int:
     try:
-        from vaara.audit.verify import verify_signed
+        from vaara.audit.verify import (
+            describe_cage_lifecycle,
+            describe_rotation_seams,
+            describe_unrecorded_windows,
+            verify_signed,
+        )
     except ImportError:
         print(_INSTALL_HINT, file=sys.stderr)
         return 2
 
+    from vaara.audit import verify as _verify_mod
+    if not _verify_mod._HAS_CRYPTO:
+        print(_INSTALL_HINT, file=sys.stderr)
+        return 2
+
     pubkey = Path(args.pubkey).expanduser() if args.pubkey else None
-    result = verify_signed(Path(args.zip).expanduser(), public_key=pubkey)
+    if pubkey is not None and not pubkey.is_file():
+        print(f"vaara trail verify: public key not found: {pubkey}",
+              file=sys.stderr)
+        return 2
+    try:
+        erasure_key = (_verify_mod._load_erasure_key(Path(args.erasure_key).expanduser())
+                       if args.erasure_key else None)
+    except (OSError, ValueError) as exc:
+        print(f"vaara trail verify: --erasure-key: {exc}", file=sys.stderr)
+        return 2
+    rotation_key = Path(args.rotation_key).expanduser() if args.rotation_key else None
+    if rotation_key is not None:
+        try:
+            _verify_mod._load_public_key(rotation_key)
+        except (OSError, ValueError) as exc:
+            print(f"vaara trail verify: --rotation-key: {exc}", file=sys.stderr)
+            return 2
+    archive = Path(args.archive).expanduser() if args.archive else None
+    if archive is not None and not archive.is_file():
+        print(f"vaara trail verify: --archive: not a file: {archive}", file=sys.stderr)
+        return 2
+    try:
+        result = verify_signed(Path(args.zip).expanduser(), public_key=pubkey,
+                               erasure_key=erasure_key, rotation_key=rotation_key,
+                               archive=archive)
+    except ImportError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    except (OSError, ValueError) as exc:
+        print(f"vaara trail verify: --pubkey: {exc}", file=sys.stderr)
+        return 2
 
     if result.manifest:
         print("Manifest:")
@@ -588,6 +1165,26 @@ def _cmd_trail_verify(args: argparse.Namespace) -> int:
         print(f"  vaara:        {result.manifest.get('vaara_version')}")
     if result.ok:
         print("Verification: OK")
+        print(_TRAIL_VERIFY_SCOPE)
+        for slot in result.erased:
+            print(f"  record {slot['index']} ({slot['record_id']}) erased: link verified, "
+                  f"content not checkable (erasure record {slot['erased_by_index']})")
+        for e in result.erasures:
+            ground = f", ground: {e['legal_ground']}" if e["legal_ground"] else ""
+            if e["state"] == "signed":
+                who = f"signed by {e['erased_by']} under the given key"
+            elif e["state"] == "unpinned":
+                who = (f"signed as {e['erased_by']}, not checked "
+                       "(pass --erasure-key to check whose key)")
+            else:
+                who = "eraser not signed"
+            print(f"  erasure record {e['index']}: {who}{ground}")
+        for line in describe_cage_lifecycle(result):
+            print(f"  {line}")
+        for line in describe_unrecorded_windows(result):
+            print(f"  {line}")
+        for line in describe_rotation_seams(result):
+            print(f"  {line}")
         if pubkey is None:
             print(
                 "  WARNING: no --pubkey given — the trail was checked against the "
@@ -598,8 +1195,8 @@ def _cmd_trail_verify(args: argparse.Namespace) -> int:
             )
         return 0
     print("Verification: FAILED", file=sys.stderr)
-    for e in result.errors:
-        print(f"  - {e}", file=sys.stderr)
+    for err in result.errors:
+        print(f"  - {err}", file=sys.stderr)
     return 1
 
 
@@ -636,6 +1233,20 @@ def _cmd_trail_export_prov(args: argparse.Namespace) -> int:
     )
     scope = f"action {args.action_id}" if args.action_id else "full trail"
     print(f"Exported {n} records ({scope}) to PROV-JSON: {out}")
+    return 0
+
+
+def _cmd_trail_export_ocsf(args: argparse.Namespace) -> int:
+    """Export the trail's decisions as OCSF API Activity events (JSON Lines)."""
+    from vaara.audit.ocsf_export import OCSF_VERSION, write_ocsf_jsonl
+
+    trail, err = _load_trail_source(args)
+    if trail is None:
+        return err
+
+    out = Path(args.out).expanduser()
+    n = write_ocsf_jsonl(trail._records, out, hostname=args.hostname)
+    print(f"Exported {n} decisions as OCSF {OCSF_VERSION} API Activity events: {out}")
     return 0
 
 
@@ -743,6 +1354,7 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
         host=args.host,
         port=port,
         open_browser=not args.no_browser,
+        allow_network=args.allow_network,
     )
 
 
@@ -820,7 +1432,13 @@ def _cmd_trail_publish_head(args: argparse.Namespace) -> int:
         print("dry run, nothing published")
         return 0
 
-    if not args.yes and sys.stdin.isatty():
+    if not args.yes:
+        # With no terminal there is nobody to answer, and silence is not a
+        # yes: a script, CI job or agent has to pass --yes to publish.
+        if not sys.stdin.isatty():
+            print("nothing published: no terminal to confirm on, pass --yes "
+                  "to publish non-interactively", file=sys.stderr)
+            return 2
         try:
             if input("Publish? [y/N] ").strip().lower() not in ("y", "yes"):
                 print("nothing published")
@@ -854,6 +1472,7 @@ def _cmd_trail_verify_anchor(args: argparse.Namespace) -> int:
         from vaara.audit.timeanchor import (
             TimeAnchor,
             TimeAnchorError,
+            _cert_der,
             verify_anchor_over_records,
         )
         from vaara.audit.trail import AuditRecord
@@ -865,6 +1484,26 @@ def _cmd_trail_verify_anchor(args: argparse.Namespace) -> int:
     if not zip_path.exists():
         print(f"package zip not found: {zip_path}", file=sys.stderr)
         return 2
+
+    pins: dict[str, bytes] = {}
+    for flag, path in (("--tsa-cert", args.tsa_cert), ("--tsa-issuer", args.tsa_issuer)):
+        if path is None:
+            continue
+        pin_path = Path(path).expanduser()
+        try:
+            pin_bytes = pin_path.read_bytes()
+        except FileNotFoundError:
+            print(f"{flag} file not found: {pin_path}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"could not read {flag} file: {exc}", file=sys.stderr)
+            return 2
+        try:
+            _cert_der(pin_bytes)
+        except ValueError:
+            print(f"{flag} is not a PEM or DER certificate: {pin_path}", file=sys.stderr)
+            return 2
+        pins[flag] = pin_bytes
 
     try:
         with zipfile.ZipFile(zip_path) as zf:
@@ -888,7 +1527,12 @@ def _cmd_trail_verify_anchor(args: argparse.Namespace) -> int:
     ]
 
     try:
-        attested = verify_anchor_over_records(anchor, record_hashes)
+        attested = verify_anchor_over_records(
+            anchor,
+            record_hashes,
+            trusted_signer_cert=pins.get("--tsa-cert"),
+            trusted_issuer_cert=pins.get("--tsa-issuer"),
+        )
     except TimeAnchorError as exc:
         print(f"time anchor INVALID: {exc}", file=sys.stderr)
         return 1
@@ -897,8 +1541,16 @@ def _cmd_trail_verify_anchor(args: argparse.Namespace) -> int:
     print(f"  backend:        {anchor.backend}")
     print(f"  TSA:            {anchor.tsa_url}")
     print(f"  anchored head:  {anchor.chain_head_hash}")
-    print(f"  attested (UTC): {attested.isoformat()}")
-    print("  note: pin the TSA certificate to enforce an eIDAS-qualified authority.")
+    print(
+        f"  attested (UTC): {attested.isoformat()}"
+        " (the anchored head existed no later than this)"
+    )
+    if "--tsa-cert" in pins:
+        print("  pinned:         signer certificate equals --tsa-cert")
+    if "--tsa-issuer" in pins:
+        print("  pinned:         signer issued by --tsa-issuer")
+    if not pins:
+        print("  UNPINNED: time as asserted by the certificate in the package")
     return 0
 
 
@@ -943,6 +1595,8 @@ def _obtain_time_anchor(args: argparse.Namespace, trail):
         except (json.JSONDecodeError, OSError, KeyError, TypeError) as exc:
             raise ValueError(f"failed to read anchor file: {exc}") from exc
 
+    if not anchor_tsa:
+        return None
     try:
         client = RFC3161TimeAnchorClient(anchor_tsa)
         return client.anchor(head_position, head_hash)
@@ -987,7 +1641,11 @@ def _cmd_trail_export_article50(args: argparse.Namespace) -> int:
         result = export_article50(
             trail, out, signer_key=Path(args.key).expanduser(),
             system_meta=system_meta, period=period,
+            revocation=_load_export_revocations(args),
         )
+    except (OSError, ValueError) as exc:
+        print(f"vaara trail export-article50: {exc}", file=sys.stderr)
+        return 2
     except ImportError:
         print(_INSTALL_HINT, file=sys.stderr)
         return 2
@@ -1144,10 +1802,11 @@ def _cmd_trail_export_article12(args: argparse.Namespace) -> int:
             enforcements=enforcements,
             trusted_did_document=trusted,
             expected_measurement=expected,
+            revocation=_load_export_revocations(args),
             fmt=args.format,
             agent_id=args.agent_id or "",
         )
-    except (ValueError, ImportError, TimeAnchorError) as exc:
+    except (OSError, ValueError, ImportError, TimeAnchorError) as exc:
         print(f"Article 12 export failed: {exc}", file=sys.stderr)
         return 2
 
@@ -1165,7 +1824,7 @@ def _cmd_trail_export_article12(args: argparse.Namespace) -> int:
 
 
 def _cmd_trail_purge(args: argparse.Namespace) -> int:
-    """Delete audit records older than --retention-days. EU AI Act Article 12(2)."""
+    """Delete audit records older than --retention-days. EU AI Act Articles 19(1) and 26(6)."""
     from vaara.audit.sqlite_backend import SQLiteAuditBackend
 
     db_path = Path(args.db).expanduser()
@@ -1188,6 +1847,7 @@ def _cmd_trail_purge(args: argparse.Namespace) -> int:
     backend = SQLiteAuditBackend(db_path, tenant_id=tenant_scope)
     try:
         count = backend.purge_older_than(retention_seconds, dry_run=args.dry_run)
+        scrubbed = backend.last_purge_scrubbed
     finally:
         backend.close()
 
@@ -1198,11 +1858,14 @@ def _cmd_trail_purge(args: argparse.Namespace) -> int:
         print(f"Purged {count} record(s) older than {args.retention_days} day(s).")
         if count > 0:
             print(
-                "Note: hash chain has a seam at the retention boundary. "
-                "Run 'vaara trail export' BEFORE future purges to preserve "
-                "audit history in a signed zip.",
+                "Note: nothing in the trail accounts for the records removed, so an "
+                "export of it fails verification at its first record. Use "
+                "'vaara trail rotate' instead: it archives the trail, appends a "
+                "signed record naming what is purged, and then purges.",
                 file=sys.stderr,
             )
+        if scrubbed is False:
+            print(_WAL_NOT_TRUNCATED, file=sys.stderr)
     return 0
 
 
@@ -1268,9 +1931,24 @@ def _cmd_review_claim(args: argparse.Namespace) -> int:
 
 
 def _cmd_review_resolve(args: argparse.Namespace) -> int:
+    from vaara.attestation._attest_types import AttestationError
     from vaara.audit.review_queue import (
         InvalidTransitionError, ItemNotFoundError,
     )
+    reviewer_key = None
+    if args.sign_key:
+        from cryptography.hazmat.primitives import serialization
+        if not args.audit_db:
+            print("resolve failed: --sign-key needs --audit-db, the trail the "
+                  "signature binds to", file=sys.stderr)
+            return 2
+        try:
+            reviewer_key = serialization.load_pem_private_key(
+                Path(args.sign_key).expanduser().read_bytes(), password=None,
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"resolve failed: --sign-key: {exc}", file=sys.stderr)
+            return 2
     trail = None
     backend = None
     if args.audit_db:
@@ -1290,11 +1968,12 @@ def _cmd_review_resolve(args: argparse.Namespace) -> int:
                     resolution=args.resolution,
                     justification=args.justification or "",
                     trail=trail,
+                    reviewer_key=reviewer_key,
                 )
             except (InvalidTransitionError, ItemNotFoundError) as exc:
                 print(f"resolve failed: {exc}", file=sys.stderr)
                 return 2
-            except ValueError as exc:
+            except (ValueError, AttestationError) as exc:
                 print(f"resolve failed: {exc}", file=sys.stderr)
                 return 2
     finally:
@@ -1306,6 +1985,8 @@ def _cmd_review_resolve(args: argparse.Namespace) -> int:
     )
     if trail is not None:
         print("Wrote ESCALATION_RESOLVED to audit trail (Article 14(4)(d)).")
+    if reviewer_key is not None:
+        print("Signed by the reviewer over the decision record hash.")
     return 0
 
 
@@ -1321,6 +2002,40 @@ def _cmd_review_expire(args: argparse.Namespace) -> int:
     verb = "Would expire" if args.dry_run else "Expired"
     print(f"{verb} {n} pending item(s) older than "
           f"{args.timeout_seconds} second(s).")
+    return 0
+
+
+def _cmd_review_purge(args: argparse.Namespace) -> int:
+    """Delete closed review items past retention. GDPR Art. 5(1)(e) and 17."""
+    if args.older_than_days <= 0:
+        print(f"--older-than-days must be > 0, got {args.older_than_days}",
+              file=sys.stderr)
+        return 2
+    db_path = Path(args.db).expanduser()
+    if not db_path.exists():
+        print(f"review queue DB not found: {db_path}", file=sys.stderr)
+        return 1
+    seconds = args.older_than_days * 86400
+    with _open_review_queue(args.db) as q:
+        n = q.purge_older_than(seconds, dry_run=args.dry_run)
+        scrubbed = q.last_purge_scrubbed
+        still_open = q.open_older_than(seconds)
+    if args.dry_run:
+        print(f"Would purge {n} closed item(s) older than "
+              f"{args.older_than_days} day(s).")
+        print("Run without --dry-run to apply.")
+    else:
+        print(f"Purged {n} closed item(s) older than "
+              f"{args.older_than_days} day(s).")
+        if scrubbed is False:
+            print("Note: the WAL could not be truncated (another process "
+                  "holds the queue open): the purged bytes stay in the -wal "
+                  "file until the next checkpoint", file=sys.stderr)
+    if still_open:
+        print(f"Note: {still_open} open item(s) older than the cutoff are "
+              "kept, a decision is still owed on them. 'vaara review expire' "
+              "closes pending ones; a later purge then removes them.",
+              file=sys.stderr)
     return 0
 
 
@@ -1429,7 +2144,7 @@ def _cmd_trail_receipt(args: argparse.Namespace) -> int:
 
     text = json.dumps(receipt.to_dict(), indent=2, sort_keys=False)
     if args.out:
-        Path(args.out).expanduser().write_text(text, encoding="utf-8")
+        Path(args.out).expanduser().write_text(text, encoding="utf-8", newline="\n")
     else:
         print(text)
     return 0
@@ -1464,7 +2179,7 @@ def _cmd_compliance_dashboard(args: argparse.Namespace) -> int:
         out = out / "index.html"
     else:
         out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(render_html(report), encoding="utf-8")
+    out.write_text(render_html(report), encoding="utf-8", newline="\n")
     print(str(out))
     return 0
 
@@ -1528,7 +2243,7 @@ def _cmd_compliance_report(args: argparse.Namespace) -> int:
 
     if args.out:
         out_path = Path(args.out).expanduser()
-        out_path.write_text(text, encoding="utf-8")
+        out_path.write_text(text, encoding="utf-8", newline="\n")
     else:
         print(text)
     return 0
@@ -1736,10 +2451,9 @@ def _cmd_tee_parse(args: argparse.Namespace) -> int:
 def _cmd_tee_verify(args: argparse.Namespace) -> int:
     """Verify a SEV-SNP report signature, optionally against an OVERT envelope.
 
-    The VCEK (Versioned Chip Endorsement Key) must be supplied as PEM. AMD
-    KDS-based cert-chain validation (VCEK -> ASK -> ARK) is tracked for a
-    later release; v0.18.0 only validates the report signature against a
-    caller-supplied VCEK.
+    The VCEK (Versioned Chip Endorsement Key) must be supplied as PEM. With
+    --amd-chain the signing key is also checked against AMD's pinned root, and
+    the command fails if that chain does not hold.
     """
     try:
         import cbor2
@@ -1786,11 +2500,23 @@ def _cmd_tee_verify(args: argparse.Namespace) -> int:
         print(f"vaara tee verify: {exc}", file=sys.stderr)
         return 1
 
-    result = {
+    result: dict[str, Any] = {
         "signature_valid": signature_ok,
         "report_data": report.report_data.hex(),
         "measurement": report.measurement.hex(),
     }
+
+    chain_ok = True
+    if args.amd_chain:
+        from vaara.attestation._sev_snp_chain import verify_sev_snp_chain
+
+        try:
+            chain = verify_sev_snp_chain(report, *_read_amd_chain(args.amd_chain))
+        except (OSError, ValueError, TEEAttestationError) as exc:
+            print(f"vaara tee verify: {exc}", file=sys.stderr)
+            return 1
+        result["amd_chain"] = chain.to_dict()
+        chain_ok = chain.ok
 
     if args.overt:
         overt_path = Path(args.overt).expanduser()
@@ -1820,10 +2546,101 @@ def _cmd_tee_verify(args: argparse.Namespace) -> int:
         result["envelope_binding_valid"] = None
 
     print(json.dumps(result, indent=2))
-    if not signature_ok:
+    if not signature_ok or not chain_ok:
         return 1
     if args.overt and result["envelope_binding_valid"] is False:
         return 1
+    return 0
+
+
+def _read_amd_chain(paths: "list[str]") -> "tuple[bytes, bytes, bytes]":
+    """(signing cert, intermediate, ARK) from one combined PEM or three files.
+
+    Raises OSError on an unreadable file and ValueError (TEEAttestationError is
+    a RuntimeError, so it is re-raised as ValueError) on a bad chain file.
+    """
+    from vaara.attestation._sev_snp_chain import split_pem_chain
+    from vaara.attestation.tee import TEEAttestationError
+
+    blobs = [Path(p).expanduser().read_bytes() for p in paths]
+    if len(blobs) == 3:
+        return blobs[0], blobs[1], blobs[2]
+    if len(blobs) != 1:
+        raise ValueError("--amd-chain takes one combined PEM file or three files")
+    try:
+        return split_pem_chain(blobs[0])
+    except TEEAttestationError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _pem_from_cert_bytes(data: bytes) -> bytes:
+    from vaara.attestation._sev_snp_chain import _load_cert
+    from cryptography.hazmat.primitives import serialization
+
+    return bytes(_load_cert(data).public_bytes(serialization.Encoding.PEM))
+
+
+def _cmd_tee_emit(args: argparse.Namespace) -> int:
+    """Request a live SEV-SNP report inside a confidential VM."""
+    try:
+        from vaara.attestation._sev_snp_chain import parse_certificate_table
+        from vaara.attestation.tee import SEVSNPHostAttester, TEEAttestationError
+    except ImportError:
+        print(_ATTESTATION_HINT, file=sys.stderr)
+        return 2
+    try:
+        report_data = bytes.fromhex(args.report_data.strip())
+    except ValueError:
+        print("vaara tee emit: --report-data is not valid hex", file=sys.stderr)
+        return 2
+    try:
+        report, table = SEVSNPHostAttester(
+            privlevel=args.privlevel
+        ).emit_with_certificates(report_data)
+    except TEEAttestationError as exc:
+        print(f"vaara tee emit: {exc}", file=sys.stderr)
+        return 1
+    Path(args.out).expanduser().write_bytes(report)
+    print(f"report: {args.out} ({len(report)} bytes)")
+    if args.certs_out:
+        try:
+            certs = parse_certificate_table(table) if table else {}
+            signing = certs.get("vcek") or certs.get("vlek")
+            if not (signing and certs.get("ask") and certs.get("ark")):
+                print("vaara tee emit: the host published no certificate chain; "
+                      "use `vaara tee fetch-chain`", file=sys.stderr)
+                return 1
+            pem = b"".join(
+                _pem_from_cert_bytes(c) for c in (signing, certs["ask"], certs["ark"])
+            )
+        except TEEAttestationError as exc:
+            print(f"vaara tee emit: {exc}", file=sys.stderr)
+            return 1
+        Path(args.certs_out).expanduser().write_bytes(pem)
+        print(f"chain:  {args.certs_out}")
+    return 0
+
+
+def _cmd_tee_fetch_chain(args: argparse.Namespace) -> int:
+    """Fetch a report's VCEK, ASK and ARK from AMD's KDS as one PEM file."""
+    try:
+        from vaara.attestation._sev_snp_chain import (
+            fetch_amd_cert_chain,
+            fetch_vcek,
+        )
+        from vaara.attestation.tee import TEEAttestationError, parse_sev_snp_report
+    except ImportError:
+        print(_ATTESTATION_HINT, file=sys.stderr)
+        return 2
+    try:
+        report = parse_sev_snp_report(Path(args.report).expanduser().read_bytes())
+        vcek = _pem_from_cert_bytes(fetch_vcek(report, args.product))
+        ask, ark = fetch_amd_cert_chain(args.product)
+    except (OSError, TEEAttestationError) as exc:
+        print(f"vaara tee fetch-chain: {exc}", file=sys.stderr)
+        return 1
+    Path(args.out).expanduser().write_bytes(vcek + ask + ark)
+    print(f"chain: {args.out} (VCEK, ASK, ARK for {args.product})")
     return 0
 
 
@@ -1984,6 +2801,175 @@ def _cmd_attest_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_receipt_verify_transparency(args: argparse.Namespace) -> int:
+    """Check a SCITT Transparency Service receipt offline."""
+    from vaara.audit import scitt_service as ss
+
+    try:
+        receipt = Path(args.receipt).expanduser().read_bytes()
+        statement = Path(args.statement).expanduser().read_bytes()
+        keys = ss.load_key_set(Path(args.keys).expanduser().read_bytes())
+    except (OSError, ValueError) as exc:
+        print(f"vaara receipt verify-transparency: {exc}", file=sys.stderr)
+        return 2
+    check = ss.verify_receipt(receipt, statement=statement, keys=keys)
+    if args.json:
+        print(json.dumps({
+            "ok": check.ok, "detail": check.detail,
+            "kid": check.kid.decode("ascii", "replace") if check.kid else None,
+            "root": check.root.hex() if check.root else None,
+        }))
+    else:
+        print(("OK    " if check.ok else "FAIL  ") + check.detail)
+    return 0 if check.ok else 1
+
+
+def _cmd_receipt_disclose_arguments(args: argparse.Namespace) -> int:
+    """Write the disclosure that opens one receipt's arguments commitment."""
+    from vaara.audit import decision_receipts as dr
+
+    db = Path(args.db or Path.home() / ".vaara" / "trail" / "audit.db").expanduser()
+    try:
+        body = json.loads(Path(args.receipt).expanduser().read_text(encoding="utf-8"))
+        disclosure = dr.disclose_arguments(body["evidence"], db)
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"vaara receipt disclose-arguments: {exc}", file=sys.stderr)
+        return 2
+    text = json.dumps(disclosure, indent=2, sort_keys=True) + "\n"
+    if args.out:
+        Path(args.out).expanduser().write_text(text, encoding="utf-8", newline="\n")
+        print(f"wrote {args.out}: arguments and salt for action {disclosure['actionId']}")
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+def _cmd_receipt_verify_arguments(args: argparse.Namespace) -> int:
+    """Check a disclosure against a decision receipt, without the trail."""
+    from vaara.audit import decision_receipts as dr
+
+    if not dr.signing_available():
+        print("vaara receipt verify-arguments: needs cryptography and rfc8785 "
+              "(reinstall vaara with its dependencies)", file=sys.stderr)
+        return 2
+    path = Path(args.receipt).expanduser()
+    try:
+        key = Path(args.key).expanduser().read_bytes() if args.key else None
+        check = dr.verify_receipt_file(path, public_key_pem=key)
+        body = json.loads(path.read_text(encoding="utf-8"))
+        disclosure = json.loads(Path(args.disclosure).expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"vaara receipt verify-arguments: {exc}", file=sys.stderr)
+        return 2
+    if not (check.signature_ok and check.evidence_ok):
+        print(f"FAIL  receipt does not verify ({check.detail})")
+        return 1
+    if not dr.check_disclosure(body["evidence"], disclosure):
+        print("FAIL  the disclosed arguments do not open this receipt's commitment")
+        return 1
+    print(f"OK    {check.decided_at}  {check.decision}  {check.tool}: "
+          "the disclosed arguments are the ones this decision was made over")
+    return 0
+
+
+def _cmd_receipt_verify_decision(args: argparse.Namespace) -> int:
+    """Verify engine-emitted decision receipts against their trail."""
+    import sqlite3
+
+    from vaara.audit import decision_receipts as dr
+
+    if not dr.signing_available():
+        print("vaara receipt verify-decision: needs cryptography and rfc8785 "
+              "(reinstall vaara with its dependencies)", file=sys.stderr)
+        return 2
+    db = Path(args.db or Path.home() / ".vaara" / "trail" / "audit.db").expanduser()
+    roots = [Path(p).expanduser() for p in args.paths] or [db.parent / dr.RECEIPTS_DIRNAME]
+    files: list[Path] = []
+    # The inference proxy writes its signed pairs into the same receipts
+    # directory the chart gives the engine, so a directory walk meets them.
+    # They are a different receipt type with their own verifier; counting
+    # them here as unreadable decision receipts failed every healthy run.
+    inference: list[Path] = []
+    for root in roots:
+        if root.is_dir():
+            for f in sorted(root.rglob("*.json")):
+                if f.name.endswith(("-infer-attest.json", "-infer-receipt.json")):
+                    inference.append(f)
+                else:
+                    files.append(f)
+        elif root.is_file():
+            files.append(root)
+        else:
+            print(f"vaara receipt verify-decision: {root} not found", file=sys.stderr)
+            return 2
+    if not files:
+        print("vaara receipt verify-decision: no receipts found", file=sys.stderr)
+        return 1
+    hashes = None
+    if db.exists():
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            hashes = dict(con.execute("SELECT record_id, record_hash FROM audit_records"))
+        finally:
+            con.close()
+    key = Path(args.key).expanduser().read_bytes() if args.key else None
+    failed = 0
+    # Blocks on verified receipts, by whether the producer could stop the
+    # action. A shadow or recorded-only block is a deny that stopped nothing,
+    # and one with no mode says nothing either way.
+    blocks = {"could_block": 0, "shadow": 0, "recorded_only": 0, "": 0}
+    for f in files:
+        try:
+            c = dr.verify_receipt_file(f, public_key_pem=key, trail_hashes=hashes)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            failed += 1
+            print(f"FAIL  {f}: unreadable ({exc})")
+            continue
+        failed += 0 if c.ok else 1
+        if c.ok and c.decision == "block":
+            blocks[c.enforcement if c.enforcement in blocks else ""] += 1
+        if args.json:
+            print(json.dumps({
+                "path": c.path, "ok": c.ok, "signature": c.signature_ok,
+                "evidence": c.evidence_ok, "trail": c.trail_ok,
+                "decision": c.decision, "tool": c.tool, "decidedAt": c.decided_at,
+                "enforcement": c.enforcement, "detail": c.detail,
+            }))
+        else:
+            mark = "OK  " if c.ok else "FAIL"
+            tail = f"  ({c.detail})" if c.detail else ""
+            print(f"{mark}  {c.decided_at}  {c.decision:<8}  {c.tool}{tail}")
+    if not args.json:
+        trail_note = "" if hashes is not None else " (no trail to check against)"
+        print(f"{len(files) - failed}/{len(files)} verified{trail_note}")
+        if any(blocks.values()):
+            print(f"blocks: {blocks['could_block']} stopped, {blocks['shadow']} shadow, "
+                  f"{blocks['recorded_only']} recorded only, "
+                  f"{blocks['']} mode not recorded")
+        if inference:
+            dirs = sorted({str(f.parent) for f in inference})
+            print(f"skipped {len(inference)} inference receipt file(s); check them with "
+                  f"vaara receipt verify-inference --dir {dirs[0]} --pubkey PUBKEY.pem")
+    return 1 if failed else 0
+
+
+def _cmd_receipt_verify_inference(args: argparse.Namespace) -> int:
+    """Verify inference-proxy attestation and receipt pairs."""
+    try:
+        from vaara.attestation._inference_verify import main as verify_inference
+    except ImportError:
+        print(_ATTESTATION_HINT, file=sys.stderr)
+        return 2
+    argv: list[str] = [args.receipt] if args.receipt else []
+    for flag, value in (("--attestation", args.attestation), ("--dir", args.dir),
+                        ("--pubkey", args.pubkey), ("--secret", args.secret)):
+        if value:
+            argv += [flag, value]
+    if args.json:
+        argv.append("--json")
+    return verify_inference(argv)
+
+
 def _cmd_receipt_verify(args: argparse.Namespace) -> int:
     """Verify an execution receipt: signature, back-link, and optionally result."""
     try:
@@ -2049,7 +3035,15 @@ def _cmd_receipt_verify(args: argparse.Namespace) -> int:
         "back_link_valid": back_link.ok,
         "status": receipt.outcome_derived.status,
         "completed_at": receipt.outcome_derived.completed_at,
+        "outcome_observed": receipt.outcome_derived.status != "unobserved",
+        "outcome_note": "status and completed_at as asserted by the issuer",
     }
+    if receipt.outcome_derived.status == "unobserved":
+        result["outcome_note"] = (
+            "unobserved: the issuer sent the request and observed no outcome, "
+            "so it cannot say whether the action ran; read as neither executed "
+            "nor errored (status and completed_at as asserted by the issuer)"
+        )
 
     commitment = receipt.outcome_derived.result_commitment
     if commitment is None:
@@ -2100,27 +3094,76 @@ def _write_receipt_out(receipt: dict, args: argparse.Namespace,
                        fallback: Path) -> None:
     text = json.dumps(receipt, indent=2)
     out = Path(args.out).expanduser() if args.out else fallback
-    out.write_text(text + "\n", encoding="utf-8")
+    out.write_text(text + "\n", encoding="utf-8", newline="\n")
     print(f"wrote {out}")
 
 
 def _cmd_receipt_anchor_scitt(args: argparse.Namespace) -> int:
-    """Add a SCITT transparency-log witness anchor to a receipt."""
+    """Add a ``scitt`` Merkle-log anchor to a receipt."""
     from vaara.audit.scitt_anchor import ScittAnchor, ScittAnchorError
     receipt, path = _load_receipt(args.receipt, "anchor-scitt")
     if receipt is None or path is None:
         return 2
-    anchorer = ScittAnchor()
     try:
+        anchorer = ScittAnchor.load_or_create(args.log_dir, log_id=args.log_id)
         anchor = anchorer.anchor_receipt(receipt)
-    except ScittAnchorError as exc:
+    except (ScittAnchorError, OSError) as exc:
         print(f"vaara receipt anchor-scitt: {exc}", file=sys.stderr)
         return 2
     receipt.setdefault("timestampAnchors", []).append(anchor)
     _write_receipt_out(receipt, args, path)
     print(f"scitt anchor added: leafIndex={anchor['leafIndex']} "
-          f"treeSize={anchor['treeSize']}")
+          f"treeSize={anchor['treeSize']} log={anchorer.path}")
+    print("The root is the log operator's own claim until someone else holds "
+          "a tree head: publish `vaara receipt anchor-scitt-head`.")
     return 0
+
+
+def _cmd_receipt_anchor_scitt_head(args: argparse.Namespace) -> int:
+    """Print the ``scitt`` log's current tree head as JSON."""
+    from vaara.audit.scitt_anchor import ScittAnchor, ScittAnchorError
+    try:
+        head = ScittAnchor.load_or_create(args.log_dir, log_id=args.log_id).head(
+            consistency_from=args.consistency_from)
+    except (ScittAnchorError, OSError) as exc:
+        print(f"vaara receipt anchor-scitt-head: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(head, indent=2))
+    return 0
+
+
+def _cmd_receipt_verify_scitt(args: argparse.Namespace) -> int:
+    """Verify every ``scitt`` anchor on a receipt, optionally against a head."""
+    from vaara.audit.scitt_anchor import ScittAnchorError, verify_scitt_anchor
+    receipt, _ = _load_receipt(args.receipt, "verify-scitt")
+    if receipt is None:
+        return 2
+    trusted_head = None
+    if args.head:
+        try:
+            trusted_head = json.loads(
+                Path(args.head).expanduser().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"vaara receipt verify-scitt: cannot read head JSON: {exc}",
+                  file=sys.stderr)
+            return 2
+    anchors = [a for a in receipt.get("timestampAnchors") or []
+               if isinstance(a, dict) and a.get("method") == "scitt"]
+    if not anchors:
+        print("vaara receipt verify-scitt: the receipt carries no scitt anchor",
+              file=sys.stderr)
+        return 2
+    ok = True
+    for anchor in anchors:
+        try:
+            result = verify_scitt_anchor(receipt, anchor, trusted_head=trusted_head)
+        except ScittAnchorError as exc:
+            print(f"vaara receipt verify-scitt: {exc}", file=sys.stderr)
+            return 2
+        print(f"leaf {result['leaf_index']}: {result['status']}; "
+              f"root {result['root']}")
+        ok = ok and bool(result["verified"])
+    return 0 if ok else 1
 
 
 def _cmd_receipt_render(args: argparse.Namespace) -> int:
@@ -2137,7 +3180,7 @@ def _cmd_receipt_render(args: argparse.Namespace) -> int:
         return 2
     out = (Path(args.out).expanduser() if args.out
            else path.with_suffix(".html"))
-    out.write_text(page, encoding="utf-8")
+    out.write_text(page, encoding="utf-8", newline="\n")
     print(f"wrote {out}")
     return 0
 
@@ -2166,14 +3209,14 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
         )
         return 2
 
-    if args.enforce and not args.allow and not args.approvals_dir:
+    if (args.enforce and not args.allow and not args.approvals_dir
+            and not args.policy):
         print(
-            "vaara proxy: --enforce needs --allow PATTERN (repeatable) "
-            "and/or --approvals-dir. Without an allow-list every tool call "
-            "is gated and clients appear to lose their tools (nothing is "
-            "damaged, but the session is unusable). Start with --allow "
-            "'mcp__*' and tighten from there, or run without --enforce to "
-            "observe first.",
+            "vaara proxy: --enforce needs --policy FILE, --allow PATTERN "
+            "(repeatable) or --approvals-dir. With none of them the built-in "
+            "defaults decide alone and every escalation fails closed with "
+            "nobody to answer it. Run without --enforce first with your "
+            "policy, read `vaara trail shadow-report`, then enforce.",
             file=sys.stderr,
         )
         return 2
@@ -2190,6 +3233,20 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
     trail = backend.load_trail()
     trail._on_record = backend.write_record
     pipeline = InterceptionPipeline(trail=trail, enforce=args.enforce)
+    if args.policy:
+        from vaara.policy.validate import validate_source
+
+        policy_path = Path(args.policy).expanduser()
+        policy, report = validate_source(policy_path)
+        if policy is None:
+            print(f"vaara proxy: policy {policy_path} failed validation:",
+                  file=sys.stderr)
+            for issue in report.issues:
+                print(f"  {issue.level.value}: {issue.message}", file=sys.stderr)
+            return 2
+        # Same rebinding `vaara serve` and vaara-mcp-proxy do: thresholds,
+        # per-tool overrides and sequence patterns come from the policy.
+        pipeline.scorer.apply_policy(policy)
 
     emitter = None
     if args.signing_key:
@@ -2224,7 +3281,8 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
     )
     mode = "enforce" if args.enforce else "observe"
     print(f"vaara proxy: listening on {host}:{port} -> {args.upstream}, "
-          f"trail {trail_path}, mode {mode}")
+          f"trail {trail_path}, mode {mode}, "
+          f"policy {args.policy or 'built-in defaults'}")
 
     import uvicorn
 
@@ -2246,45 +3304,15 @@ def _cmd_proxy_shell(args: argparse.Namespace) -> int:
 
 
 def _cmd_llm_proxy(args: argparse.Namespace) -> int:
-    """Run the LLM API proxy.
+    """Run the LLM API proxy, forwarding argv untouched.
 
-    Intercepts prompts from coding agents, strips secrets, enforces
-    model/rate policies, and forwards to the configured upstream provider.
+    The parser lives in vaara.integrations.llm_proxy and is the only one.
+    Nothing is restated here, so a new option there is reachable through
+    ``vaara llm-proxy`` the moment it exists.
     """
     from vaara.integrations.llm_proxy import main as llm_main
 
-    cli_args = []
-    cli_args += ["--upstream", args.upstream]
-    if args.api_key:
-        cli_args += ["--api-key", args.api_key]
-    if args.api_key_file:
-        cli_args += ["--api-key-file", args.api_key_file]
-    if args.api_key_header:
-        cli_args += ["--api-key-header", args.api_key_header]
-    if args.mode:
-        cli_args += ["--mode", args.mode]
-    if args.audit:
-        cli_args += ["--audit", args.audit]
-    if args.listen:
-        cli_args += ["--listen", args.listen]
-    if args.trail:
-        cli_args += ["--trail", args.trail]
-    if args.enforce:
-        cli_args.append("--enforce")
-    if args.model_allow:
-        for pat in args.model_allow:
-            cli_args += ["--model-allow", pat]
-    if args.model_deny:
-        for pat in args.model_deny:
-            cli_args += ["--model-deny", pat]
-    if args.rate_limit:
-        cli_args += ["--rate-limit", str(args.rate_limit)]
-    if args.redact:
-        for pat in args.redact:
-            cli_args += ["--redact", pat]
-    if args.agent_id_header:
-        cli_args += ["--agent-id-header", args.agent_id_header]
-    return llm_main(cli_args)
+    return llm_main(getattr(args, "llm_proxy_args", []))
 
 
 def _cmd_check(args: argparse.Namespace) -> int:
@@ -2302,6 +3330,10 @@ def _cmd_check(args: argparse.Namespace) -> int:
     Path(db).parent.mkdir(parents=True, exist_ok=True)
     trail = SQLiteAuditBackend(db).load_trail()
     pipeline = InterceptionPipeline(registry=registry, trail=trail)
+
+    # A check nobody followed with `vaara outcome` is closed as orphaned, on
+    # the trail, once it is a day old. Nothing is deleted silently.
+    pipeline.close_orphaned_outcomes()
 
     params = {}
     for p in args.param or []:
@@ -2465,6 +3497,9 @@ def _cmd_verify_record(args: argparse.Namespace) -> int:
     existence = _verify_single_existence_proof(
         doc, getattr(args, "trusted_issuer_cert", None)
     )
+    time_source = None if is_decision else _verify_single_time_source(
+        doc, getattr(args, "trusted_issuer_cert", None)
+    )
 
     if args.json:
         out: dict[str, Any] = {"conformance": report.to_dict()}
@@ -2474,6 +3509,8 @@ def _cmd_verify_record(args: argparse.Namespace) -> int:
             out["backLink"] = back_link
         if existence is not None:
             out["existenceProof"] = existence
+        if time_source is not None:
+            out["timeSource"] = time_source
         print(json.dumps(out, indent=2))
     else:
         print(f"conformance: {'CONFORMS' if report.conforms else 'NON-CONFORMING'}")
@@ -2503,6 +3540,9 @@ def _cmd_verify_record(args: argparse.Namespace) -> int:
             at = existence.get("attestedTime")
             suffix = f"  @ {at}" if at else ""
             print(f"  existence: {estate}{suffix}  {existence['detail']}")
+        if time_source is not None:
+            tstate = "FAIL" if time_source["finding"] else time_source["verdict"]
+            print(f"  time source: {tstate}  {time_source['reason']}")
 
     if not report.conforms:
         return 1
@@ -2511,6 +3551,8 @@ def _cmd_verify_record(args: argparse.Namespace) -> int:
     if back_link is not None and not back_link["ok"] and not back_link.get("skipped"):
         return 1
     if existence is not None and existence["ran"] and not existence["ok"]:
+        return 1
+    if time_source is not None and time_source["finding"]:
         return 1
     return 0
 
@@ -2569,6 +3611,29 @@ def _verify_single_existence_proof(
     return {"ran": True, "ok": res.ok, "qualified": res.qualified,
             "basis": res.basis, "attestedTime": res.attested_time,
             "detail": res.reason}
+
+
+def _verify_single_time_source(
+    doc: Any, trusted_issuer_cert_path: Optional[str]
+) -> Optional[dict[str, Any]]:
+    """Grade the record's ``receiptAsserted.timeSource``.
+
+    Returns ``None`` when the record has no ``receiptAsserted`` object (the
+    conformance check already fails it), else the ``TimeSourceResult`` dict.
+    Absent and ``unsynced`` are reported, never as a trusted time; only a
+    ``tsa`` claim with no checkable token, or an undefined value, is a finding.
+    """
+    if not (isinstance(doc, dict) and isinstance(doc.get("receiptAsserted"), dict)):
+        return None
+    from vaara.attestation._receipt_time_source import verify_receipt_time_source
+
+    pin = None
+    if trusted_issuer_cert_path:
+        try:
+            pin = Path(trusted_issuer_cert_path).expanduser().read_bytes()
+        except OSError:
+            pin = None  # the existence line already reports the unreadable pin
+    return verify_receipt_time_source(doc, trusted_issuer_cert=pin).to_dict()
 
 
 def _record_back_link(attestation_path: str, doc: Any) -> dict[str, Any]:
@@ -2802,16 +3867,21 @@ def _load_handoff_docs(
 
 def _discover_enforcement_triples(
     record_paths: "list[Path]", directory: Path,
-) -> "tuple[list[tuple[str, Any, bytes, bytes]], list[tuple[str, str]]]":
+) -> "tuple[list[tuple[Any, ...]], list[tuple[str, str]]]":
     """Discover ``(stem, record, report_bytes, vcek_pem)`` triples by stem.
 
     Shared by ``verify-enforcements`` and the ``export-article12`` fold:
     ``NAME.record.json`` pairs with ``NAME.report.bin`` and ``NAME.vcek.pem`` in
-    the same directory. A record missing either companion, or an unreadable
-    file, becomes a failing entry in the returned ``missing`` list, never a
-    silent skip.
+    the same directory. An optional ``NAME.amd-chain.pem`` (the VCEK
+    certificate, the ASK and the ARK, in that order) is passed on as the AMD
+    chain. A record missing either required companion, or an unreadable file,
+    becomes a failing entry in the returned ``missing`` list, never a silent
+    skip.
     """
-    triples: list[tuple[str, Any, bytes, bytes]] = []
+    from vaara.attestation._sev_snp_chain import split_pem_chain
+    from vaara.attestation.tee import TEEAttestationError
+
+    triples: list[tuple[Any, ...]] = []
     missing: list[tuple[str, str]] = []
     for record_path in record_paths:
         if record_path.name.endswith(".record.json"):
@@ -2831,13 +3901,21 @@ def _discover_enforcement_triples(
         if not vcek_path.is_file():
             missing.append((record_path.name, f"no companion {vcek_path.name}"))
             continue
+        chain_path = directory / f"{stem}.amd-chain.pem"
         try:
             report_bytes = report_path.read_bytes()
             vcek_pem = vcek_path.read_bytes()
-        except OSError as exc:
+            chain = (
+                split_pem_chain(chain_path.read_bytes())
+                if chain_path.is_file() else None
+            )
+        except (OSError, TEEAttestationError) as exc:
             missing.append((record_path.name, f"cannot read companion ({exc})"))
             continue
-        triples.append((stem, record, report_bytes, vcek_pem))
+        if chain is None:
+            triples.append((stem, record, report_bytes, vcek_pem))
+        else:
+            triples.append((stem, record, report_bytes, vcek_pem, chain))
     return triples, missing
 
 
@@ -2990,8 +4068,10 @@ def _cmd_verify_contiguity(args: argparse.Namespace) -> int:
     """Check authorization receipts for completeness gaps under one boundary.
 
     Reads the ``evidence`` half of each ``*-authz.json`` file and checks that the
-    per-boundary sequence is contiguous. Exit 0 when complete, 1 when a gap is
-    found, 2 on a usage or input error.
+    per-boundary sequence is contiguous. Exit 0 when the held set is consistent,
+    1 when a gap is found, 2 on a usage or input error. Consistent is not
+    complete: a tail removed before the set was held shows only through a held
+    seal, and this command checks no external anchor.
     """
     from vaara.credential import evidence_binding_ok, verify_contiguity
 
@@ -3028,6 +4108,9 @@ def _cmd_verify_contiguity(args: argparse.Namespace) -> int:
         return 2
 
     evidence: list[dict] = []
+    # The whole file each evidence record came from: two different receipts at
+    # one seq are a fork, the same receipt twice is a replay.
+    wholes: list[dict] = []
     dropped = 0
     for f in files:
         try:
@@ -3045,11 +4128,13 @@ def _cmd_verify_contiguity(args: argparse.Namespace) -> int:
                 dropped += 1
                 continue
             evidence.append(payload["evidence"])
+            wholes.append(payload)
         else:
             # Keyless/structural path: accept a full payload or a bare record.
             ev = payload.get("evidence", payload)
             if isinstance(ev, dict):
                 evidence.append(ev)
+                wholes.append(payload)
 
     if verifying_material is not None and dropped:
         print(
@@ -3065,7 +4150,9 @@ def _cmd_verify_contiguity(args: argparse.Namespace) -> int:
         )
 
     try:
-        report = verify_contiguity(evidence, boundary_id=args.boundary_id)
+        report = verify_contiguity(
+            evidence, boundary_id=args.boundary_id, records=wholes
+        )
     except ValueError as exc:
         print(f"vaara verify-contiguity: {exc}", file=sys.stderr)
         return 2
@@ -3086,8 +4173,12 @@ def _cmd_verify_contiguity(args: argparse.Namespace) -> int:
                     "expected": report.expected,
                     "missingSeqs": report.missing_seqs,
                     "duplicateSeqs": report.duplicate_seqs,
+                    "duplicates": report.duplicates,
                     "countMismatches": report.count_mismatches,
                     "dropped": dropped,
+                    "sealed": report.sealed,
+                    # This command takes no anchor, so none is ever checked.
+                    "anchorChecked": False,
                     "ok": ok,
                 },
                 indent=2,
@@ -3166,11 +4257,14 @@ def _cmd_release_check(args: argparse.Namespace) -> int:
     if args.condition_key:
         from cryptography.exceptions import UnsupportedAlgorithm
         from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
         try:
             key = serialization.load_pem_public_key(
                 Path(args.condition_key).expanduser().read_bytes()
             )
+            if not isinstance(key, Ed25519PublicKey):
+                raise ValueError("not an Ed25519 public key")
             condition_verifier = Ed25519Verifier(key.public_bytes_raw())
         except (OSError, ValueError, TypeError, AttributeError, UnsupportedAlgorithm) as exc:
             print(f"vaara release-check: --condition-key: {exc}", file=sys.stderr)
@@ -3212,6 +4306,149 @@ def _cmd_release_check(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
     return 0 if decision.released else 1
+
+
+def _cmd_attribute_check(args: argparse.Namespace) -> int:
+    """Decide a predicate over an attribute whose value nobody is carrying.
+
+    The relying party learns two things and no more: whether the predicate holds
+    over the hidden value, and how strongly that value was sourced. Exit 0 when
+    the predicate is accepted, 1 when it is not (withheld, expired or refused),
+    2 on a usage or input error. The three non-accepting states are separated in
+    the printed reason and never in the exit code, because a caller acts the same
+    way on all three: it does not proceed.
+    """
+    from vaara.attestation._attest_canonical import now_iso8601
+    from vaara.attestation.attribute_zk import (
+        Predicate,
+        PredicateKind,
+        PredicateQuery,
+        SourceStanding,
+        evaluate,
+    )
+    from vaara.audit.signer import Ed25519Verifier
+
+    def _read_json(path_str: str, label: str):
+        try:
+            return json.loads(Path(path_str).expanduser().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"vaara attribute-check: {label}: {exc}", file=sys.stderr)
+            return None
+
+    attestation = proof = None
+    now = args.now
+    if args.bundle:
+        payload = _read_json(args.bundle, args.bundle)
+        if payload is None:
+            return 2
+        if not isinstance(payload, dict):
+            print("vaara attribute-check: bundle must be a JSON object", file=sys.stderr)
+            return 2
+        attestation = payload.get("attestation")
+        proof = payload.get("proof")
+        now = now or payload.get("now")
+
+    for flag, label in (("attestation", "--attestation"), ("proof", "--proof")):
+        path_str = getattr(args, flag, None)
+        if not path_str:
+            continue
+        loaded = _read_json(path_str, label)
+        if loaded is None:
+            return 2
+        if flag == "attestation":
+            attestation = loaded
+        else:
+            proof = loaded
+
+    if attestation is None:
+        print(
+            "vaara attribute-check: no attestation given; pass a bundle file or "
+            "--attestation <file>",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.at_least is None and args.at_most is None:
+        print(
+            "vaara attribute-check: state the predicate with --at-least, "
+            "--at-most, or both for a range",
+            file=sys.stderr,
+        )
+        return 2
+    if args.at_least is not None and args.at_most is not None:
+        kind = PredicateKind.IN_RANGE
+    elif args.at_least is not None:
+        kind = PredicateKind.AT_LEAST
+    else:
+        kind = PredicateKind.AT_MOST
+    try:
+        predicate = Predicate(kind=kind, lower=args.at_least, upper=args.at_most)
+    except Exception as exc:  # noqa: BLE001 — a bad bound is a usage error
+        print(f"vaara attribute-check: {exc}", file=sys.stderr)
+        return 2
+
+    verifier = None
+    if args.key:
+        from cryptography.exceptions import UnsupportedAlgorithm
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+        try:
+            key = serialization.load_pem_public_key(
+                Path(args.key).expanduser().read_bytes()
+            )
+            if not isinstance(key, Ed25519PublicKey):
+                raise ValueError("not an Ed25519 public key")
+            verifier = Ed25519Verifier(key.public_bytes_raw())
+        except (OSError, ValueError, TypeError, AttributeError, UnsupportedAlgorithm) as exc:
+            print(f"vaara attribute-check: --key: {exc}", file=sys.stderr)
+            return 2
+
+    query = PredicateQuery(
+        name=args.name,
+        predicate=predicate,
+        minimum_source=SourceStanding(args.min_source),
+        subject_id=args.subject_id,
+        accepted_issuers=frozenset(args.accepted_issuers)
+        if args.accepted_issuers
+        else None,
+    )
+    try:
+        decision = evaluate(
+            attestation, query, proof=proof, now=now or now_iso8601(),
+            verifier=verifier,
+        )
+    except Exception as exc:  # noqa: BLE001 — a bad input is a usage error, not a crash
+        print(f"vaara attribute-check: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(decision.to_dict(), indent=2))
+    else:
+        print(f"{decision.state.value.upper()}  {decision.reason.value}")
+        print(f"  attestation  {decision.attestation_digest}")
+        print(f"  attribute    {args.name}")
+        if decision.predicate:
+            bounds = "  ".join(
+                f"{k}={v}" for k, v in sorted(decision.predicate.items())
+            )
+            print(f"  predicate    {bounds}")
+        if decision.source:
+            print(f"  source       {decision.source.value}")
+        print(f"  evaluated    {decision.evaluated_at}")
+        if verifier is None:
+            print(
+                "vaara attribute-check: NOTE no --key given, so the issuer "
+                "signature could not be checked and nothing can be accepted",
+                file=sys.stderr,
+            )
+        elif proof is None:
+            print(
+                "vaara attribute-check: NOTE no proof was presented, so the "
+                "predicate is unanswered rather than false",
+                file=sys.stderr,
+            )
+    return 0 if decision.accepted else 1
 
 
 def _receipt_signature_verifies(payload: dict, verifying_material: Any) -> bool:
@@ -3344,8 +4581,8 @@ def _cmd_verify_enforcement(args: argparse.Namespace) -> int:
 
     Reads the record, the binary SEV-SNP report, and the VCEK PEM, and prints one
     verdict. The verdict is honest about its limits: a pass proves a report
-    carrying sha512(jcs(record)) verifies against the VCEK you supplied, not that
-    the VCEK is genuine AMD silicon (the KDS chain is not validated) or that the
+    carrying sha512(jcs(record)) verifies against the VCEK you supplied; with
+    --amd-chain, that the VCEK is genuine AMD silicon. It never proves the
     decision logic ran in the enclave. Pass --expected-measurement to pin which
     image ran. Exit 0 iff ``ok``.
     """
@@ -3396,7 +4633,8 @@ def _cmd_verify_enforcement(args: argparse.Namespace) -> int:
     try:
         report_bytes = report_path.read_bytes()
         vcek_pem = vcek_path.read_bytes()
-    except OSError as exc:
+        amd_chain = _read_amd_chain(args.amd_chain) if args.amd_chain else None
+    except (OSError, ValueError) as exc:
         print(f"vaara verify-enforcement: cannot read input: {exc}",
               file=sys.stderr)
         return 1
@@ -3405,6 +4643,7 @@ def _cmd_verify_enforcement(args: argparse.Namespace) -> int:
         verdict = verify_enforcement(
             record, report_bytes, vcek_pem,
             expected_measurement=expected, strict=args.strict,
+            amd_chain=amd_chain,
         )
     except (TEEAttestationError, ValueError, KeyError, TypeError) as exc:
         print(f"vaara verify-enforcement: {exc}", file=sys.stderr)
@@ -3612,7 +4851,7 @@ def _cmd_export_attestation_result(args: argparse.Namespace) -> int:
     rendered = json.dumps(ear, indent=2)
     if args.out:
         try:
-            Path(args.out).expanduser().write_text(rendered + "\n", encoding="utf-8")
+            Path(args.out).expanduser().write_text(rendered + "\n", encoding="utf-8", newline="\n")
         except OSError as exc:
             print(f"vaara export-attestation-result: cannot write output: {exc}",
                   file=sys.stderr)
@@ -3675,7 +4914,7 @@ def _cmd_build_handoff(args: argparse.Namespace) -> int:
 
     out_path = Path(args.out).expanduser()
     try:
-        out_path.write_text(rendered, encoding="utf-8")
+        out_path.write_text(rendered, encoding="utf-8", newline="\n")
     except OSError as exc:
         print(f"vaara build-handoff: cannot write {out_path}: {exc}", file=sys.stderr)
         return 2
@@ -3796,7 +5035,7 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
     if args.out:
         out_path = Path(args.out).expanduser()
         try:
-            out_path.write_text(text + "\n", encoding="utf-8")
+            out_path.write_text(text + "\n", encoding="utf-8", newline="\n")
         except OSError as exc:
             print(f"vaara ingest: cannot write {out_path}: {exc}", file=sys.stderr)
             return 1
@@ -3908,8 +5147,8 @@ def _cmd_verify_records(args: argparse.Namespace) -> int:
             mark = "FAIL" if finding.severity == "required" else "warn"
             print(f"  [{mark}] {finding.id}: {finding.detail}")
             print(f"         {', '.join(finding.records)}")
-        for name, exc in unreadable:
-            print(f"  [FAIL] {name}: unreadable ({exc})")
+        for name, err in unreadable:
+            print(f"  [FAIL] {name}: unreadable ({err})")
 
     return 0 if ok else 1
 
@@ -3951,7 +5190,7 @@ def _cmd_audit_summary(args: argparse.Namespace) -> int:
         page += f"\n> Note: {len(unreadable)} file(s) could not be read: {names}\n"
 
     if args.out:
-        Path(args.out).expanduser().write_text(page, encoding="utf-8")
+        Path(args.out).expanduser().write_text(page, encoding="utf-8", newline="\n")
         print(f"wrote audit summary to {args.out}", file=sys.stderr)
     else:
         print(page, end="")
@@ -4014,7 +5253,7 @@ def _cmd_conformance_statement(args: argparse.Namespace) -> int:
     else:
         page = render_conformance_statement(statement)
         if args.out:
-            Path(args.out).expanduser().write_text(page, encoding="utf-8")
+            Path(args.out).expanduser().write_text(page, encoding="utf-8", newline="\n")
             print(f"wrote conformance statement to {args.out}", file=sys.stderr)
         else:
             print(page, end="")
@@ -4032,6 +5271,16 @@ def _cmd_conformance_check(args: argparse.Namespace) -> int:
     conformance logic of its own, so the two paths never drift from the
     commands they wrap. Keyless: runs in the base install.
     """
+    if args.all:
+        if args.path is not None:
+            print("vaara conformance check: --all runs every published suite; it "
+                  "takes no path", file=sys.stderr)
+            raise SystemExit(2)
+        return _conformance_check_all(args)
+    if args.path is None:
+        print("vaara conformance check: a path is required (a record file or a "
+              "directory of records), or --all", file=sys.stderr)
+        raise SystemExit(2)
     path = Path(args.path).expanduser()
     if path.is_file():
         args.record = str(path)
@@ -4041,6 +5290,32 @@ def _cmd_conformance_check(args: argparse.Namespace) -> int:
         return _cmd_verify_records(args)
     print(f"vaara conformance check: no such path: {path}", file=sys.stderr)
     return 2
+
+
+def _conformance_check_all(args: argparse.Namespace) -> int:
+    """Every published suite, through the neutral runner, verdict per suite."""
+    from vaara import _conformance_all as suites
+
+    def log(message: str) -> None:
+        print(f"vaara conformance check --all: {message}", file=sys.stderr)
+
+    try:
+        vectors, how = suites.locate_vectors(
+            Path(args.vectors) if args.vectors else None, log=log,
+        )
+        runner = suites.locate_runner(vectors, log=log)
+    except suites.NoSuitesError as exc:
+        print(f"vaara conformance check --all: {exc}", file=sys.stderr)
+        return 2
+    if not args.json:
+        source = {
+            "given": f"suites: {vectors}",
+            "environment": f"suites: {vectors} (from ${suites.TREE_ENV})",
+            "checkout": f"suites: {vectors} (this checkout)",
+            "release": f"suites: {vectors} (release archive v{__version__})",
+        }[how]
+        log(source)
+    return suites.run_all(vectors, runner, as_json=args.json, suites=args.suite)
 
 
 def _cmd_verify_bundles(args: argparse.Namespace) -> int:
@@ -4102,8 +5377,8 @@ def _cmd_verify_bundles(args: argparse.Namespace) -> int:
                 failed = [ln for ln, st in entry.lens_states.items() if st == "fail"]
                 reason = ", ".join(failed) if failed else "authenticity not established"
                 print(f"  [FAIL] {entry.name}: {reason}")
-        for name, exc in unreadable:
-            print(f"  [FAIL] {name}: unreadable ({exc})")
+        for name, err in unreadable:
+            print(f"  [FAIL] {name}: unreadable ({err})")
 
     return 0 if ok else 1
 
@@ -4184,8 +5459,8 @@ def _cmd_verify_handoffs(args: argparse.Namespace) -> int:
                     "verifiable" if entry.verifiable else "not verifiable")
                 print(f"  [FAIL] {entry.name}: {tier}, "
                       f"identity {entry.producer_identity_basis}")
-        for name, exc in unreadable:
-            print(f"  [FAIL] {name}: unreadable ({exc})")
+        for name, err in unreadable:
+            print(f"  [FAIL] {name}: unreadable ({err})")
 
     return 0 if ok else 1
 
@@ -4197,8 +5472,9 @@ def _cmd_verify_enforcements(args: argparse.Namespace) -> int:
     directory of enforced records and gets the roll-up. How many bind to a
     confidential VM, at what tier, and whether any pinned a vetted launch image.
     Triples are discovered by stem: ``NAME.record.json`` pairs with
-    ``NAME.report.bin`` and ``NAME.vcek.pem``. A record missing either companion
-    is a failing entry, never a silent skip. Requires the attestation extra.
+    ``NAME.report.bin``, ``NAME.vcek.pem`` and, optionally,
+    ``NAME.amd-chain.pem``. A record missing a required companion is a failing
+    entry, never a silent skip. Requires the attestation extra.
     """
     try:
         import rfc8785  # noqa: F401
@@ -4357,7 +5633,7 @@ def _cmd_build_bundle(args: argparse.Namespace) -> int:
     if args.out is not None:
         out_path = Path(args.out).expanduser()
         try:
-            out_path.write_text(rendered, encoding="utf-8")
+            out_path.write_text(rendered, encoding="utf-8", newline="\n")
         except OSError as exc:
             print(f"vaara build-bundle: cannot write {out_path}: {exc}", file=sys.stderr)
             return 2
@@ -4519,14 +5795,21 @@ def _cmd_policy_reload(args: argparse.Namespace) -> int:
             payload["format"] = fmt
 
     url = args.server.rstrip("/") + "/v1/policy/reload"
+    headers = {"Content-Type": "application/json"}
+    # The server refuses every endpoint but health without its key; the
+    # reload is the operator's own call and carries the same key.
+    api_key = getattr(args, "api_key", None) or os.environ.get("VAARA_SERVER_API_KEY") or None
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(
         url,
         data=_json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=args.timeout) as resp:
+        # --server is the operator's own Vaara server.
+        with urllib.request.urlopen(req, timeout=args.timeout) as resp:  # nosec B310
             body_bytes = resp.read()
     except urllib.error.HTTPError as exc:
         print(f"vaara policy reload: HTTP {exc.code}", file=sys.stderr)
@@ -4586,7 +5869,7 @@ def _cmd_mode_emit(args: argparse.Namespace) -> int:
         print(f"vaara mode emit: {e}", file=sys.stderr)
         return 1
     if args.output:
-        Path(args.output).write_text(text, encoding="utf-8")
+        Path(args.output).write_text(text, encoding="utf-8", newline="\n")
     else:
         sys.stdout.write(text)
     return 0
@@ -4677,6 +5960,31 @@ def _cmd_init(args: argparse.Namespace) -> int:
         print(f"Claude Code hooks written to {report.hooks_path}")
     else:
         print(f"Claude Code hooks already current at {report.hooks_path}")
+    if report.cursor_hooks is not None:
+        state = "written" if report.cursor_changed else "already current"
+        print(f"Cursor hooks {state} at {report.cursor_hooks}")
+    else:
+        print("Cursor: not found")
+    if report.opencode_plugin is not None:
+        state = "installed" if report.opencode_changed else "already current"
+        print(f"OpenCode plugin {state} at {report.opencode_plugin}")
+    else:
+        print("OpenCode: not found")
+    if report.codex_hooks is not None:
+        state = "written" if report.codex_changed else "already current"
+        print(f"Codex hooks {state} at {report.codex_hooks}")
+    else:
+        print("Codex: not found")
+    if report.gemini_settings is not None:
+        state = "written" if report.gemini_changed else "already current"
+        print(f"Gemini CLI hooks {state} in {report.gemini_settings}")
+    else:
+        print("Gemini CLI: not found")
+    if report.copilot_hooks is not None:
+        state = "written" if report.copilot_changed else "already current"
+        print(f"Copilot CLI hooks {state} at {report.copilot_hooks}")
+    else:
+        print("Copilot CLI: not found")
     print(f"Trail: {report.trail_db}")
 
     for client in report.clients:
@@ -4696,11 +6004,75 @@ def _cmd_init(args: argparse.Namespace) -> int:
     for warning in report.warnings:
         print(f"  warning: {warning}", file=sys.stderr)
 
+    rows = ig.coverage(report)
+    print()
+    print("Agents on this machine:")
+    for row in rows:
+        print(f"  {row.name:<15}{row.state}: {row.detail}")
+    if not rows:
+        print("  none found. Claude Code's hooks are in place for when it is installed.")
+
     print()
     govern_mode = "shadow (observing)" if args.shadow or args.auto else "enforcing"
     mode_label = f" | Mode: {args.mode}" if hasattr(args, 'mode') and args.auto else ""
-    print(f"Vaara is governing. {govern_mode}{mode_label}")
+    short = [row.name for row in rows if row.state != "governed"]
+    if not rows:
+        print(f"Vaara is set up; no agent found yet. {govern_mode}{mode_label}")
+    elif short:
+        print(f"Vaara is governing {len(rows) - len(short)} of {len(rows)} agents found. "
+              f"{govern_mode}{mode_label}")
+        print(f"Not fully governed: {', '.join(short)}")
+    else:
+        print(f"Vaara is governing every agent found. {govern_mode}{mode_label}")
     print("Reverse with: vaara ungovern")
+    return 0
+
+
+def _cmd_scan(args: argparse.Namespace) -> int:
+    from vaara.integrations import scan
+
+    if args.install_watch or args.uninstall_watch or args.watch:
+        from vaara.integrations import scan_watch
+
+        if args.uninstall_watch:
+            removed = scan_watch.uninstall()
+            print("login watch removed" if removed else "no login watch installed")
+            return 0
+        if args.install_watch:
+            from vaara.integrations.init_governance import resolve_vaara_bin
+
+            path, message = scan_watch.install(resolve_vaara_bin(), interval=args.interval)
+            print(message)
+            return 0 if path else 1
+        trail_path = Path(args.trail).expanduser() if args.trail else scan_watch.default_trail()
+        watcher = scan_watch.Watcher(scan_watch.open_trail(trail_path))
+        print(f"vaara scan: watching every {args.interval:g}s, recording to {trail_path}",
+              file=sys.stderr)
+        try:
+            watcher.run(args.interval)
+        except KeyboardInterrupt:
+            pass
+        return 0
+
+    findings = scan.run_scan(processes=not args.no_processes, mcp=not args.no_mcp,
+                             apps=not args.no_apps)
+    if args.json:
+        print(scan.to_json(findings))
+    elif not findings:
+        print("No AI agents found: no process talking to a model, no MCP config, "
+              "no app bundling a model SDK.")
+    else:
+        width = max(len(f.name) for f in findings)
+        for f in findings:
+            print(f"{f.state.upper():<11} {f.kind:<8} {f.name:<{width}}  {f.detail}")
+            if f.where:
+                print(f"{'':<21}{'':<{width}}{f.where}")
+        counts = {s: sum(1 for f in findings if f.state == s)
+                  for s in ("governed", "reachable", "ungoverned")}
+        print(f"\n{counts['governed']} governed, {counts['reachable']} reachable, "
+              f"{counts['ungoverned']} ungoverned")
+    if args.fail_on_ungoverned and any(f.state != "governed" for f in findings):
+        return 1
     return 0
 
 
@@ -4712,6 +6084,16 @@ def _cmd_ungovern(args: argparse.Namespace) -> int:
         print(f"Removed Vaara hooks from {report.hooks_path}")
     else:
         print(f"No Vaara hooks found in {report.hooks_path}")
+    if report.opencode_removed:
+        print("  OpenCode plugin removed")
+    if report.cursor_removed:
+        print("  Cursor hooks removed")
+    if report.codex_removed:
+        print("  Codex hooks removed")
+    if report.gemini_removed:
+        print("  Gemini CLI hooks removed")
+    if report.copilot_removed:
+        print("  Copilot CLI hooks removed")
     for name in report.mcp_restored:
         print(f"  {name}: MCP config restored from backup")
     if not report.mcp_restored:
@@ -4757,7 +6139,7 @@ def _http_fetch(url: str) -> bytes:
 
     if not url.startswith(("https://", "http://")):
         raise ValueError(f"refusing non-http url: {url!r}")
-    with urllib.request.urlopen(url, timeout=30) as resp:  # noqa: S310
+    with urllib.request.urlopen(url, timeout=30) as resp:  # noqa: S310  # nosec B310
         return resp.read()
 
 
@@ -4943,6 +6325,11 @@ def build_parser() -> argparse.ArgumentParser:
                             "(.yaml/.yml/.json). Read-only without it.")
     pdash.add_argument("--host", default="127.0.0.1",
                        help="Bind address. Defaults to loopback only.")
+    pdash.add_argument("--allow-network", action="store_true",
+                       help="Permit a bind off loopback. The page carries the "
+                            "write token, so anyone who can reach the port "
+                            "can change policy thresholds and approve "
+                            "OS-layer requests; refused without this flag.")
     pdash.add_argument("--port", type=int, default=0,
                        help="Port. Defaults to 7517, or a free one if taken.")
     pdash.add_argument("--no-browser", action="store_true",
@@ -4958,6 +6345,8 @@ def build_parser() -> argparse.ArgumentParser:
     pe.add_argument("--out", required=True, help="Path to write the signed zip")
     pe.add_argument("--key", required=True, help="Path to Ed25519 signing private key (PEM)")
     pe.add_argument("--agent-id", default="", help="Optional agent_id tag for the manifest")
+    pe.add_argument("--revocations", default=None,
+                        help="Optional revocation-registry JSON to pin into the signed manifest as revocation.registry_sha256, with the registry written to revocation.json inside the zip. Without it the export pins no revocation state, so a reader cannot recompute a revocation-in-time verdict from the bundle.")
     pe.set_defaults(func=_cmd_trail_export)
 
     pet = tsub.add_parser(
@@ -4980,6 +6369,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Quorum: minimum valid custodian signatures required to verify.",
     )
     pet.add_argument("--agent-id", default="", help="Optional agent_id tag for the manifest")
+    pet.add_argument("--revocations", default=None,
+                        help="Optional revocation-registry JSON to pin into the signed manifest as revocation.registry_sha256, with the registry written to revocation.json inside the zip. Without it the export pins no revocation state, so a reader cannot recompute a revocation-in-time verdict from the bundle.")
     pet.set_defaults(func=_cmd_trail_export_threshold)
 
     pv = tsub.add_parser("verify", help="Verify a signed trail zip")
@@ -4988,6 +6379,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--pubkey",
         default=None,
         help="Path to Ed25519 public key (PEM). If omitted, uses signer_pubkey.pem from inside the zip.",
+    )
+    pv.add_argument(
+        "--erasure-key", default=None,
+        help="Public key (PEM, EC P-256 or RSA) of the person who signs erasures; "
+             "each record_erased record must verify under it",
+    )
+    pv.add_argument(
+        "--rotation-key", default=None,
+        help="Ed25519 public key (PEM) that signed the trail_rotated records, when "
+             "it is not the key that signed this zip. Defaults to the zip's own key.",
+    )
+    pv.add_argument(
+        "--archive", default=None,
+        help="The retention archive this zip begins after (the zip, or the sealed "
+             "file of an encrypted rotation): checked against the digest the "
+             "trail_rotated record states",
     )
     pv.set_defaults(func=_cmd_trail_verify)
 
@@ -5024,6 +6431,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Verify the external time anchor in an Article 12 package",
     )
     pva.add_argument("--zip", required=True, help="Path to the package zip")
+    pva.add_argument(
+        "--tsa-cert",
+        metavar="PEM_OR_DER",
+        help="Pin the TSA signer certificate (PEM or DER) you hold out of band; "
+             "a token signed by any other certificate is refused",
+    )
+    pva.add_argument(
+        "--tsa-issuer",
+        metavar="PEM_OR_DER",
+        help="Pin the CA certificate (PEM or DER) that issued the TSA signer; "
+             "survives the signer certificate rotating",
+    )
     pva.set_defaults(func=_cmd_trail_verify_anchor)
 
     pep = tsub.add_parser(
@@ -5041,6 +6460,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Omit the audit-record chain layer",
     )
     pep.set_defaults(func=_cmd_trail_export_prov)
+
+    peo = tsub.add_parser(
+        "export-ocsf",
+        help="Export the trail's decisions as OCSF API Activity events (JSON Lines)",
+    )
+    peo_src = peo.add_mutually_exclusive_group(required=True)
+    peo_src.add_argument("--trail", help="Path to trail JSONL file")
+    peo_src.add_argument(
+        "--db", help="Path to an audit SQLite DB (e.g. ~/.vaara/claude-code/audit.db)",
+    )
+    peo.add_argument("--out", required=True, help="Path to write the OCSF JSON Lines")
+    peo.add_argument(
+        "--hostname", default=None,
+        help="The deciding host for src_endpoint (default: this host's name)",
+    )
+    peo.set_defaults(func=_cmd_trail_export_ocsf)
 
     pei = tsub.add_parser(
         "export-incident",
@@ -5133,6 +6568,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Vetted SHA-384 launch measurement (96 hex chars) to pin folded "
              "enforcement bindings against.",
     )
+    pa12.add_argument("--revocations", default=None,
+                        help="Optional revocation-registry JSON to pin into the signed manifest as revocation.registry_sha256, with the registry written to revocation.json inside the zip. Without it the export pins no revocation state, so a reader cannot recompute a revocation-in-time verdict from the bundle.")
     pa12.set_defaults(func=_cmd_trail_export_article12)
 
     pa50 = tsub.add_parser(
@@ -5156,6 +6593,8 @@ def build_parser() -> argparse.ArgumentParser:
              "side may be empty. Narrows the summary counts only; the signed "
              "trail stays whole.",
     )
+    pa50.add_argument("--revocations", default=None,
+                        help="Optional revocation-registry JSON to pin into the signed manifest as revocation.registry_sha256, with the registry written to revocation.json inside the zip. Without it the export pins no revocation state, so a reader cannot recompute a revocation-in-time verdict from the bundle.")
     pa50.set_defaults(func=_cmd_trail_export_article50)
 
     prd = tsub.add_parser(
@@ -5223,7 +6662,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     pp = tsub.add_parser(
         "purge",
-        help="Delete audit records older than the retention period (Article 12(2))",
+        help="Delete audit records older than the retention period (Articles 19(1), 26(6))",
     )
     pp.add_argument("--db", required=True, help="Path to the audit SQLite DB")
     pp.add_argument(
@@ -5267,6 +6706,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true",
         help="Export and verify the archive, report the purge count, delete nothing",
     )
+    prot.add_argument(
+        "--encrypt-to", default=None, metavar="RECIPIENT_PUB_PEM",
+        help="Encrypt the verified archive to this X25519 public key (vaara trail "
+             "seal-keygen) and write a public seal signed with --key; the plaintext "
+             "zip is removed before the purge",
+    )
     rot_scope = prot.add_mutually_exclusive_group(required=True)
     rot_scope.add_argument("--tenant", help="Restrict rotation to records with this tenant_id")
     rot_scope.add_argument(
@@ -5274,6 +6719,125 @@ def build_parser() -> argparse.ArgumentParser:
         help="Rotate across all tenants in this DB",
     )
     prot.set_defaults(func=_cmd_trail_rotate)
+
+    pskg = tsub.add_parser(
+        "seal-keygen",
+        help="Create an X25519 recipient key pair for encrypted retention archives",
+    )
+    pskg.add_argument("--private", required=True, help="Where to write the private key (PEM, 0600)")
+    pskg.add_argument("--public", required=True, help="Where to write the public key (PEM)")
+    pskg.set_defaults(func=_cmd_trail_seal_keygen)
+
+    pvs = tsub.add_parser(
+        "verify-seal",
+        help="Check an encrypted archive's public seal without the decryption key",
+    )
+    pvs.add_argument("seal", help="The .seal.json file")
+    pvs.add_argument("--ciphertext", default=None, help="The .sealed file the seal names")
+    pvs.add_argument("--signer-pub", default=None,
+                     help="Require this Ed25519 public key (PEM) as the seal's signer")
+    pvs.add_argument("--format", choices=["text", "json"], default="text")
+    pvs.set_defaults(func=_cmd_trail_verify_seal)
+
+    pus = tsub.add_parser(
+        "unseal",
+        help="Decrypt an encrypted archive, recording the opening in a trail first",
+    )
+    pus.add_argument("sealed", help="The .sealed file")
+    pus.add_argument("--seal", required=True, help="Its .seal.json file")
+    pus.add_argument("--key", required=True, help="The recipient's X25519 private key (PEM)")
+    pus.add_argument("--signer-pub", required=True,
+                     help="The trail signer's Ed25519 public key (PEM) the seal must be signed by")
+    pus.add_argument("--out", required=True, help="Where to write the decrypted zip")
+    pus.add_argument("--db", default=None, help="Trail to record the opening in, before decrypting")
+    pus.add_argument("--on-behalf-of", default=None, help="Who the archive is opened for")
+    pus.add_argument("--basis", default=None, help="Why it may be opened (legal hold, DPO request)")
+    pus.add_argument("--no-access-record", action="store_true",
+                     help="Open without recording it in a trail")
+    pus.set_defaults(func=_cmd_trail_unseal)
+
+    prep = tsub.add_parser(
+        "repair",
+        help="Repair a damaged trail: rebuild indexes, else salvage every "
+             "readable record and declare the rest in the chain",
+    )
+    prep.add_argument("--db", required=True, help="Path to the audit SQLite DB")
+    prep.add_argument(
+        "--format", choices=["text", "json"], default="text",
+        help="Output format (default text)",
+    )
+    prep.set_defaults(func=_cmd_trail_repair)
+
+    pcarve = tsub.add_parser(
+        "carve",
+        help="Read a damaged trail page by page and write out every record "
+             "whose hash still verifies, including ones repair could not reach",
+    )
+    pcarve.add_argument("--db", required=True, help="Path to the damaged SQLite file (read only)")
+    pcarve.add_argument("--out", required=True, help="JSONL file to write the recovered records to")
+    pcarve.add_argument("--seq-from", type=int, default=None, help="First seq to write (default: all)")
+    pcarve.add_argument("--seq-to", type=int, default=None, help="Last seq to write, inclusive")
+    pcarve.add_argument(
+        "--format", choices=["text", "json"], default="text",
+        help="Output format (default text)",
+    )
+    pcarve.set_defaults(func=_cmd_trail_carve)
+
+    precover = tsub.add_parser(
+        "recover",
+        help="Declare records a repair lost as recovered: check a carved bundle "
+             "against the trail and append a repair_recovered record naming it",
+    )
+    precover.add_argument("--db", required=True, help="Path to the live audit SQLite DB")
+    precover.add_argument("--bundle", required=True,
+                          help="JSONL written by `vaara trail carve`")
+    precover.add_argument("--source", default="",
+                          help="Where the bundle was carved from (recorded as given)")
+    precover.add_argument("--dry-run", action="store_true",
+                          help="Run every check, append nothing, copy nothing")
+    precover.add_argument(
+        "--format", choices=["text", "json"], default="text",
+        help="Output format (default text)",
+    )
+    precover.set_defaults(func=_cmd_trail_recover)
+    pfork = tsub.add_parser(
+        "declare-fork",
+        help="Declare another store a branch of this trail: check it shares a prefix "
+             "and chains on from it, then append a trail_forked record naming its head",
+    )
+    pfork.add_argument("--db", required=True, help="Path to the live audit SQLite DB")
+    pfork.add_argument("--branch", required=True,
+                       help="Path to the other store (opened read-only)")
+    pfork.add_argument("--source", default="",
+                       help="How the branch came about (recorded as given)")
+    pfork.add_argument("--dry-run", action="store_true",
+                       help="Run every check, append nothing")
+    pfork.add_argument(
+        "--format", choices=["text", "json"], default="text",
+        help="Output format (default text)",
+    )
+    pfork.set_defaults(func=_cmd_trail_declare_fork)
+    perase = tsub.add_parser(
+        "erase",
+        help="Erase one record's data (GDPR Art. 17): keep its hash, append a "
+             "record_erased record, and verify the slot as erased",
+    )
+    perase.add_argument("--db", required=True, help="Path to the live audit SQLite DB")
+    perase.add_argument("--record-id", required=True, help="record_id of the record to erase")
+    perase.add_argument("--reason", required=True,
+                        help="Why, recorded on the chain (keep personal data out of it)")
+    perase.add_argument("--legal-ground", default=None,
+                        help="Legal ground, recorded on the chain (e.g. 'GDPR Art. 17(1)(a)')")
+    perase.add_argument("--erased-by", default=None,
+                        help="Who erases (a name or DID), recorded on the chain")
+    perase.add_argument("--sign-key", default=None,
+                        help="The eraser's private key (PEM, EC P-256 or RSA); signs the "
+                             "erasure record. Needs --erased-by")
+    perase.add_argument(
+        "--format", choices=["text", "json"], default="text",
+        help="Output format (default text)",
+    )
+    perase.set_defaults(func=_cmd_trail_erase)
 
     psr = tsub.add_parser(
         "shadow-report",
@@ -5289,6 +6853,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format (default text)",
     )
     psr.set_defaults(func=_cmd_trail_shadow_report)
+
+    pcp = tsub.add_parser(
+        "check-permission",
+        help="Replay every recorded call under a principal's signed permission",
+    )
+    _add_trail_source_args(pcp)
+    pcp.add_argument("--permission", required=True, help="Path to the permission JSON")
+    pcp_key = pcp.add_mutually_exclusive_group(required=True)
+    pcp_key.add_argument(
+        "--pubkey-file", dest="pubkey_file", default=None,
+        help="The principal's PEM public key (ES256 / RS256)",
+    )
+    pcp_key.add_argument(
+        "--hs256-secret-file", dest="hs256_secret_file", default=None,
+        help="Raw shared-secret file for an HS256 permission",
+    )
+    pcp.add_argument(
+        "--format", choices=["text", "json"], default="text",
+        help="Output format (default text)",
+    )
+    pcp.set_defaults(func=_cmd_trail_check_permission)
+
+    pcg = tsub.add_parser(
+        "check-grant",
+        help="Check every recorded call to a granted tool against the signed grant",
+    )
+    _add_trail_source_args(pcg)
+    pcg.add_argument("--grant", required=True, help="Path to the grant JSON")
+    pcg_key = pcg.add_mutually_exclusive_group(required=True)
+    pcg_key.add_argument(
+        "--pubkey-file", dest="pubkey_file", default=None,
+        help="PEM public key for an ES256 / RS256 grant",
+    )
+    pcg_key.add_argument(
+        "--hs256-secret-file", dest="hs256_secret_file", default=None,
+        help="Raw shared-secret file for an HS256 grant",
+    )
+    pcg.add_argument(
+        "--format", choices=["text", "json"], default="text",
+        help="Output format (default text)",
+    )
+    pcg.set_defaults(func=_cmd_trail_check_grant)
 
     pr = sub.add_parser(
         "review",
@@ -5340,6 +6946,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="If supplied, also write an ESCALATION_RESOLVED record to "
              "the audit DB at this path (Article 14(4)(d) evidence).",
     )
+    rr.add_argument(
+        "--sign-key", default=None,
+        help="The reviewer's own PEM private key (EC P-256 or RSA). The "
+             "resolution row then carries the reviewer's signature over the "
+             "decision record hash; needs --audit-db.",
+    )
     rr.set_defaults(func=_cmd_review_resolve)
 
     re_ = rsub.add_parser(
@@ -5355,6 +6967,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Report the count without modifying the DB",
     )
     re_.set_defaults(func=_cmd_review_expire)
+
+    rp_ = rsub.add_parser(
+        "purge",
+        help="Delete resolved and expired items past a retention age",
+    )
+    rp_.add_argument("--db", required=True, help="Path to the review queue DB")
+    rp_.add_argument(
+        "--older-than-days", required=True, type=int,
+        help="Closed items whose case closed more than this many days ago "
+             "are deleted, with secure_delete and a WAL truncate. Pending "
+             "and claimed items are kept.",
+    )
+    rp_.add_argument(
+        "--dry-run", action="store_true",
+        help="Report the count without modifying the DB",
+    )
+    rp_.set_defaults(func=_cmd_review_purge)
 
     pp_policy = sub.add_parser(
         "policy",
@@ -5641,12 +7270,102 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prc_verify.set_defaults(func=_cmd_receipt_verify)
 
+    prc_dec = rcsub.add_parser(
+        "verify-decision",
+        help="Verify the decision receipts the engine writes beside a trail: "
+             "ES256 signature, evidence digest, and the record in the trail. "
+             "Requires the attestation extra.",
+    )
+    prc_dec.add_argument(
+        "paths", nargs="*",
+        help="Receipt files or directories (default: the receipts beside --db)",
+    )
+    prc_dec.add_argument(
+        "--db", default=None,
+        help="Trail database the receipts belong to (default ~/.vaara/trail/audit.db)",
+    )
+    prc_dec.add_argument(
+        "--key", default=None,
+        help="Issuer public key PEM (default: issuer-es256.pub.pem in the receipts directory)",
+    )
+    prc_dec.add_argument("--json", action="store_true", help="One JSON object per receipt")
+    prc_dec.set_defaults(func=_cmd_receipt_verify_decision)
+
+    prc_disc = rcsub.add_parser(
+        "disclose-arguments",
+        help="Write the arguments and salt that open one decision receipt's "
+             "argumentsCommitment, read from its trail, for an auditor",
+    )
+    prc_disc.add_argument("receipt", help="The decision receipt file")
+    prc_disc.add_argument(
+        "--db", default=None,
+        help="Trail database the receipt belongs to (default ~/.vaara/trail/audit.db)",
+    )
+    prc_disc.add_argument("--out", default=None, help="Write here (default: stdout)")
+    prc_disc.set_defaults(func=_cmd_receipt_disclose_arguments)
+
+    prc_varg = rcsub.add_parser(
+        "verify-arguments",
+        help="Check a disclosure against a decision receipt: the receipt's signature, "
+             "then that the disclosed arguments and salt open its argumentsCommitment",
+    )
+    prc_varg.add_argument("receipt", help="The decision receipt file")
+    prc_varg.add_argument("--disclosure", required=True, help="The disclosure JSON")
+    prc_varg.add_argument(
+        "--key", default=None,
+        help="Issuer public key PEM (default: issuer-es256.pub.pem in the receipts directory)",
+    )
+    prc_varg.set_defaults(func=_cmd_receipt_verify_arguments)
+
+    prc_inf = rcsub.add_parser(
+        "verify-inference",
+        help="Verify the attestation and receipt pairs the inference proxy "
+             "writes per chat call: signatures and the back-link. Requires the "
+             "attestation extra.",
+    )
+    prc_inf.add_argument("receipt", nargs="?", help="One *-infer-receipt.json file")
+    prc_inf.add_argument("--attestation", default=None,
+                         help="The paired *-infer-attest.json; enables the back-link check")
+    prc_inf.add_argument("--dir", default=None,
+                         help="A receipts directory; pairs are matched by filename")
+    prc_inf.add_argument("--pubkey", default=None,
+                         help="PEM public key of the proxy's signing key (ES256 / RS256)")
+    prc_inf.add_argument("--secret", default=None, help="Raw shared-secret file (HS256)")
+    prc_inf.add_argument("--json", action="store_true", help="Emit JSON")
+    prc_inf.set_defaults(func=_cmd_receipt_verify_inference)
+
+    prc_ts = rcsub.add_parser(
+        "verify-transparency",
+        help="Check a receipt from an IETF SCITT Transparency Service offline: "
+             "the inclusion proof commits to the statement bytes and the "
+             "service signature holds over the ledger root (CCF profile).",
+    )
+    prc_ts.add_argument("receipt", help="COSE receipt the service returned")
+    prc_ts.add_argument("--statement", required=True,
+                           help="The signed statement exactly as registered")
+    prc_ts.add_argument("--keys", required=True,
+                           help="The service's /.well-known/scitt-keys COSE_Key_Set, saved earlier")
+    prc_ts.add_argument("--json", action="store_true", help="Print the result as JSON")
+    prc_ts.set_defaults(func=_cmd_receipt_verify_transparency)
+
+    def _scitt_log_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--log-dir", default=None,
+            help="Directory of the append-only log (default ~/.vaara/anchor-log)",
+        )
+        p.add_argument(
+            "--log-id", default="vaara-scitt-log",
+            help="Log name; the leaves live in <log-dir>/<log-id>.leaves",
+        )
+
     prc_scitt = rcsub.add_parser(
         "anchor-scitt",
-        help="Add a SCITT transparency-log witness anchor: append the "
-             "receipt's signed-payload digest to the in-process Merkle log "
-             "and record the inclusion proof. Instant, no third party, "
-             "verifiable by recomputation. Stacks with rfc3161 anchors.",
+        help="Add a scitt anchor: append the receipt's signed-payload digest "
+             "to a local append-only Merkle log (RFC 6962 hashing) and record "
+             "the inclusion proof and root. Not a submission to an IETF SCITT "
+             "service. The root is the operator's own claim until a tree head "
+             "is held by someone else (anchor-scitt-head). Stacks with "
+             "rfc3161 anchors.",
     )
     prc_scitt.add_argument(
         "receipt", help="Path to a receipt JSON file (SPEC.md envelope)",
@@ -5655,7 +7374,37 @@ def build_parser() -> argparse.ArgumentParser:
         "--out", default=None,
         help="Write the anchored receipt here instead of updating in place",
     )
+    _scitt_log_args(prc_scitt)
     prc_scitt.set_defaults(func=_cmd_receipt_anchor_scitt)
+
+    prc_scitt_head = rcsub.add_parser(
+        "anchor-scitt-head",
+        help="Print the scitt log's current tree head (logId, treeSize, "
+             "rootHash) as JSON, for publishing or handing to a third party.",
+    )
+    prc_scitt_head.add_argument(
+        "--consistency-from", type=int, default=None, metavar="N",
+        help="Also include the consistency proof from tree size N, so an "
+             "anchor made at size N can be checked against this head",
+    )
+    _scitt_log_args(prc_scitt_head)
+    prc_scitt_head.set_defaults(func=_cmd_receipt_anchor_scitt_head)
+
+    prc_verify_scitt = rcsub.add_parser(
+        "verify-scitt",
+        help="Recompute every scitt anchor on a receipt. With --head, also "
+             "check the anchor's root against a tree head held independently; "
+             "without it the root is reported as the producer's own claim.",
+    )
+    prc_verify_scitt.add_argument(
+        "receipt", help="Path to a receipt JSON file (SPEC.md envelope)",
+    )
+    prc_verify_scitt.add_argument(
+        "--head", default=None,
+        help="Tree head JSON from anchor-scitt-head, obtained independently "
+             "of the receipt",
+    )
+    prc_verify_scitt.set_defaults(func=_cmd_receipt_verify_scitt)
 
     prc_render = rcsub.add_parser(
         "render",
@@ -5714,6 +7463,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds to wait for a human decision (default 60)",
     )
     pproxy.add_argument(
+        "--policy", default=None,
+        help="YAML or JSON policy file (thresholds, per-tool overrides, "
+             "sequences) applied to the pipeline. Same format as `vaara "
+             "serve --policy`; check it first with `vaara policy validate`. "
+             "In observe mode the policy decides what the trail records as "
+             "would-have-been blocked. YAML needs the [yaml] extra.",
+    )
+    pproxy.add_argument(
         "--signing-key", default=None,
         help="Optional signing key to also emit attestation/receipt pairs",
     )
@@ -5742,50 +7499,56 @@ def build_parser() -> argparse.ArgumentParser:
     )
     psh.set_defaults(func=_cmd_proxy_shell)
 
+    # Every option is forwarded verbatim to vaara.integrations.llm_proxy,
+    # which owns the only parser for this command.
+    #
+    # 2026-09-13: this subcommand used to restate all fourteen options here and
+    # then re-serialise them back into a string list for the real parser. A
+    # flag added to llm_proxy.py and not mirrored here was simply unreachable
+    # through `vaara llm-proxy`, with no error anywhere to say so. Three had
+    # drifted out of reach that way: --seal-file and --seal-listen-unix from
+    # v1.85.0, and --allow-origin, which is the browser origin guard that stops
+    # a page the operator visits from spending the upstream key. A security
+    # control cannot sit behind a copy that someone has to remember to update.
+    #
+    # add_help=False so `--help` also forwards and the user reads the real
+    # parser's help instead of a second copy that can say something else.
     pllp = sub.add_parser(
         "llm-proxy",
-        help="Govern LLM API calls from coding agents: intercept prompts, "
-             "strip secrets, enforce model/rate policies, "
-             "record everything in the Vaara audit trail.",
+        add_help=False,
+        help="Govern LLM API calls from coding agents: record every call "
+             "(chat, messages and responses with their prompt, others by hash), enforce "
+             "model and rate policy, hold back the secrets named in "
+             "--seal-file.",
     )
-    pllp.add_argument("--upstream", required=True,
-                       help="Provider base URL, e.g. https://api.melious.ai/v1")
-    key_group = pllp.add_mutually_exclusive_group(required=True)
-    key_group.add_argument("--api-key", default=None,
-                           help="Upstream API key")
-    key_group.add_argument("--api-key-file", default=None,
-                           help="Path to file containing the upstream API key")
-    pllp.add_argument("--api-key-header", default="x-api-key",
-                       help="Header name for the API key (default: x-api-key)")
-    pllp.add_argument("--mode", default="relay",
-                       choices=["relay", "govern"],
-                       help="relay: blind route without inspecting prompts. "
-                            "govern: inspect, scan, redact (default: relay)")
-    pllp.add_argument("--audit", default="meta",
-                       choices=["meta", "hash", "full"],
-                       help="Audit level: meta (model/tokens/timestamp), "
-                            "hash (meta + sha256 of prompt), "
-                            "full (meta + redacted prompt). (default: meta)")
-    pllp.add_argument("--listen", default="127.0.0.1:8790",
-                       help="Bind address (default: 127.0.0.1:8790)")
-    pllp.add_argument("--trail", default=None,
-                       help="Trail database path")
-    pllp.add_argument("--enforce", action="store_true",
-                       help="Gate instead of observe-only (govern mode only)")
-    pllp.add_argument("--model-allow", action="append", default=None,
-                       metavar="GLOB",
-                       help="Allowed model name glob (repeatable)")
-    pllp.add_argument("--model-deny", action="append", default=None,
-                       metavar="GLOB",
-                       help="Denied model name glob (repeatable)")
-    pllp.add_argument("--rate-limit", type=int, default=0,
-                       help="Max requests per minute per agent (0 = unlimited)")
-    pllp.add_argument("--redact", action="append", default=None,
-                       metavar="REGEX",
-                       help="Additional regex pattern for redaction (repeatable)")
-    pllp.add_argument("--agent-id-header", default="x-agent-id",
-                       help="Header carrying agent identity (default: x-agent-id)")
     pllp.set_defaults(func=_cmd_llm_proxy)
+
+    # Listed here so it shows in `vaara --help`; main() forwards its argv to
+    # vaara.netgate.cli before this parser runs, as for llm-proxy.
+    sub.add_parser(
+        "net-gate",
+        add_help=False,
+        help="Govern agents' network access where it leaves: each connection "
+             "attributed to one agent, checked against its mandate and the "
+             "policy, recorded, and ended the moment the agent is revoked.",
+    )
+
+    # The Linux OS layer. Each command owns its parser in vaara.oslayer and
+    # main() forwards argv to it untouched, as it does for llm-proxy; these
+    # entries put the three in `vaara --help`.
+    for name, summary in (
+        ("run", "Start an agent under the Linux OS layer: confined by the vaara-agent "
+                "AppArmor profile, in a cgroup the guard can end. Needs the guard."),
+        ("os-guard", "The OS layer's root half (sudo): loads the floor, decides agents' "
+                     "opens and execs in your folders, keeps its own trail."),
+        ("os-layer", "Pick OS-layer folders and apps, see the guard, answer its questions."),
+        ("cage", "Start, stop and read an agent's cage through one of twelve drivers "
+                 "(Vaara's own, OpenShell, gVisor, Firecracker, apple/container...); "
+                 "`drivers` shows which are ready here, `observe` the block a decision "
+                 "here would carry."),
+    ):
+        sub.add_parser(name, add_help=False, help=summary).set_defaults(
+            func=lambda args, _n=name: _oslayer_main(_n)(getattr(args, "oslayer_args", [])))
 
     pchk = sub.add_parser(
         "check",
@@ -6008,9 +7771,9 @@ def build_parser() -> argparse.ArgumentParser:
              "record to a confidential VM whose VCEK you supply: the report's "
              "REPORT_DATA must carry sha512(jcs(record)) and its signature must "
              "verify against the VCEK, with an optional pinned launch "
-             "measurement. It does not validate the VCEK chain to AMD's ARK (KDS "
-             "deferred) or prove the decision logic ran in the enclave, so it "
-             "does not by itself establish genuine AMD hardware. Requires the "
+             "measurement. With --amd-chain it also checks the VCEK chains to "
+             "AMD's root, which establishes genuine AMD hardware. It does not "
+             "prove the decision logic ran in the enclave. Requires the "
              "attestation extra.",
     )
     pve.add_argument(
@@ -6023,9 +7786,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pve.add_argument(
         "--vcek", required=True,
-        help="Path to the PEM-encoded VCEK to check the report signature "
-             "against. Trusted as supplied; its AMD KDS chain is not validated "
-             "in v0.",
+        help="Path to the PEM-encoded VCEK public key to check the report "
+             "signature against. Trusted as supplied unless --amd-chain is given.",
+    )
+    pve.add_argument(
+        "--amd-chain", nargs="+", default=None, dest="amd_chain",
+        metavar="CERT",
+        help="Certificates that chain the VCEK to AMD's root: one PEM file "
+             "holding the VCEK certificate, the ASK and the ARK (as `vaara tee "
+             "emit` and `vaara tee fetch-chain` write it), or the three as "
+             "separate PEM or DER files. The ARK must be AMD's pinned root for the "
+             "product and the VCEK certificate must match the report's chip and "
+             "TCB.",
     )
     pve.add_argument(
         "--expected-measurement", default=None, dest="expected_measurement",
@@ -6035,8 +7807,8 @@ def build_parser() -> argparse.ArgumentParser:
     pve.add_argument(
         "--strict", action="store_true",
         help="Regulator-grade: pass only at the chain-rooted attested tier "
-             "(validated VCEK chain plus a pinned measurement), which v0 cannot "
-             "yet reach, so a strict pass is honestly unavailable",
+             "(VCEK chained to AMD's root with --amd-chain, plus a pinned "
+             "measurement)",
     )
     pve.add_argument(
         "--json", action="store_true",
@@ -6139,6 +7911,91 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit the release decision as JSON",
     )
     prc.set_defaults(func=_cmd_release_check)
+
+    pac = sub.add_parser(
+        "attribute-check",
+        help=(
+            "Decide a predicate over an attribute whose value the issuer no "
+            "longer holds: the document carries a commitment, not the value, "
+            "and a proof shows the predicate holds without opening it. Answers "
+            "accepted / withheld / expired / refused with a reason from a closed "
+            "set, so a proof that was never presented never reads as a forged "
+            "one. Exit 0 accepted, 1 not."
+        ),
+    )
+    pac.add_argument(
+        "bundle",
+        nargs="?",
+        default=None,
+        help=(
+            "JSON file holding what was presented: an 'attestation' object plus "
+            "an optional 'proof' and 'now'. Individual documents can be passed "
+            "with the flags below instead, or on top of it."
+        ),
+    )
+    pac.add_argument(
+        "--attestation", default=None,
+        help="Signed vaara.attribute-attestation-zk/v0 document (JSON file)",
+    )
+    pac.add_argument(
+        "--proof", default=None,
+        help="The vaara.attribute-predicate/v0 envelope the holder presented "
+             "(JSON file). Without it the predicate is unanswered, which is "
+             "withheld and is not the same answer as a proof that failed.",
+    )
+    pac.add_argument(
+        "--key", default=None, metavar="PEM",
+        help="Issuer's Ed25519 public key (PEM), held OUT OF BAND. Without it "
+             "nothing is accepted: a document cannot vouch for the key that "
+             "signed it.",
+    )
+    pac.add_argument(
+        "--name", required=True, metavar="ATTRIBUTE",
+        help="The attribute to ask about, by name",
+    )
+    pac.add_argument(
+        "--at-least", type=int, default=None, metavar="N",
+        help="Require the hidden value to be at least N",
+    )
+    pac.add_argument(
+        "--at-most", type=int, default=None, metavar="N",
+        help="Require the hidden value to be at most N. Give both bounds for a "
+             "range.",
+    )
+    pac.add_argument(
+        "--min-source",
+        dest="min_source",
+        required=True,
+        choices=["undeclared", "operator_declared", "measured", "protocol_defined"],
+        help=(
+            "The floor the caller will accept for where the value came from. "
+            "Required on purpose: a caller that genuinely accepts anything says "
+            "so by naming undeclared, which is a decision on the record rather "
+            "than an omission."
+        ),
+    )
+    pac.add_argument(
+        "--subject", default=None, dest="subject_id", metavar="ID",
+        help="Require the attestation to be about this subject id",
+    )
+    pac.add_argument(
+        "--issuer",
+        action="append",
+        default=None,
+        dest="accepted_issuers",
+        metavar="NAME",
+        help="An issuer the caller accepts; repeat to accept several",
+    )
+    pac.add_argument(
+        "--now", default=None,
+        help="Evaluation instant, ISO 8601 UTC (default: the current time). "
+             "Both ends of the validity window are inclusive.",
+    )
+    pac.add_argument(
+        "--json", action="store_true",
+        help="Emit the decision as JSON",
+    )
+    pac.set_defaults(func=_cmd_attribute_check)
 
     pec = sub.add_parser(
         "enforce-by-class",
@@ -6322,8 +8179,8 @@ def build_parser() -> argparse.ArgumentParser:
     pves.add_argument(
         "--strict", action="store_true",
         help="Regulator-grade: every record must reach the chain-rooted attested "
-             "tier, which v0 cannot yet reach, so a strict pass is honestly "
-             "unavailable",
+             "tier, which needs NAME.amd-chain.pem beside each record and a "
+             "pinned measurement",
     )
     pves.add_argument(
         "--json", action="store_true",
@@ -6402,6 +8259,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit the normalized evidence mapping as JSON",
     )
     pnz.set_defaults(func=_cmd_normalize)
+
+    pperm = sub.add_parser(
+        "permission",
+        help="Standing permissions a principal signs for an agent",
+    )
+    permsub = pperm.add_subparsers(dest="permission_cmd", metavar="COMMAND")
+    pperm.set_defaults(func=_help_dispatch(pperm))
+    pps = permsub.add_parser(
+        "sign",
+        help="Sign a vaara.permission/v1 from a JSON spec with the principal's key",
+    )
+    pps.add_argument("--spec", required=True,
+                     help="JSON: principal, keyId, agent, toolName, tenantId, "
+                          "notBefore, notAfter, capabilities, limits")
+    pps.add_argument("--key", help="The principal's PEM private key (EC P-256 -> ES256, RSA -> RS256)")
+    pps.add_argument("--hs256-secret-file", dest="hs256_secret_file", default=None,
+                     help="Raw shared-secret file to sign with HS256 (alternative to --key)")
+    pps.add_argument("--out", help="Write the signed permission here (default stdout)")
+    pps.set_defaults(func=_cmd_permission_sign)
 
     ping = sub.add_parser(
         "ingest",
@@ -6532,11 +8408,32 @@ def build_parser() -> argparse.ArgumentParser:
         "check",
         help="Conformance-check a SEP-2828 record (a JSON file) or a record set "
              "(a directory of them). File or directory is auto-detected; the "
-             "verdict matches verify-record / verify-records. Keyless.",
+             "verdict matches verify-record / verify-records. With --all, run "
+             "every published conformance suite instead and print a verdict "
+             "per suite. Keyless.",
     )
     pcc.add_argument(
-        "path",
-        help="A record JSON file, or a directory of record JSON files",
+        "path", nargs="?", default=None,
+        help="A record JSON file, or a directory of record JSON files "
+             "(required unless --all)",
+    )
+    pcc.add_argument(
+        "--all", action="store_true",
+        help="Run every published conformance suite (tests/vectors/*/"
+             "_check_independent.py) through scripts/conformance_runner.py and "
+             "print PASS, FAIL or SKIP per suite. The suites come from "
+             "--vectors, from $VAARA_CONFORMANCE_TREE, from the checkout this "
+             "install runs from, or from the release archive of this version, "
+             "fetched once from GitHub and kept in the cache directory.",
+    )
+    pcc.add_argument(
+        "--vectors", default=None, metavar="DIR",
+        help="With --all: the directory of suites to run, or a tree holding "
+             "tests/vectors (default: find them as described under --all)",
+    )
+    pcc.add_argument(
+        "--suite", action="append", default=None, metavar="NAME",
+        help="With --all: run only this suite (repeatable)",
     )
     pcc.add_argument(
         "--attestation", default=None,
@@ -6711,9 +8608,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--vcek",
         required=True,
         help=(
-            "Path to a PEM-encoded VCEK (Versioned Chip Endorsement Key). "
-            "Must be supplied out of band. AMD KDS chain validation is "
-            "tracked for v0.19+."
+            "Path to a PEM-encoded VCEK (Versioned Chip Endorsement Key) "
+            "public key. Trusted as supplied unless --amd-chain is given."
+        ),
+    )
+    ptee_verify.add_argument(
+        "--amd-chain", nargs="+", default=None, dest="amd_chain",
+        metavar="CERT",
+        help=(
+            "Certificates that chain the signing key to AMD's root: one PEM "
+            "file holding the VCEK or VLEK certificate, the ASK or ASVK and "
+            "the ARK, or the three as separate PEM or DER files. "
+            "The ARK must be AMD's pinned root for the product and the "
+            "certificate must match the report's chip and TCB."
         ),
     )
     ptee_verify.add_argument(
@@ -6726,6 +8633,54 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     ptee_verify.set_defaults(func=_cmd_tee_verify)
+
+    ptee_emit = tsub.add_parser(
+        "emit",
+        help=(
+            "Inside an AMD SEV-SNP guest, request an attestation report "
+            "carrying 64 bytes of REPORT_DATA, through configfs-tsm or "
+            "/dev/sev-guest. Needs root. Requires the attestation extra."
+        ),
+    )
+    ptee_emit.add_argument(
+        "--report-data", required=True, dest="report_data",
+        help="REPORT_DATA as 128 hex characters (64 bytes)",
+    )
+    ptee_emit.add_argument(
+        "--out", required=True, help="Where to write the 1184-byte report",
+    )
+    ptee_emit.add_argument(
+        "--certs-out", default=None, dest="certs_out",
+        help=(
+            "Write the certificates the host published with the report "
+            "(VCEK or VLEK, ASK, ARK) as one PEM file, usable as --amd-chain"
+        ),
+    )
+    ptee_emit.add_argument(
+        "--privlevel", type=int, default=None,
+        help="VMPL to request the report for (default: the lowest allowed)",
+    )
+    ptee_emit.set_defaults(func=_cmd_tee_emit)
+
+    ptee_fetch = tsub.add_parser(
+        "fetch-chain",
+        help=(
+            "Fetch a report's VCEK and AMD's ASK and ARK from AMD's Key "
+            "Distribution Service into one PEM file, usable as --amd-chain. "
+            "Requires the attestation extra and network access."
+        ),
+    )
+    ptee_fetch.add_argument(
+        "report", help="Path to a binary SEV-SNP attestation report",
+    )
+    ptee_fetch.add_argument(
+        "--product", required=True, choices=("Milan", "Genoa", "Turin"),
+        help="The EPYC product line the report came from",
+    )
+    ptee_fetch.add_argument(
+        "--out", required=True, help="Where to write the PEM chain",
+    )
+    ptee_fetch.set_defaults(func=_cmd_tee_fetch_chain)
 
     preload = psub.add_parser(
         "reload",
@@ -6758,13 +8713,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout", type=float, default=10.0,
         help="HTTP request timeout in seconds (default 10)",
     )
+    preload.add_argument(
+        "--api-key", default=None,
+        help=(
+            "The server's API key, sent as a bearer token. Defaults to "
+            "VAARA_SERVER_API_KEY, the variable vaara serve reads."
+        ),
+    )
     preload.set_defaults(func=_cmd_policy_reload)
 
     phook = sub.add_parser(
         "hook",
         help=(
-            "Claude Code hook runner (called by the vaara-governance "
-            "plugin; reads the hook event JSON on stdin)"
+            "Hook runner for Claude Code, OpenCode, Cursor, Codex, Gemini "
+            "CLI and Copilot CLI (called by their Vaara hooks and plugins; "
+            "reads the event JSON on stdin)"
         ),
     )
     hooksub = phook.add_subparsers(dest="hook_cmd", metavar="COMMAND")
@@ -6781,17 +8744,58 @@ def build_parser() -> argparse.ArgumentParser:
              "then $CLAUDE_PLUGIN_ROOT/policies/default_deny.json, then the "
              "copy bundled with the package)",
     )
+    phpre.add_argument(
+        "--client", choices=["claude-code", "opencode", "cursor", "codex", "gemini",
+                               "copilot"],
+        default="claude-code",
+        help="Which agent sent the event: its tool call in that agent's own "
+             "shape. cursor also prints Cursor's JSON verdict on stdout "
+             "(default: claude-code)",
+    )
     phpre.set_defaults(func=lambda args: __import__(
         "vaara.integrations.claude_code_hooks", fromlist=["run_pre_tool_use"]
-    ).run_pre_tool_use(args.deny_patterns))
+    ).run_pre_tool_use(args.deny_patterns, client=args.client))
 
     phpost = hooksub.add_parser(
         "post-tool-use",
         help="Append the outcome record and feed the online learner",
     )
+    phpost.add_argument(
+        "--client", choices=["claude-code", "opencode", "cursor", "codex", "gemini",
+                               "copilot"],
+        default="claude-code",
+        help="Which agent sent the event (default: claude-code)",
+    )
     phpost.set_defaults(func=lambda args: __import__(
         "vaara.integrations.claude_code_hooks", fromlist=["run_post_tool_use"]
-    ).run_post_tool_use())
+    ).run_post_tool_use(client=args.client))
+
+    phfail = hooksub.add_parser(
+        "post-tool-use-failure",
+        help="Record that a call failed or was interrupted (state only, not "
+             "the host's error text)",
+    )
+    phfail.set_defaults(func=lambda args: __import__(
+        "vaara.integrations.claude_code_hooks", fromlist=["run_post_tool_use_failure"]
+    ).run_post_tool_use_failure())
+
+    phdeny = hooksub.add_parser(
+        "permission-denied",
+        help="Record that the host's permission step refused a call Vaara "
+             "had allowed, so it did not run",
+    )
+    phdeny.set_defaults(func=lambda args: __import__(
+        "vaara.integrations.claude_code_hooks", fromlist=["run_permission_denied"]
+    ).run_permission_denied())
+
+    phups = hooksub.add_parser(
+        "user-prompt-submit",
+        help="Remember the recipients, payees and hosts the user typed, so "
+             "value-origin holds never fire on them. Prints nothing",
+    )
+    phups.set_defaults(func=lambda args: __import__(
+        "vaara.integrations.claude_code_hooks", fromlist=["run_user_prompt_submit"]
+    ).run_user_prompt_submit())
 
     phss = hooksub.add_parser(
         "session-start",
@@ -6903,10 +8907,77 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pungov.set_defaults(func=_cmd_ungovern)
 
+    pscan = sub.add_parser(
+        "scan",
+        help="Find AI agents on this machine and say whether Vaara governs "
+             "each: processes talking to model APIs or local model servers, "
+             "MCP configs anywhere under your home, and installed apps that "
+             "bundle a model or MCP SDK. Reads only; changes nothing.",
+    )
+    pscan.add_argument("--json", action="store_true", help="Print the findings as JSON")
+    pscan.add_argument("--no-processes", action="store_true", help="Skip open connections")
+    pscan.add_argument("--no-mcp", action="store_true", help="Skip the MCP config search")
+    pscan.add_argument("--no-apps", action="store_true", help="Skip installed apps")
+    pscan.add_argument(
+        "--fail-on-ungoverned", action="store_true",
+        help="Exit 1 when anything is ungoverned or reachable but not governed",
+    )
+    pscan.add_argument(
+        "--watch", action="store_true",
+        help="Keep scanning and record each agent process the first time it "
+             "is seen, as an agent_seen record in its own trail. The macOS "
+             "app notifies when one that is not governed starts.",
+    )
+    pscan.add_argument("--interval", type=float, default=15.0,
+                       help="Seconds between passes with --watch (default 15)")
+    pscan.add_argument("--trail", default=None,
+                       help="Trail for --watch (default ~/.vaara/trail/agents/audit.db)")
+    pscan.add_argument("--install-watch", action="store_true",
+                       help="Run --watch at login (launchd on macOS, systemd user unit on Linux)")
+    pscan.add_argument("--uninstall-watch", action="store_true",
+                       help="Remove the login service --install-watch wrote")
+    pscan.set_defaults(func=_cmd_scan)
+
     return p
 
 
+def _oslayer_main(name: str):
+    if name == "run":
+        from vaara.oslayer.run import main as entry
+    elif name == "os-guard":
+        from vaara.oslayer.guard import main as entry
+    elif name == "cage":
+        from vaara.cage.cli import main as entry
+    else:
+        from vaara.oslayer.manage import main as entry
+    return entry
+
+
 def main(argv: list[str] | None = None) -> int:
+    # `llm-proxy` forwards its argv untouched to the parser that owns it.
+    # argparse.REMAINDER cannot do this: it stops capturing when the first
+    # remaining token starts with "-", which is every option this command
+    # takes. Intercepting here keeps one parser and no mirrored copy.
+    raw = sys.argv[1:] if argv is None else argv
+    if raw and raw[0] == "llm-proxy":
+        from vaara.integrations.llm_proxy import main as llm_main
+        return llm_main(raw[1:])
+    # `net-gate` the same way: its parser in vaara.netgate.cli is the only one.
+    if raw and raw[0] == "net-gate":
+        from vaara.netgate.cli import main as netgate_main
+        return netgate_main(raw[1:])
+    # The OS layer's commands forward the same way. `run` has to: everything
+    # after the agent's name belongs to the agent. None of the three triggers
+    # first-run setup; the guard runs as root and `run` only starts an agent.
+    if raw and raw[0] in ("run", "os-guard", "os-layer", "cage"):
+        return _oslayer_main(raw[0])(raw[1:])
+    # Inside a `vaara run` launch the floor seals ~/.vaara, so a hook relays
+    # its event to `vaara run`, which decides it outside the floor. Before
+    # the parser: first-run setup reads ~/.vaara too.
+    if raw and raw[0] == "hook" and os.environ.get("VAARA_RUN_SOCKET"):
+        from vaara.oslayer.forward import relay
+        return relay(raw[1:])
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -6933,7 +9004,7 @@ def _should_auto_init(args: argparse.Namespace) -> bool:
     governance gestures.
     """
     func_name = getattr(args.func, "__name__", "")
-    if func_name in ("_cmd_init", "_cmd_ungovern"):
+    if func_name in ("_cmd_init", "_cmd_ungovern", "_cmd_scan"):
         return False
     return True
 
@@ -6943,8 +9014,10 @@ def _run_first_time_setup() -> None:
     from vaara.integrations import init_governance as ig
 
     try:
+        # set_hook_mode=False: this runs silently on the first use of any
+        # command, so it must not switch the hooks from blocking to watching.
         ig.run_init(shadow=True, auto=True, mode="balanced",
-                     trail_db=ig.DEFAULT_TRAIL_DB)
+                     trail_db=ig.DEFAULT_TRAIL_DB, set_hook_mode=False)
     except Exception:
         pass  # silent — next invocation will retry
 

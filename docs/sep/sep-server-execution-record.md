@@ -634,7 +634,7 @@ than broken by nonce). Relevant modules:
   receipt's back-link, the issuer-block
   layout, and the shared signing stack unchanged, so the decision record adds
   the `decisionDerived` block and no new crypto.
-- `vaara/attestation/_sep2787_types.py` and `_sep2787_canonical.py`: the shared
+- `vaara/attestation/_attest_types.py` and `_attest_canonical.py`: the shared
   commitment shapes (`ArgsRef`, `ArgsProjection`, `make_args_digest`), the
   issuer-block layout, RFC 8785 canonicalization with float rejection, and the
   signing stack (`ES256` / `RS256` / `HS256`) reused unchanged.
@@ -680,10 +680,12 @@ decision-only escalate, the two replay-rejection cases (substituted attestation
 back-link and substituted pairing nonce, both failing Check A), a substituted
 decision under a shared attestation (Check A passes, Check B fails), the
 equal-`decidedAt` supersession tie reported as ambiguous, and the no-SEP-2787
-fallback request-envelope binding (with its replayed-envelope substitution). An
-independent consumer verifier (Rul1an/Assay) reproduces the Check-A subset today
-and the Check-B and supersession cases as it adopts the digest and ordering
-model.
+fallback request-envelope binding (with its replayed-envelope substitution).
+
+Runs of these vectors by parties other than the author are recorded at
+<https://vaara.io/conformance.html>, on terms that are the same for everyone and
+that each runner agrees to before a row is published. This page states no claim
+about any third-party implementation on its own account.
 
 Conformance traceability, mapping each MUST / MUST NOT and SHOULD / SHOULD NOT in
 the Specification to a conformance check ID, is maintained with the living

@@ -1,7 +1,9 @@
 # Execution receipts
 
 The execution receipt is the post-execution sibling of SEP-2787 tool
-call attestation.
+call attestation. MCP pull request 2787, which proposed that SEP, was
+closed without being merged on 2026-09-22. The receipt still links back
+to the attestation shape and reuses its canonicalization and signing.
 
 SEP-2787 attests a `tools/call` **request** before it runs: issuer,
 subject, target, intent, nonce, time, and an argument commitment. It
@@ -10,8 +12,9 @@ back. The receipt covers that deferred half. It binds the **outcome** of
 one attested request and links back to the attestation it answers.
 
 Together the pair gives end-to-end accountability for one action: the
-attestation proves the request was authorised, the receipt proves what
-happened to it.
+attestation states what was asked, and the receipt records what the
+issuer observed happen to it. The receipt is the issuer's account, signed
+by whoever saw the outcome. It is not a separate witness to the action.
 
 ## Shape
 
@@ -86,6 +89,51 @@ to check receipts. The back-link check recomputes the attestation digest
 and confirms both the digest and the nonce match. The result-commitment
 check recomputes the commitment against the result the server is about
 to return, or returned.
+
+## Completeness
+
+`receiptAsserted.completeness` is an optional block:
+
+```json
+{ "boundaryId": "vaara-mcp-proxy#execution", "seq": 12, "runningCount": 13 }
+```
+
+`runningCount` always equals `seq + 1`. The sequence is per boundary, and it
+rides inside `receiptAsserted`, so it is covered by the receipt signature. A
+holder who renumbers a receipt to close a gap invalidates it.
+
+Authorization receipts have carried an equivalent block for longer, in the
+evidence document their signed record pins by digest. Without one on this side,
+a holder could name every allow decision with no execution receipt, because
+every execution receipt back-links to its attestation. What they could not do
+was tell an action that never ran from a receipt that was dropped, because the
+execution side had no contiguity to break.
+
+The two streams count separately, which is why the boundary id ends in
+`#execution`. A denied call mints an authorization receipt and no execution
+receipt by design, so one shared sequence would read every deny as a gap.
+
+To check a held set:
+
+```python
+from vaara.credential._contiguity import (
+    completeness_from_execution_receipts,
+    verify_contiguity,
+)
+
+report = verify_contiguity(completeness_from_execution_receipts(receipts))
+print(report.missing_seqs)
+```
+
+Verify each receipt's signature first. The checker reads sequence numbers as
+given, and an unverified receipt's number is a claim.
+
+**What this does not close.** Contiguity catches a receipt dropped in the
+middle of a run. A pure tail truncation is invisible to sequence contiguity
+alone, because the dropped records take their own numbers with them; closing it
+needs a timestamp anchor over the running count, or the sealing block the
+authorization side supports. Receipts minted before this field existed carry no
+block and are skipped rather than counted as gaps.
 
 ## Conformance vectors
 

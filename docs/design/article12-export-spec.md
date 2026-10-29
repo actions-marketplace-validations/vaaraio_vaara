@@ -21,7 +21,7 @@ This makes the package self-explaining.
 - `vaara trail export-incident` -> `incident_export.py`: Article 73
   serious-incident report from a trail.
 - `vaara trail export-prov` -> `prov_export.py`: W3C PROV-JSON lineage.
-- `vaara trail prune` (retention): Article 12(2) deletion.
+- `vaara trail prune` (retention): deletion past the Article 19(1) / 26(6) retention period.
 - `AuditRecord.regulatory_articles`: per-record article tags already
   carried in the chain.
 
@@ -127,7 +127,12 @@ cannot back.
 The regulator verifies it offline with `vaara trail verify-anchor --zip
 <package>.zip`: the anchored `chain_head_hash` must equal the last
 `record_hash` in `trail.jsonl`, and the RFC 3161 token must verify under a TSA
-the regulator trusts. This reuses `vaara/audit/timeanchor.py`
+the regulator trusts. `--tsa-cert` pins the TSA signer certificate and
+`--tsa-issuer` pins the CA that issued it (PEM or DER, held out of band); a
+token signed by anyone else is refused. With neither flag the command prints
+`UNPINNED: time as asserted by the certificate in the package`, because a
+package can carry any TSA certificate. The time it prints is a "no later
+than": the anchored head existed by then. This reuses `vaara/audit/timeanchor.py`
 (`verify_anchor_over_records`); the report's "External time anchor (Article
 19)" section and `article12_summary.json["time_anchor"]` surface the attested
 time. Versus a blockchain-anchored digest, an eIDAS-qualified RFC 3161
@@ -220,10 +225,11 @@ ships evidence it cannot back, and there is no `--skip-invalid`.
   window and not revoked; it is `corroborated` only with a verified anchor that
   predates retirement, and `pinned` only against a `--trusted-did-document`. It
   is never silently upgraded.
-- An enforcement binding is never "attested" in v0: `vcek_chain_basis` stays
-  `caller_supplied_unverified` and `enforcement_logic_basis` stays
-  `not_established`. `--expected-measurement` pins a launch image; the
-  `attested` tier and a strict pass are reserved for the future KDS-chained tier.
+- An enforcement binding in the fold carries no AMD chain, so
+  `vcek_chain_basis` stays `caller_supplied_unverified` and
+  `enforcement_logic_basis` stays `not_established`. `--expected-measurement`
+  pins a launch image; the `attested` tier needs the AMD chain
+  (`vaara verify-enforcements` with `NAME.amd-chain.pem`).
 
 ### Conformance
 
@@ -231,7 +237,9 @@ ships evidence it cannot back, and there is no `--skip-invalid`.
 `enforcement_attestation_v0` corpora into a real package and pin the roll-up and
 `evidence/` membership. The Vaara-free checker reproduces every folded verdict
 from the same bytes folded into the zip (not a re-snapshot), composing the two
-single-verb suites' own evaluators.
+single-verb suites' own evaluators. One sample package per scenario is
+committed under `packages/`, so the checker runs from the vectors alone, with
+no Vaara install to build a package first.
 
 ### CLI
 

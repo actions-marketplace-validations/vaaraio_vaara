@@ -25,15 +25,29 @@ says they should.
 A suite that cannot run bare (it needs an external artifact passed as an
 argument, or an optional dependency that is not installed) is reported SKIP,
 never silently dropped, and does not on its own fail the run.
+
+The report is a portable run record. It pins the commit and the sha256 of
+every checker and case file that was graded, and carries its own digest over
+those bytes. So a run can be handed to a third party and checked against a
+clean clone without a public listing, without consent to a permanent row, and
+without the maintainer in the trust path. Being listed is for being seen;
+the record is for being believed, and nobody should have to buy the first to
+get the second.
+
+The digest is taken over stdlib-canonical bytes (sorted keys, no spaces,
+UTF-8), named in the record as ``canonicalization``. Deliberately not JCS:
+this runner grades outside implementations and imports nothing, so it cannot
+require a canonicalisation library to state its own result.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import platform
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.parse
 from datetime import datetime, timezone
@@ -53,24 +67,9 @@ SKIP_EXIT_CODE = 77
 # Suites whose checker validates an artifact handed to it on the command line
 # rather than a bare directory of case files. Reported SKIP (with reason) in the
 # aggregate run; an explicit list so the gap reads as a gap, not as coverage.
-#
-# The skip is a consequence of this runner's promise rather than a hole in the
-# corpus. article12_fold_v0 validates a produced EU AI Act Article 12 regulator
-# package, so something has to build the package first, and building it needs
-# Vaara installed. The runner's whole point is that a stranger can grade the
-# corpus with `pip install cryptography rfc8785` and no Vaara. Those two cannot
-# both hold, so it skips, and `--with-vaara` is for the environment where the
-# install already exists: our own CI, and anyone who happens to have it.
-NEEDS_ARGUMENT = {
-    "article12_fold_v0": "checker validates a passed-in bundle zip, not a bare case directory",
-}
-
-#: How to build the artifact a NEEDS_ARGUMENT suite grades, when Vaara is
-#: importable. Each entry names the generator callable and the scenario it
-#: builds; the runner hands the result to the suite's own checker unchanged.
-BUILDABLE = {
-    "article12_fold_v0": "full",
-}
+# Empty today: article12_fold_v0 was the one such suite until its sample
+# packages were committed, and its checker now grades them bare.
+NEEDS_ARGUMENT: dict[str, str] = {}
 
 
 def discover(vectors_dir: Path) -> list[str]:
@@ -96,57 +95,36 @@ def _case_count(suite_dir: Path) -> Optional[int]:
     return None
 
 
-def _build_artifact(suite_dir: Path, suite: str, work: Path) -> Path | None:
-    """Build the artifact a NEEDS_ARGUMENT suite grades. None if not possible.
+def _scrub(text: str, vectors_dir: Path) -> str:
+    """Take absolute local paths out of captured checker output.
 
-    Imports the suite's own generator, which imports Vaara, so this only works
-    where Vaara is installed. Any failure returns None and the suite falls back
-    to being skipped with its usual reason: a runner that turned a missing
-    optional install into a red suite would punish exactly the stranger this
-    corpus is built for.
+    A traceback names the file it was raised in, so a checker that cannot
+    import an optional dependency writes the runner's filesystem layout into
+    the report. That was harmless while the report was a local artifact. It is
+    not harmless now that the report is meant to be handed to strangers.
+
+    Found by the record's own no-absolute-paths test failing in CI, where
+    rfc8785 is absent and one checker skipped with a full traceback.
     """
-    import importlib.util
-
+    if not text:
+        return text
+    replacements = [(vectors_dir.resolve(), "<vectors>"), (REPO, "<repo>")]
     try:
-        spec = importlib.util.spec_from_file_location(
-            f"_gen_{suite}", suite_dir / "_generate.py"
-        )
-        gen = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(gen)
-        hcases = {c["name"]: c for c in json.loads(
-            (gen.HANDOFF / "cases.json").read_text())["cases"]}
-        ecases = {c["name"]: c for c in json.loads(
-            (gen.ENFORCEMENT / "cases.json").read_text())["cases"]}
-        return gen._build(gen.SCENARIOS[BUILDABLE[suite]], hcases, ecases, work)
-    except Exception:  # noqa: BLE001
-        return None
+        replacements.append((Path.home(), "~"))
+    except RuntimeError:  # pragma: no cover - no home dir on this platform
+        pass
+    for root, marker in replacements:
+        text = text.replace(str(root), marker)
+    return text
 
 
-def run_suite(vectors_dir: Path, suite: str, with_vaara: bool = False) -> dict[str, Any]:
+def run_suite(vectors_dir: Path, suite: str) -> dict[str, Any]:
     """Run one suite's checker and return a structured result row."""
     suite_dir = vectors_dir / suite
     if suite in NEEDS_ARGUMENT:
-        artifact = None
-        if with_vaara and suite in BUILDABLE:
-            work = Path(tempfile.mkdtemp(prefix=f"{suite}-"))
-            artifact = _build_artifact(suite_dir, suite, work)
-        if artifact is None:
-            return {
-                "suite": suite, "status": "SKIP", "reason": NEEDS_ARGUMENT[suite],
-                "cases": _case_count(suite_dir), "returncode": None, "duration_s": 0.0,
-            }
-        start = time.perf_counter()
-        proc = subprocess.run(
-            [sys.executable, str(suite_dir / CHECKER), str(artifact)],
-            capture_output=True, text=True, cwd=str(suite_dir),
-        )
-        duration = round(time.perf_counter() - start, 3)
         return {
-            "suite": suite,
-            "status": "PASS" if proc.returncode == 0 else "FAIL",
-            "reason": "" if proc.returncode == 0 else proc.stderr.strip()[-400:],
-            "cases": _case_count(suite_dir), "returncode": proc.returncode,
-            "duration_s": duration,
+            "suite": suite, "status": "SKIP", "reason": NEEDS_ARGUMENT[suite],
+            "cases": _case_count(suite_dir), "returncode": None, "duration_s": 0.0,
         }
 
     start = time.perf_counter()
@@ -161,6 +139,7 @@ def run_suite(vectors_dir: Path, suite: str, with_vaara: bool = False) -> dict[s
         lines = proc.stderr.strip().splitlines()
         reason = lines[-1].removeprefix("SKIP: ") if lines else \
             "optional dependency not installed"
+        reason = _scrub(reason, vectors_dir)
         return {
             "suite": suite, "status": "SKIP", "reason": reason,
             "cases": _case_count(suite_dir), "returncode": proc.returncode,
@@ -173,7 +152,10 @@ def run_suite(vectors_dir: Path, suite: str, with_vaara: bool = False) -> dict[s
     }
     if status == "FAIL":
         # Tail of the checker's own output, so a failure is actionable in place.
-        row["output_tail"] = (proc.stdout + proc.stderr).strip().splitlines()[-12:]
+        row["output_tail"] = [
+            _scrub(line, vectors_dir)
+            for line in (proc.stdout + proc.stderr).strip().splitlines()[-12:]
+        ]
     return row
 
 
@@ -187,15 +169,104 @@ def _print_table(rows: list[dict[str, Any]]) -> None:
             print(f"            | {line}")
 
 
+# The canonicalisation used for the record digest, named in the record itself
+# so a verifier does not have to guess. Deliberately NOT called JCS: this is
+# stdlib `json.dumps` with sorted keys and no spaces, which is reproducible
+# from the standard library alone. That constraint is the point. This runner
+# grades outside implementations and imports nothing, so it cannot require
+# rfc8785 to be installed in order to state its own result.
+CANONICALIZATION = "json-sorted-compact-utf8"
+RECORD_VERSION = 1
+
+
+def canonical_bytes(obj: Any) -> bytes:
+    """Deterministic bytes for `obj`. See CANONICALIZATION."""
+    return json.dumps(
+        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _git(*args: str) -> Optional[str]:
+    """A git value, or None when this is not a checkout or git is absent."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(REPO), *args],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
+
+
+def pin_corpus(vectors_dir: Path, suites: list[str]) -> dict[str, Any]:
+    """Digest every checker and case file that this run graded.
+
+    Without this a report says "49 passed" and nothing that ties the claim to
+    the bytes it was made against. A reader holding the report and a clean
+    clone can recompute these and see whether the corpus was the real one.
+    """
+    pinned: dict[str, Any] = {}
+    for suite in sorted(suites):
+        suite_dir = vectors_dir / suite
+        entry: dict[str, Any] = {}
+        checker = suite_dir / CHECKER
+        if checker.is_file():
+            entry["checker_sha256"] = _sha256_file(checker)
+        files: dict[str, str] = {}
+        for path in sorted(suite_dir.rglob("*")):
+            if not path.is_file() or path.name == CHECKER:
+                continue
+            if "__pycache__" in path.parts:
+                continue
+            files[path.relative_to(suite_dir).as_posix()] = _sha256_file(path)
+        if files:
+            entry["files_sha256"] = files
+        pinned[suite] = entry
+    return {
+        "suites": pinned,
+        "corpus_sha256": hashlib.sha256(canonical_bytes(pinned)).hexdigest(),
+    }
+
+
+def seal(report: dict[str, Any]) -> dict[str, Any]:
+    """Add the record's own digest, computed over everything else in it."""
+    body = {k: v for k, v in report.items() if k != "record_sha256"}
+    report["record_sha256"] = hashlib.sha256(canonical_bytes(body)).hexdigest()
+    return report
+
+
 def build_report(rows: list[dict[str, Any]], vectors_dir: Path, stamp: str) -> dict[str, Any]:
     passed = [r for r in rows if r["status"] == "PASS"]
     failed = [r for r in rows if r["status"] == "FAIL"]
     skipped = [r for r in rows if r["status"] == "SKIP"]
-    return {
+    try:
+        shown_dir = str(vectors_dir.relative_to(REPO).as_posix())
+    except ValueError:
+        # Outside the repo, which is the `--vectors-dir ./their_vectors` case.
+        # Name it without the absolute path, so a shared record does not carry
+        # the runner's filesystem layout.
+        shown_dir = vectors_dir.name
+    report = {
         "tool": "vaara-conformance-runner",
+        "record_version": RECORD_VERSION,
+        "canonicalization": CANONICALIZATION,
         "generated_at": stamp,
-        "vectors_dir": str(vectors_dir),
+        "vectors_dir": shown_dir,
         "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "commit": _git("rev-parse", "HEAD"),
+        "commit_dirty": bool(_git("status", "--porcelain")),
+        "corpus": pin_corpus(vectors_dir, [r["suite"] for r in rows]),
         "totals": {
             "suites": len(rows), "passed": len(passed), "failed": len(failed),
             "skipped": len(skipped), "cases_passed": sum(r["cases"] or 0 for r in passed),
@@ -203,6 +274,7 @@ def build_report(rows: list[dict[str, Any]], vectors_dir: Path, stamp: str) -> d
         "all_passed": not failed,
         "suites": rows,
     }
+    return seal(report)
 
 
 #: Where a reproduction gets listed. The issue form is a self-service desk: a
@@ -274,6 +346,35 @@ def print_submit_block(report: dict, repo_root: Path, selected=None) -> None:
     print(f"  {link}")
 
 
+def print_record_block(report: dict, json_path: Optional[Path]) -> None:
+    """The other door, and it has to be shown or it does not exist.
+
+    A row is permanent and public. Plenty of people will not consent to that
+    and will run the corpus anyway, which is their right and costs them
+    nothing. Until this block existed those runs left an unsigned JSON file
+    that proved nothing, so the only way to be believed was to be listed.
+
+    This says the record is checkable on its own. No page, no permanence, no
+    consent, and nobody has to be told who ran it.
+    """
+    print()
+    print("Not listing it? The run is still provable on its own.")
+    print(f"  record digest  {report['record_sha256']}")
+    print(f"  corpus digest  {report['corpus']['corpus_sha256']}")
+    if json_path is None:
+        print()
+        print("  Re-run with --json report.json to keep it. The file pins the")
+        print("  commit and the sha256 of every checker and case file that was")
+        print("  graded, so anyone you hand it to can recompute it against a")
+        print("  clean clone. You do not have to be listed to be checked.")
+    else:
+        print()
+        print(f"  {json_path} pins the commit and the sha256 of every checker")
+        print("  and case file that was graded. Hand it to whoever you like:")
+        print("  they recompute it against a clean clone and need neither this")
+        print("  page nor our word for it.")
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Aggregate runner over the Vaara conformance vector corpus."
@@ -287,9 +388,6 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="write a machine-readable conformance report to this path")
     parser.add_argument("--no-submit-link", action="store_true",
                         help="omit the listing link (for CI and scripted runs)")
-    parser.add_argument("--with-vaara", action="store_true",
-                        help="also grade suites whose checker needs a built artifact "
-                             "(requires Vaara installed; skipped silently if not)")
     args = parser.parse_args(argv)
 
     vectors_dir = args.vectors_dir.resolve()
@@ -312,7 +410,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         suites = [s for s in suites if s in args.corpus]
 
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    rows = [run_suite(vectors_dir, s, with_vaara=args.with_vaara) for s in suites]
+    rows = [run_suite(vectors_dir, s) for s in suites]
     _print_table(rows)
 
     report = build_report(rows, vectors_dir, stamp)
@@ -335,6 +433,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # value here is that nobody has to go looking for the form.
     if not args.no_submit_link:
         print_submit_block(report, Path(__file__).resolve().parent.parent, args.corpus)
+        print_record_block(report, args.json)
 
     return 1 if failed else 0
 

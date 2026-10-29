@@ -47,7 +47,7 @@ import json
 import sys
 import zipfile
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -114,7 +114,7 @@ def _emit_json(obj: Any, stream=None) -> None:
     stream.write("\n")
 
 
-def _emit_table(rows: Iterable[list[str]], headers: list[str], stream=None) -> None:
+def _emit_table(rows: Iterable[list[Any]], headers: list[str], stream=None) -> None:
     stream = stream or sys.stdout
     rows = list(rows)
     if not rows:
@@ -136,7 +136,12 @@ def _emit_table(rows: Iterable[list[str]], headers: list[str], stream=None) -> N
 
 def cmd_verify(args) -> int:
     try:
-        from .audit.verify import verify_signed
+        from .audit.verify import (
+            describe_cage_lifecycle,
+            describe_rotation_seams,
+            describe_unrecorded_windows,
+            verify_signed,
+        )
     except ImportError as exc:
         print(f"vaara-audit verify requires cryptography: {exc}", file=sys.stderr)
         return 2
@@ -145,12 +150,28 @@ def cmd_verify(args) -> int:
         print(f"ERROR: trail zip not found: {zip_path}", file=sys.stderr)
         return 2
     pubkey = Path(args.pubkey) if args.pubkey else None
-    result = verify_signed(zip_path, public_key=pubkey)
-    payload = {
+    try:
+        result = verify_signed(
+            zip_path, public_key=pubkey,
+            erasure_key=Path(args.erasure_key) if args.erasure_key else None,
+            rotation_key=Path(args.rotation_key) if args.rotation_key else None,
+            archive=Path(args.archive) if args.archive else None,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    payload: dict[str, Any] = {
         "ok": bool(result.ok),
         "trail": str(zip_path),
         "manifest": result.manifest,
         "errors": list(result.errors),
+        "erased": list(result.erased),
+        "erasures": list(result.erasures),
+        "cage_lifecycle": list(result.cage_lifecycle),
+        "cage_open": list(result.cage_open),
+        "cage_unpaired_stops": list(result.cage_unpaired_stops),
+        "unrecorded_windows": list(result.unrecorded_windows),
+        "rotation_seams": list(result.rotation_seams),
         # Honest labeling: with no out-of-band --pubkey, a passing result is
         # integrity/internal-consistency only, not authenticated issuer identity.
         "identity_pinned": pubkey is not None,
@@ -169,6 +190,29 @@ def cmd_verify(args) -> int:
             print("errors:")
             for e in payload["errors"]:
                 print(f"  - {e}")
+        if payload["erased"]:
+            print("erased:")
+            for e in payload["erased"]:
+                print(f"  - record {e['index']} ({e['record_id']}): link verified, "
+                      f"content not checkable")
+        if payload["erasures"]:
+            print("erasures:")
+            for e in payload["erasures"]:
+                ground = f", ground: {e['legal_ground']}" if e["legal_ground"] else ""
+                by = f" by {e['erased_by']}" if e["erased_by"] else ""
+                print(f"  - record {e['index']}: {e['state']}{by}{ground}")
+        if payload["cage_lifecycle"]:
+            print("cage launches:")
+            for line in describe_cage_lifecycle(result):
+                print(f"  - {line}")
+        if payload["unrecorded_windows"]:
+            print("unrecorded windows:")
+            for line in describe_unrecorded_windows(result):
+                print(f"  - {line}")
+        if payload["rotation_seams"]:
+            print("rotation seams:")
+            for line in describe_rotation_seams(result):
+                print(f"  - {line}")
         if payload["ok"] and pubkey is None:
             print(
                 "  WARNING: no --pubkey given — identity NOT authenticated "
@@ -200,11 +244,9 @@ def cmd_inspect(args) -> int:
             return False
         return True
 
-    filtered = (r for r in records if matches(r))
+    filtered = [r for r in records if matches(r)]
     if args.limit:
-        filtered = list(filtered)[: args.limit]
-    else:
-        filtered = list(filtered)
+        filtered = filtered[: args.limit]
 
     if args.json:
         _emit_json({"n": len(filtered), "records": filtered})
@@ -304,8 +346,18 @@ DEFAULT_UNKNOWN_FRAC = 0.25
 DEFAULT_UNKNOWN_WINDOW = 50
 
 
+def _decision_events() -> frozenset[str]:
+    """The event types that record a decision: the trail's own names."""
+    from vaara.audit.trail import EventType
+
+    return frozenset({EventType.DECISION_MADE.value, EventType.ACTION_BLOCKED.value})
+
+
 def _rule_missing_completion(records: list[dict]) -> list[dict]:
-    """Every action_requested should have a matching decision_emitted.
+    """Every action_requested should have a matching decision record.
+
+    A decision is ``decision_made`` (allow, escalate, deny by the scorer) or
+    ``action_blocked`` (deny by a rule or policy), as the trail writes them.
 
     Hash-chain integrity is already checked by the ``verify`` subcommand
     via the cryptographic path. This rule looks at the semantic lifecycle:
@@ -313,9 +365,10 @@ def _rule_missing_completion(records: list[dict]) -> list[dict]:
     that enforcement crashed, the trail was truncated, or the gate was
     bypassed. All three are anomalies worth surfacing.
     """
-    findings = []
+    findings: list[dict] = []
+    decisions = _decision_events()
     event_types = {r.get("event_type") for r in records}
-    if "decision_emitted" not in event_types:
+    if not event_types & decisions:
         # Trail is request-log only (no decisions anywhere). Not enough
         # semantic context to call missing completions an anomaly.
         return findings
@@ -326,7 +379,7 @@ def _rule_missing_completion(records: list[dict]) -> list[dict]:
             continue
         by_action[action_id][r.get("event_type", "")] = r
     for action_id, events in by_action.items():
-        if "action_requested" in events and "decision_emitted" not in events:
+        if "action_requested" in events and not events.keys() & decisions:
             req = events["action_requested"]
             findings.append({
                 "rule": "missing_completion",
@@ -374,15 +427,16 @@ def _rule_rate_burst(
         aid = r.get("agent_id") or "(none)"
         by_agent[aid].append(r)
     for aid, rs in by_agent.items():
-        rs_ts = sorted([
-            (_record_ts(r), r)
-            for r in rs
-            if _record_ts(r) is not None
-        ], key=lambda x: x[0])
+        stamped: list[tuple[datetime, dict]] = []
+        for r in rs:
+            ts = _record_ts(r)
+            if ts is not None:
+                stamped.append((ts, r))
+        rs_ts = sorted(stamped, key=lambda x: x[0])
         # Sliding-window count
         left = 0
         for right in range(len(rs_ts)):
-            while rs_ts[right][0] - rs_ts[left][0] > __import__("datetime").timedelta(seconds=window_s):
+            while rs_ts[right][0] - rs_ts[left][0] > timedelta(seconds=window_s):
                 left += 1
             count = right - left + 1
             if count >= threshold:
@@ -495,6 +549,14 @@ def build_parser() -> argparse.ArgumentParser:
     pv = sub.add_parser("verify", help="Verify signature + hash chain.")
     pv.add_argument("trail", help="Path to trail zip.")
     pv.add_argument("--pubkey", help="Path to Ed25519 public key (PEM).")
+    pv.add_argument("--erasure-key",
+                    help="Public key (PEM, EC P-256 or RSA) that signs erasure records.")
+    pv.add_argument("--rotation-key",
+                    help="Ed25519 public key (PEM) that signed the trail_rotated records, "
+                         "when it is not the key that signed the zip.")
+    pv.add_argument("--archive",
+                    help="The retention archive the trail begins after, checked against "
+                         "the digest the trail_rotated record states.")
     pv.add_argument("--json", action="store_true", help="Emit JSON.")
     pv.set_defaults(func=cmd_verify)
 

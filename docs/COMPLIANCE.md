@@ -2,7 +2,8 @@
 
 This document maps what Vaara produces at runtime to the specific article
 references a deployer needs to assemble conformity evidence under the
-EU AI Act and DORA.
+EU AI Act and DORA, and the criterion references a SOC 2 service auditor
+asks for.
 
 ## Scope
 
@@ -28,18 +29,18 @@ partial, or insufficient, see [VERDICTS.md](VERDICTS.md).
 |---|---|---|
 | **9(1)** | Risk Management System | Every intercepted action is scored and the score is recorded with inputs. `RISK_SCORED` events. |
 | **9(2)(a)** | Risk Identification and Analysis | `RISK_SCORED` plus `ACTION_BLOCKED` records show which risks were detected and which were blocked. |
-| **9(4)(a)** | Risk Mitigation Measures | `ACTION_BLOCKED` and `DECISION_MADE` records show mitigation applied per action. |
-| **9(7)** | Testing Procedures | `RISK_SCORED` plus `OUTCOME_RECORDED` pairs form the test signal. Conformal intervals give distribution-free calibration metrics. |
+| **9(5)(a)** | Risk Mitigation Measures | `ACTION_BLOCKED` and `DECISION_MADE` records show mitigation applied per action. |
+| **9(6)** | Testing Procedures | `RISK_SCORED` plus `OUTCOME_RECORDED` pairs form the test signal. Conformal intervals give distribution-free calibration metrics. |
 | **11(1)** | Technical Documentation | Checked outside the audit trail. Vaara does not replace the Annex IV technical file. |
 | **12(1)** | Record-Keeping (Logging) | Every `ACTION_REQUESTED`, `RISK_SCORED`, and `DECISION_MADE` is written to a hash-chained, tamper-evident trail. See "Audit trail integrity" below. |
 | **13(1)** | Transparency and Provision of Information | `RISK_SCORED` and `DECISION_MADE` records carry the risk score, the interval, the decision, and the reason string shown to the operator. |
 | **14(1)** | Human Oversight -- Design | `ESCALATION_SENT` and `ESCALATION_RESOLVED` events prove the oversight path exists and was exercised. The `vaara.audit.review_queue` storage layer turns `escalate` into a substantive queued-for-review step rather than a fire-and-forget log line. The `vaara review` CLI is the operator surface. |
 | **14(4)(d)** | Human Oversight -- Override Capability | `ESCALATION_RESOLVED` and `POLICY_OVERRIDE` events prove a human can decide not to proceed or can override Vaara's decision. The `vaara review resolve --audit-db PATH` CLI writes the `ESCALATION_RESOLVED` row directly from an operator action, so the override is a single recorded transaction rather than an out-of-band promise. |
 | **15(1)** | Accuracy, Robustness and Cybersecurity | `OUTCOME_RECORDED` events feed the adaptive scorer. Recency is tracked (default weekly calibration window). |
-| **26(10)** | Deployer Obligations -- Logging | `ACTION_REQUESTED`, `RISK_SCORED` and `DECISION_MADE` events are the automatically generated logs the deployer must retain. The engine treats this as critical and wants at least 10 records inside the staleness window. |
+| **26(6)** | Deployer Obligations -- Logging | `ACTION_REQUESTED`, `RISK_SCORED` and `DECISION_MADE` events are the automatically generated logs the deployer must retain. The engine treats this as critical and wants at least 10 records inside the staleness window. |
 | **50(1)** | Transparency -- AI System Disclosure | `DISCLOSURE_RECORDED` events prove a natural person was informed they were interacting with an AI system. Recorded via `vaara.audit.article50`. Critical requirement; a single record inside the window satisfies it. |
-| **61(1)** | Post-Market Monitoring | `OUTCOME_RECORDED` events form the post-market signal, tied back to the original action via `action_id`. |
-| **73(1)** | Serious-Incident Reporting | `vaara trail export-incident` builds a standalone JSON report referencing the trigger audit record by `record_id`. INTERIM format pending the Commission template promised by Article 73(7). Reporting deadline is derived from the Article 3(49) sub-category (general 15 days, death 10 days, Article 3(49)(b) widespread or serious 2 days). |
+| **72(1)** | Post-Market Monitoring | `OUTCOME_RECORDED` events form the post-market signal, tied back to the original action via `action_id`. |
+| **73(1)** | Serious-Incident Reporting | `vaara trail export-incident` builds a standalone JSON report referencing the trigger audit record by `record_id`. INTERIM format pending the Commission guidance required by Article 73(7). Reporting deadline is derived from the Article 3(49) sub-category (general 15 days, death 10 days, Article 3(49)(b) widespread or serious 2 days), counted from `awareness_timestamp` in the incident metadata when it is given and from the trigger record otherwise. |
 
 ### Article 14 in particular
 
@@ -115,9 +116,46 @@ also ships with a DORA bundle:
 
 | Article | Requirement | Evidence Vaara produces |
 |---|---|---|
-| **10(1)** | ICT Risk Management -- Protection and Prevention | `ACTION_BLOCKED` and `DECISION_MADE` records. |
-| **12(1)** | ICT Incident Detection | `ACTION_REQUESTED` and `ACTION_BLOCKED` records, with risk score and reason. |
-| **13(1)** | ICT Incident Response and Learning | `OUTCOME_RECORDED` events close the loop and feed the adaptive scorer. |
+| **9(1)** | ICT Risk Management -- Protection and Prevention | `ACTION_BLOCKED` and `DECISION_MADE` records. |
+| **10(1)** | ICT Anomaly Detection | `ACTION_REQUESTED` and `ACTION_BLOCKED` records, with risk score and reason. |
+| **13(1)** | ICT Learning and Evolving | `OUTCOME_RECORDED` events close the loop and feed the adaptive scorer. |
+
+## SOC 2 Trust Services Criteria mapping
+
+For a deployer whose own SOC 2 report has to cover what its agents do.
+The default `ComplianceEngine` carries six common criteria from the
+AICPA 2017 Trust Services Criteria (revised points of focus 2022), and
+records of data, infrastructure and identity actions carry the
+criterion tags beside the EU AI Act ones. The trail's own control
+events (escalations, policy overrides, signing-key changes) carry them
+whatever the action was.
+
+| Criterion | Heading | Evidence Vaara produces |
+|---|---|---|
+| **CC6.1** | Logical access security over protected information assets | `DECISION_MADE` and `ACTION_BLOCKED` records: a decision before every effect, with the policy behind it. |
+| **CC6.2** | Credentials registered before access and removed when no longer authorised | `KEY_LIFECYCLE` records: signing-key custodians added, rotated or revoked, hash-chained and time-anchored. |
+| **CC6.3** | Access authorised, modified or removed by role, least privilege | `DECISION_MADE`, `ESCALATION_RESOLVED` and `POLICY_OVERRIDE` records: access granted per action against the declared policy, with the approver named when a human disposed. |
+| **CC7.2** | Monitoring for anomalies, analysed for security events | `ACTION_REQUESTED` and `RISK_SCORED` records: every action recorded before it runs and scored before the decision. |
+| **CC7.3** | Security events evaluated, action taken | `ACTION_BLOCKED`, `ESCALATION_SENT`, `ESCALATION_RESOLVED` and `OUTCOME_RECORDED` records: the refusal, the hand-off to a human, the determination, the outcome. |
+| **CC8.1** | Changes authorised, tested, approved and implemented | `POLICY_OVERRIDE` and `KEY_LIFECYCLE` records: a change to a decision or to the key set names who made it and why. A policy change is not on the trail: a reload (`PolicyController.reload`, `POST /v1/policy/reload`, a per-tenant swap in `PolicyRegistry`) writes no record today, so policy changes are evidenced by the deployer's own change control, not by Vaara. |
+
+Which built-in actions carry the SOC 2 tag: `data.read`, `data.write`,
+`data.delete`, `data.export`, `infra.deploy`, `infra.config_change`,
+`infra.terminate`, `id.grant_permission`, `id.create_key`, `id.revoke`.
+A deployer's own action classes opt in by listing `soc2` among their
+regulatory domains.
+
+The six rows are assessed in every default report and none of them is
+critical by default, so they do not move the report's overall status
+until a deployer marks them so: pass `ComplianceEngine` the rows with
+`dataclasses.replace(row, is_critical=True)` on the criteria the
+entity's own SOC 2 report has to cover.
+
+What the evidence shows is that the control operated during the period.
+Whether that matches the control as the entity described it in its
+system description is the service auditor's call, as with every other
+mapping here. CC6.2 and CC8.1 are judged against a one-year staleness
+window, since key custodians and procedures do not change daily.
 
 ## Cloud guardrail adapter pattern
 
@@ -131,8 +169,50 @@ article-mapping table at
 
 The adapter is thin. The mapping is the artefact. A deployer can read
 the table, dispute a row, and override mappings without touching
-adapter code. 28 rows total across the three vendors (10 Bedrock,
-9 Azure, 9 GCP).
+adapter code: `override_mapping(CategoryMapping(...))` in the same
+module, or `load_overrides(path)` with a JSON list of rows, puts a
+deployer's row in force for every adapter, and `remove_override`
+restores the published one. 28 rows total across the three vendors
+(10 Bedrock, 9 Azure, 9 GCP).
+
+```python
+import json
+
+from vaara.integrations._content_safety_articles import (
+    CategoryMapping,
+    all_mappings_for,
+    clear_overrides,
+    load_overrides,
+    lookup,
+    override_mapping,
+    remove_override,
+)
+
+BEDROCK = "aws-bedrock-guardrails"
+print(lookup(BEDROCK, "contentPolicy.HATE").ai_act_articles)        # the published row: ('Art. 5',)
+
+# A deployer's legal team reads the row differently: put theirs in force.
+override_mapping(CategoryMapping(
+    provider=BEDROCK, provider_category="contentPolicy.HATE",
+    vaara_category="hate", ai_act_articles=("Art. 5", "Art. 50"),
+    owasp_llm=("LLM05",), notes="counsel memo 2026-09-30",
+))
+print(lookup(BEDROCK, "contentPolicy.HATE").ai_act_articles)        # now with Art. 50
+
+# Or a JSON list of rows, kept beside the policy and loaded at start-up.
+rows = [{"provider": "azure-content-safety", "provider_category": "Hate", "vaara_category": "hate",
+         "ai_act_articles": ["Art. 5", "Art. 50"], "owasp_llm": ["LLM05"]}]
+with open("article-overrides.json", "w", encoding="utf-8") as fh:
+    json.dump(rows, fh)
+print(load_overrides("article-overrides.json"))                     # 1 row put in force
+
+# The published table itself never changes, so a dispute stays visible as one.
+published = [m for m in all_mappings_for(BEDROCK) if m.provider_category == "contentPolicy.HATE"]
+print(published[0].ai_act_articles)                                 # still ('Art. 5',)
+
+remove_override(BEDROCK, "contentPolicy.HATE")                       # the published row applies again
+clear_overrides()
+```
 
 ### Category to article mapping
 
@@ -203,8 +283,9 @@ table covers 69 provider categories across seven upstream guardrails.
 | `word_block` | LLM Guard `BanSubstrings` / `Regex` | Art. 5 | LLM05 |
 | `bias` | Guardrails AI `BiasCheck` · LLM Guard `Bias` | Art. 10 | LLM05 |
 | `schema_violation` | Guardrails AI `ValidJSON` / `RegexMatch` / `ValidLength` · LLM Guard `JSON` | Art. 15 | LLM05 |
-| `output_validation` | NeMo `output_rails.self_check` · LLM Guard `NoRefusal` | Art. 13 | - |
-| `grounding` | NeMo `output_rails.fact_check` / `retrieval_rails.relevance` · LLM Guard `Relevance` | Art. 13, Art. 15 | LLM09 |
+| `output_validation` | NeMo `output_rails.self_check` · LLM Guard `NoRefusal` | Art. 13 | LLM05 (NeMo only) |
+| `grounding` | NeMo `output_rails.fact_check` | Art. 13, Art. 15 | LLM09 |
+| `grounding` | NeMo `retrieval_rails.relevance` · LLM Guard `Relevance` | Art. 13 | LLM09 |
 | `malicious_uri` | LLM Guard `MaliciousURLs` | Art. 15 | LLM05 |
 | `language` | LLM Guard `Language` | Art. 13 | - |
 | `sentiment` | LLM Guard `Sentiment` | - | - |
@@ -245,14 +326,14 @@ finalize. Status as of April 2026.
 | **ISO/IEC 42006** Requirements for AI Management System Auditors | WG2 | DIS Stage 40 | Vaara's hash-chained trail is the artefact 42006-qualified auditors examine for surveillance evidence. |
 | **prEN ISO/IEC 24970** AI System Logging | WG3 | Stage 30.2 (comment resolution) | Vaara aligns with the tamper-resistance, decision-factor logging, and audit-system integration requirements. Field-level alignment pending the published version. |
 | **prEN 18229-1** Trustworthiness Framework Pt 1 (logging, transparency, human oversight) | WG4 | Public enquiry | Implements AI Act Articles 12-14, which Vaara already maps to in the article table above. Field-level alignment pending the published version. |
-| **prEN ISO/IEC 12792** Transparency Taxonomy of AI Systems | WG4 | Stage 40 (final vote) | v0.6 ships per-action audit records tagged against the four-axis model (System Operation, Data Usage, Decision Making, Limitations) via four optional `AuditRecord` fields. Default classification heuristic by event type. Per-record override available. NOT tamper-evident in v0.6 - fields are metadata annotations excluded from `record_hash` so pre-v0.6 chains stay valid. |
+| **prEN ISO/IEC 12792** Transparency Taxonomy of AI Systems | WG4 | Stage 40 (final vote) | v0.6 ships per-action audit records tagged against the four-axis model (System Operation, Data Usage, Decision Making, Limitations) via four optional `AuditRecord` fields. Default classification heuristic by event type. Per-record override available. Not tamper-evident: the four fields are metadata annotations excluded from `record_hash`, which keeps chains written before they existed valid. |
 
 **What "alignment" means here.** Most of these standards have not
 published. The mapping above is pre-compliance positioning: Vaara is
 built so that when the finals drop, the gap to certified alignment is
-small. It is not a claim of certified compliance. Once a standard
-publishes, expect a v0.6 or v0.7 alignment audit and an updated entry
-in this table.
+small. It is not a claim of certified compliance. When a standard
+publishes, its row here is audited against the published text and
+updated.
 
 **What the deployer does with this table.** When listing harmonised
 standards applied (Annex IV §7), the deployer cites the published
@@ -280,8 +361,13 @@ regret guarantee O(sqrt(T log N)) (see [formal_specification.md](formal_specific
 Three artefact classes, all tied to a single `action_id`:
 
 **1. The hash-chained audit trail.** Every event is SHA-256 chained to
-its predecessor. Any insertion, deletion, or edit breaks the chain and
-is detected by `vaara trail verify`.
+its predecessor, and the store records the seq and hash of the newest
+record in the same transaction that writes it. Any insertion, deletion,
+or edit breaks the chain and is detected when the chain is walked,
+including records deleted from the end: the recorded head is then
+missing, and the next record written chains to it, so the gap stays in
+the chain. `vaara compliance report --db` reports `chain_intact` for a
+live trail, and `vaara trail verify --zip` re-walks an exported one.
 
 **2. The conformity report.** A structured per-article rollup. Each
 article gets an `EvidenceStatus` and an `EvidenceStrength`, based on
@@ -334,10 +420,12 @@ liability.
 
 Vaara's hash-chained audit trail and Article 12 commit-prove receipts
 produce **technical evidence**. They are not Qualified Electronic
-Signatures, Qualified Electronic Seals, or Qualified Electronic
-Attestations of Attributes (QEAA) under Regulation (EU) 910/2014
-(eIDAS), Articles 3(12), 3(25), 3(45), or 3(46). Vaara does not
-operate as a qualified trust service under Article 3(16).
+Signatures, Qualified Electronic Seals, Qualified Electronic
+Attestations of Attributes (QEAA), or attestations of attributes issued
+by a public sector body under Regulation (EU) 910/2014 (eIDAS) as
+amended by Regulation (EU) 2024/1183, Articles 3(12), 3(27), 3(45), or
+3(46). Vaara does not operate as a qualified trust service under
+Article 3(17).
 
 If your conformity workstream requires evidence to be backed by a
 qualified trust service, layer that on top of Vaara's output. Vaara's
@@ -379,7 +467,8 @@ Vaara's position in this picture:
   of all nine envelope fields (the inner Arbiter signature bound by
   reference) plus a transparency-log inclusion proof. Structural
   independence between the Arbiter key and the notary key is
-  enforced at both emit and verify. `InProcessTransparencyLog` is an
+  enforced at emit and on every verify, whether or not the verifier
+  also holds the Arbiter key. `InProcessTransparencyLog` is an
   RFC 6962-style binary Merkle log; production deployments swap in
   sigstore Rekor or an equivalent independently-operated log at the
   same call sites. Operators MAY run the reference IAP themselves;
@@ -392,36 +481,41 @@ Operators who need AAL-4 should pair Vaara with an independent
 attestation provider. The Vaara-emitted evidence is the input to
 that provider, not a replacement for it.
 
-### SEP-2787 v2 tool-call attestation (v0.39.2)
+### Tool-call attestation
 
-`vaara.attestation.sep2787` ships a reference implementation of
-SEP-2787, a per-tool-call JSON attestation envelope carried in MCP
-`_meta`. The v2 envelope shape groups envelope fields under three
+`vaara.attestation.tool_call_attestation` is Vaara's per-tool-call
+JSON attestation envelope, carried in MCP `_meta`. Vaara published
+the first implementation (v0.42.0 to v0.44.0) and the trust-surface
+grouping the community SEP-2787 draft later adopted. The older import
+path `vaara.attestation.sep2787` is a deprecated alias for the same
+module. The envelope groups its fields under three
 trust-surface blocks (`plannerDeclared`, `issuerAsserted`,
 `payloadDerived`) with `toolCalls` as a payload-derived fact, not a
 planner declaration. Signing modes are HS256 (HMAC-SHA256), ES256
 (ECDSA P-256 raw r||s), and RS256 (RSASSA-PKCS1-v1_5). The signature
-is computed over the JCS-canonical encoding of the four envelope
-blocks `{version, alg, plannerDeclared, issuerAsserted,
-payloadDerived}` and is excluded from its own input.
+is computed over the JCS-canonical encoding of `{version, alg,
+plannerDeclared, issuerAsserted, payloadDerived}` and is excluded
+from its own input.
 
 The two envelopes coexist. OVERT 1.0 is the operator-side attestation
-kernel emitting per-action CBOR Base Envelopes. SEP-2787 is the
-per-tool-call JSON envelope carried inside MCP transport. A
-deployment can run both: the OVERT envelope binds the action chain
-while the SEP-2787 envelope binds the specific tool-call payload.
+kernel emitting per-action CBOR Base Envelopes. The tool-call
+attestation is the per-tool-call JSON envelope carried inside MCP
+transport. A deployment can run both: the OVERT envelope binds the
+action chain while the tool-call envelope binds the specific
+tool-call payload.
 Field-level mapping between the two lives in
 [`attestation-overt-mapping.md`](attestation-overt-mapping.md).
 
 `parse_attestation(d)` provides full wire round-trip: a third-party
 consumer of the published v0 test vectors can parse JSON bytes,
-verify the signature, and re-emit byte-identically. The reference
-implementation is pinned at tag `sep2787-ref-v2`.
+verify the signature, and re-emit byte-identically. The
+implementation the vectors were cut from is pinned at tag
+`sep2787-ref-v2`.
 
-### Hardware TEE attestation hook (experimental, v0.18.0)
+### Hardware TEE attestation hook (experimental)
 
 Beyond the software-signed attestation chain described above, Vaara
-since v0.18.0 supports binding an OVERT envelope to a hardware-rooted
+supports binding an OVERT envelope to a hardware-rooted
 attestation report from a Trusted Execution Environment. The initial
 backend is **AMD SEV-SNP**, the natural fit for the confidential-VM
 deployment model used in agent runtimes. Intel TDX and Intel SGX are
@@ -444,13 +538,18 @@ If both hold, the attestation says "this OVERT envelope was emitted by
 an arbiter running inside an AMD SEV-SNP confidential VM at the
 measured launch state recorded in the report."
 
-What ships in v0.18.0: report parser, binding helper, signature verifier
-against a caller-supplied VCEK, deterministic mock attester for tests,
-and a `vaara tee parse|verify` CLI. What does NOT ship in v0.18.0: full
-VCEK chain validation against AMD's Key Distribution Service (tracked
-for v0.19+) and the `/dev/sev-guest` ioctl emitter (tracked for v0.19+
-once a tested SEV-SNP guest is available). The hook is marked
-experimental until both land.
+What ships: report parser (report versions 2 to 5), binding helper,
+signature verifier, VCEK (or VLEK) chain validation to AMD's root, a
+live emitter for use inside a SEV-SNP guest (configfs-tsm or the
+`/dev/sev-guest` ioctl), a deterministic mock attester for tests, and
+the `vaara tee parse|verify|emit|fetch-chain` CLI. The chain check pins
+the SHA-256 of AMD's ARK public key for Milan, Genoa and Turin, then
+checks ARK to ASK to VCEK signatures, the VCEK's chip ID and TCB
+against the report, and the report signature, all offline. It passes
+on a report from real Milan hardware with the VCEK AMD issued for it
+(`tests/fixtures/sev_snp_milan`). The emitter follows the Linux UAPI
+and kernel sources but has not been run inside a SEV-SNP guest by this
+project, which is why the hook stays marked experimental.
 
 ## OVERT 1.0 Part 3 (Agentic AI Controls) mapping
 
@@ -477,13 +576,25 @@ correspondence.
 - **TOOL-1.1** (intercept all tool calls before execution) - ✅.
   `InterceptionPipeline.intercept()` is the enforcement boundary. No
   tool call proceeds without a governance decision.
-- **TOOL-1.2** (evaluate against capability policy) - ✅. The policy
-  DSL declares permitted tools, parameter ranges, destinations, and
-  approval gates. `policy.evaluate` returns the verdict carried in
-  the per-call receipt.
+- **TOOL-1.2** (evaluate against capability policy) - ✅. Every
+  `tools/call` through `vaara-mcp-proxy` meets four gates in order:
+  the operator allow/deny lists (permitted tools), the Layer-1 deny
+  rules, which run over every string argument and so refuse named
+  destinations, paths and commands, the tool's own `inputSchema`
+  (parameter types and ranges, see TOOL-2.2), and `intercept()`,
+  whose policy thresholds and escalation routes are the approval
+  gates. The decision, and the list of gates that ran, is carried in
+  the per-call record.
 - **TOOL-1.3** (denial receipt with policy reference and violation
-  type) - ✅. Denials emit a `DENY` event on the hash chain with
-  policy id and violation reason.
+  type) - ✅. Every deny the pipeline, the deny-rule hook and the MCP
+  proxy write lands on the hash chain as `action_blocked` with
+  `policy_id` (the rule, the scorer, `capability_attenuation`,
+  `delegatee_binding`, `operator_perimeter` or `upstream_input_schema`) and
+  `violation_type` (`policy_rule`, `risk_threshold`,
+  `privilege_attenuation`, `delegation_binding`, `invalid_decision`,
+  `scorer_failure`, `perimeter_filter`, `parameter_schema`)
+  alongside the reason. A custom scorer can name its own policy and
+  violation type.
 - **TOOL-1.4** (provisional receipt before execution, upgrade to full
   attestation after notary validation) - ✅ structurally at AAL-3,
   with the AAL-3 to AAL-4 path now implementable in-tree. The Article
@@ -498,10 +609,20 @@ correspondence.
   attestation) - ✅. Policy hash flows into `encoder_binary_identity`
   in the Base Envelope (v0.11.0).
 - **TOOL-2.2** (parameter schema validation before execution) - ✅
-  for declared parameter shapes. ◐ for arbitrary deep schemas (the
-  policy DSL is intentionally bounded).
+  for declared parameter shapes. The proxy keeps each tool's
+  `inputSchema` from `tools/list` and checks a `tools/call` against
+  it before the call is scored or forwarded: `type`, `required`,
+  `properties`, `additionalProperties`, `enum`, `const`, numeric
+  bounds, string length and `pattern`, array `items` and length. ◐
+  for composed schemas: `anyOf`, `oneOf`, `allOf`, `not` and `$ref`
+  are not evaluated, and the record says so (gate
+  `parameter_schema:pass_partial:<keywords>`).
 - **TOOL-2.3** (rejection receipt with parameter violation detail) -
-  ✅.
+  ✅. A refused call lands on the chain as `action_blocked` with
+  `policy_id` `upstream_input_schema`, `violation_type`
+  `parameter_schema`, and a reason naming each failing parameter
+  (for example `count: 50 is above the maximum 10`). The client gets
+  the same list as `violations`.
 - **TOOL-3.1** (per-tool rate limits with attested enforcement) - ◐.
   The adaptive scorer applies velocity-aware risk signals. Explicit
   per-tool calls-per-epoch counters are not yet emitted as
@@ -528,28 +649,43 @@ correspondence.
 
 ### Section 11.5 - MCP Server Trust Governance
 
-Vaara ships an MCP server (`vaara.integrations.mcp_server`) that
-exposes governance tools to MCP clients. It does not currently act
-as an MCP *client* governing tools hosted on third-party MCP
-servers. The MCP-1/2/3 control set therefore applies to Vaara only
-in the **custom (operator-hosted)** mode (MCP-2): the operator runs
-the Vaara MCP server in their own environment.
+Vaara governs MCP servers it does not run. `vaara-mcp-proxy`
+(`vaara.integrations.mcp_proxy`) sits between an MCP client (Claude
+Code, Cursor, any MCP host) and one or more upstream MCP servers,
+reached over stdio (`--upstream`) or Streamable HTTP
+(`--upstream-url`), whoever operates them. A `tools/call` meets the
+operator allow/deny lists, then the Layer-1 deny rules, then
+`intercept()`, and reaches the upstream only when all three allow it.
+`resources/read` and `prompts/get` are gated by the operator allow/deny
+lists. Every one of these accesses lands on the chain, whether it was
+allowed, filtered or denied, and the `tools/list`,
+`resources/list` and `prompts/list` responses are filtered against the
+same lists before the client sees them. Vaara also ships its own MCP
+server (`vaara.integrations.mcp_server`) that exposes governance tools
+to MCP clients.
 
-- **MCP-2.1** (server binary identity in co-epoch binding) - ◐ at
-  v0.12.0: arbiter binary identity is captured in
-  `encoder_binary_identity`. A dedicated MCP-server binary identity
-  field is future work.
+- **MCP-2.1** (server binary identity in co-epoch binding) - ◐. The
+  arbiter binary identity, the perimeter configuration and the
+  `--policy` file hash are bound into `encoder_binary_identity` on
+  every OVERT receipt. The upstream server's own binary identity is
+  not measured.
 - **MCP-2.2** (network topology attestation) - ◯. Deployer concern.
   Vaara does not measure its own network position.
 - **MCP-2.3** (per-call authorization at the MCP server boundary) -
-  ✅. Every MCP tool invocation passes through `intercept()`.
+  ✅. Every `tools/call` through the proxy is decided there by the
+  operator lists, the deny rules and `intercept()`, for any upstream
+  server, and each decision is recorded on the chain.
 - **MCP-2.4** (configuration change detection within an epoch) - ◯.
-  Future work.
+  A change to Vaara's own perimeter or policy changes the hash in
+  `encoder_binary_identity`, so it shows between receipt batches. A
+  change on the upstream server, such as a tool definition that
+  changes mid-epoch, is not detected.
 - **MCP-1** and **MCP-3** (managed-vendor and external-third-party
-  MCP servers) - outside Vaara's current surface. An operator using
-  Vaara as the *governor in front of* a third-party MCP server would
-  need adapter work. The architecture admits it but no implementation
-  ships today.
+  MCP servers) - ◐. The proxy governs these the same way as MCP-2:
+  per-call authorization, deny rules, perimeter filtering and the
+  audit record apply to any upstream it fronts. What is missing is
+  the same as MCP-2.1 and MCP-2.4: no identity measurement or change
+  detection of the upstream server itself.
 
 ### Section 12 - Multi-Agent System Controls
 
@@ -601,10 +737,13 @@ the Vaara MCP server in their own environment.
 - **SESS-1..5** (session-scoped attestation) - ◯.
 - **STATE-1, STATE-2** (durable state sealing and prompt artifact
   binding) - ◯.
-- **IDENT-1** (federated identity / token provenance chain) - ◐.
-  `vaara.auth` accepts authenticated caller identity into the audit
-  record. Full delegation-chain attestation per IDENT-1.2 is future
-  work.
+- **IDENT-1** (federated identity / token provenance chain) - ◯.
+  The HTTP surfaces (`vaara serve`, `vaara-mcp-proxy` over HTTP, the
+  MCP server) authenticate a caller with one shared bearer key, which
+  admits the caller and names nobody. The identity on a record is the
+  `agent_id` the client asserts. There is no per-caller key or role
+  store, so no authenticated identity reaches a record. Delegation-chain
+  attestation per IDENT-1.2 is future work.
 
 ### Section 16 - Behavioural Drift Governance
 
@@ -656,23 +795,24 @@ scope of strict product-liability rules. Member State transposition
 deadline is **9 December 2026** (Article 22). The provisions that
 matter for runtime evidence:
 
-- **Article 9 (Burden of proof, rebuttable presumptions).** A
-  national court SHALL presume the defectiveness of a product, or
-  the causal link between defectiveness and damage, where the
-  claimant faces excessive difficulties proving the technical
-  facts - in particular due to the technical complexity of the
-  product (Article 9(4)). The defendant rebuts the presumption by
-  showing the product was not defective.
-- **Article 7 (Defectiveness assessment).** Defectiveness is
-  assessed having regard to, among other factors, the effect on
-  the product of any ability to continue to learn or acquire new
-  features after deployment, the foreseeable use, and the specific
-  requirements of safety regulation applicable to the product.
-- **Article 8 (Disclosure of evidence).** Where a claimant
-  presents facts and evidence sufficient to support plausibility,
-  national courts may order disclosure of relevant evidence held by
-  the defendant. Failure to disclose triggers an Article 9
-  presumption.
+- **Article 7 (Defectiveness).** Defectiveness is assessed having
+  regard to, among other factors, the effect on the product of any
+  ability to continue to learn or acquire new features after
+  deployment, the foreseeable use, and the specific requirements of
+  safety regulation applicable to the product.
+- **Article 9 (Disclosure of evidence).** Where a claimant presents
+  facts and evidence sufficient to support the plausibility of the
+  claim, national courts may order the defendant to disclose relevant
+  evidence at its disposal, in an accessible and easily understandable
+  form.
+- **Article 10 (Burden of proof).** Defectiveness is presumed where
+  the defendant fails to disclose relevant evidence under Article 9
+  (Article 10(2)(a)). A court also presumes defectiveness, or the
+  causal link between defect and damage, where the claimant faces
+  excessive difficulties proving the technical facts, in particular
+  because of the product's technical or scientific complexity
+  (Article 10(4)). The defendant may rebut any of these presumptions
+  (Article 10(5)).
 
 How Vaara fits:
 
@@ -681,7 +821,7 @@ How Vaara fits:
   report`), and the OVERT 1.0 Base Envelope + S3P attestations
   together constitute the **technical record of foreseeable use,
   governance decisions, and risk signal evolution** that a defendant
-  needs to rebut the Article 9 presumption.
+  needs to rebut the Article 10 presumptions, and the record it discloses under Article 9.
 - The hash-chain integrity, Ed25519 signatures, and Article 12
   receipt pair give the evidence the tamper-evident shape that
   national courts will expect from contemporaneous records.
@@ -692,7 +832,7 @@ How Vaara fits:
 
 This is forward-looking documentation: transposition statutes will
 land between now and 2026-12-09 and the exact procedural shape of
-Article 9 presumptions will be a Member State implementation detail.
+Article 10 presumptions will be a Member State implementation detail.
 The intent of this section is to mark Vaara's evidence surface as
 **designed to be usable** under the Directive, not to claim
 sufficiency in advance of any specific transposition.
@@ -770,44 +910,99 @@ vaara trail verify \
 Properties the hash chain guarantees:
 
 - **Append-only.** Events are chained by SHA-256. Any mutation of a
-  prior event changes every downstream hash.
+  prior event changes every downstream hash. Deleting the newest events
+  is caught by the chain head the store records with each write.
 - **Tamper-evident.** `vaara trail verify` detects chain breaks,
   signature mismatches, and manifest divergence.
 - **Regulator-portable.** The handoff zip is self-contained. The
   regulator verifies against the deployer's public key without needing
   live access to the Vaara instance.
 
-Two things the chain does not give you, which are the deployer's
+Three things the chain does not give you, which are the deployer's
 problem:
 
 - **Content authenticity of the inputs.** Vaara records what the agent
   submitted. It does not attest that the tool arguments were not
   tampered with before reaching Vaara. Run Vaara inside a trust
   boundary you control.
-- **Retention policy.** Article 12(2) allows log retention periods set
-  in accordance with the intended purpose and applicable law. The
-  deployer picks the period. Vaara enforces it via
+- **Protection from someone who can write the database file.** The
+  hashes are unkeyed and the recorded head sits in the same file, so a
+  writer who recomputes the chain and rewrites the head leaves a trail
+  that verifies. The signed decision receipts beside the trail are the
+  check against that: `vaara receipt verify-decision --db PATH` fails
+  every receipt whose record is no longer in the trail. On an agent
+  host, the deny rules keep the governed agent away from the trail,
+  the receipts and the signing key.
+- **Retention policy.** Articles 19(1) (providers) and 26(6)
+  (deployers) require logs to be kept for a period appropriate to the
+  intended purpose, at least six months unless other Union or national
+  law provides otherwise. The deployer picks the period. Vaara enforces it via
   `vaara trail purge --db PATH --retention-days N --all-tenants` (or
   `SQLiteAuditBackend.purge_older_than(seconds)` from Python). The
   tenant selector is required, not optional: pass `--tenant ID` to purge
   one tenant's records, `--all-tenants` to purge across the whole DB. A
-  `--dry-run` flag reports the count without modifying the DB.
+  `--dry-run` flag reports the count without modifying the DB. The
+  purge deletes with `secure_delete` on and truncates the WAL, so the
+  purged bytes leave the database file and the `-wal` file. If another
+  process holds the trail open the WAL cannot be truncated: the command
+  says so on stderr and the bytes stay in the `-wal` file until the next
+  checkpoint. The purge reaches the trail only. Decision receipt files
+  and the review queue database are separate files it does not touch.
+  The review queue keeps its own copy of the call's parameters, context
+  and reason, and the reviewers' names and justification, so it has its
+  own command: `vaara review purge --db QUEUE.db --older-than-days N`
+  (or `ReviewQueue.purge_older_than(seconds)`) deletes resolved and
+  expired items whose case closed more than N days ago, with the same
+  `secure_delete` and WAL truncate. Pending and claimed items stay
+  whatever their age, because a decision is still owed on them; the
+  command counts them on stderr, and `vaara review expire` closes the
+  pending ones so a later purge can remove them. The resolution itself
+  stays in the trail as `ESCALATION_RESOLVED`.
 
-  **Hash-chain seam at the retention boundary.** Surviving records
-  still reference deleted predecessors via `previous_hash`, so
-  `vaara trail verify` will report a chain break at the boundary.
-  Intended workflow: export a signed handoff zip BEFORE purging,
-  archive the zip externally for long-tail audit history, then purge
-  the live DB. The signed zip remains self-consistent forever. The
-  live DB chain has a documented seam at the retention boundary.
+  **The retention boundary.** `vaara trail rotate --db PATH --out
+  ARCHIVE.zip --key KEY --retention-days N --all-tenants` is the
+  supported workflow. It exports the whole trail as a signed zip,
+  re-verifies the zip from its own bytes, appends a signed
+  `trail_rotated` record to the trail, and only then purges the records
+  older than the window. The purge takes the unbroken prefix of the
+  chain: a record written later with an old timestamp stays until the
+  next rotation. The `trail_rotated` record is newer than the cut-off, so
+  it outlives the purge. It names the hash the first surviving record
+  links to, how many records went, and the archive's SHA-256, record
+  count and kind (`zip` or `sealed`), and it is signed with the key that
+  signs the archive (`vaara.trail-rotation/v1`, Ed25519). If the store
+  refuses the record, nothing is purged.
+
+  `vaara trail verify` accepts an export of the rotated trail when the
+  export holds that record and its signature checks out, and prints
+  `begins at a rotation seam: N records archived as <sha256>`. Pass
+  `--archive PATH` and it also checks the archive: the digest must match,
+  a zip must verify and hold the stated number of records and the record
+  the trail links to, and a sealed archive is checked by its digest alone.
+  A first record that links to nothing the trail holds is still a chain
+  break. That is what `vaara trail purge` on its own leaves, because it
+  deletes without a record of what it removed. The seam does not prove
+  that the archive still exists or is complete beyond what `--archive`
+  checks, and whoever holds the signing key can write a record for
+  records they dropped, so pin the key with `--pubkey`. Rotation can run
+  again on the rotated trail; each run appends its own record. With
+  `--tenant ID` the record is written into that tenant's chain, so the tenant's
+  records must form a chain of their own; rotation refuses, and purges nothing,
+  when another tenant's records are interleaved in the same chain.
 
 ## Current limits
 
 Honest about the edges:
 
-- The DORA bundle ships today but the EU AI Act bundle is the
-  better-calibrated one. DORA mapping will be refined in the 0.5.x
-  series with input from deployers in scope.
+- The DORA bundle is three requirements (Articles 9(1), 10(1), 13(1))
+  against the EU AI Act bundle's fourteen. It covers the runtime
+  evidence Vaara records, not DORA's incident classification and
+  reporting chapter.
+- The SOC 2 bundle is six common criteria (CC6.1, CC6.2, CC6.3, CC7.2,
+  CC7.3, CC8.1). It covers what the agent did under the gate. The
+  availability, processing integrity, confidentiality and privacy
+  categories, and the entity-level criteria (CC1 to CC5), are outside
+  what a runtime record can show.
 - `min_evidence_count` thresholds on the default requirements are
   conservative starting points. For production, tune them against your
   own traffic volume and risk tolerance through `ComplianceEngine.

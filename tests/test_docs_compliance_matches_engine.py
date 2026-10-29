@@ -32,7 +32,8 @@ DOC = Path(__file__).resolve().parent.parent / "docs" / "COMPLIANCE.md"
 # exactly one section rather than the whole file.
 _SECTIONS = {
     "EU_AI_ACT": ("## EU AI Act Article Mapping", "## EU AI Act Annex IV"),
-    "DORA": ("## DORA Article Mapping", "## Cloud guardrail adapter pattern"),
+    "DORA": ("## DORA Article Mapping", "## SOC 2 Trust Services Criteria mapping"),
+    "SOC2": ("## SOC 2 Trust Services Criteria mapping", "## Cloud guardrail adapter pattern"),
 }
 
 
@@ -82,7 +83,9 @@ def test_critical_requirements_are_all_documented():
         for r in ComplianceEngine().requirements
         if r.is_critical
     }
-    documented = _table_articles("EU_AI_ACT") | _table_articles("DORA")
+    documented = (
+        _table_articles("EU_AI_ACT") | _table_articles("DORA") | _table_articles("SOC2")
+    )
     assert critical <= documented, sorted(critical - documented)
 
 
@@ -103,8 +106,13 @@ _EXTERNAL_EVIDENCE_ROWS = {"11(1)"}
 #: be read one at a time or DORA silently overwrites the EU AI Act row.
 _VERDICTS_SECTIONS = {
     "EU_AI_ACT": ("## EU AI Act per-article thresholds", "## DORA per-article thresholds"),
-    "DORA": ("## DORA per-article thresholds", "## What an auditor sees"),
+    "DORA": ("## DORA per-article thresholds", "## SOC 2 per-criterion thresholds"),
+    "SOC2": ("## SOC 2 per-criterion thresholds", "## What an auditor sees"),
 }
+
+#: The first column of a threshold row: an article "12(1)" / "9(2)(a)" or a
+#: SOC 2 criterion "CC6.1".
+_ROW_LABEL = r"\d+\(\d+\)(\([a-z]\))?|CC\d\.\d"
 
 
 def _verdicts_threshold_rows(domain: str = "EU_AI_ACT") -> dict[str, tuple[int, float]]:
@@ -116,7 +124,7 @@ def _verdicts_threshold_rows(domain: str = "EU_AI_ACT") -> dict[str, tuple[int, 
     rows: dict[str, tuple[int, float]] = {}
     for line in text.splitlines():
         cells = [cell.strip() for cell in line.split("|")[1:-1]]
-        if len(cells) != 7 or not re.fullmatch(r"\d+\(\d+\)(\([a-z]\))?", cells[0]):
+        if len(cells) != 7 or not re.fullmatch(_ROW_LABEL, cells[0]):
             continue
         if cells[0] in _EXTERNAL_EVIDENCE_ROWS:
             continue
@@ -178,7 +186,7 @@ def test_verdicts_strong_columns_are_twice_the_minimum():
     text = VERDICTS_DOC.read_text(encoding="utf-8")
     for line in text.splitlines():
         cells = [cell.strip() for cell in line.split("|")[1:-1]]
-        if len(cells) != 7 or not re.fullmatch(r"\d+\(\d+\)(\([a-z]\))?", cells[0]):
+        if len(cells) != 7 or not re.fullmatch(_ROW_LABEL, cells[0]):
             continue
         if cells[0] in _EXTERNAL_EVIDENCE_ROWS:
             continue
@@ -196,7 +204,7 @@ def test_verdicts_strong_columns_are_twice_the_minimum():
 
 def _documented_enum_values(enum_name: str) -> set[str]:
     """Values COMPLIANCE.md lists in the table under `enum_name`."""
-    text = DOC.read_text()
+    text = DOC.read_text(encoding="utf-8")
     header = re.search(rf"\|\s*`{enum_name}`\s*\|[^\n]*\n\|[-\s|]+\n", text)
     assert header, f"no table found for {enum_name} in docs/COMPLIANCE.md"
     values = set()

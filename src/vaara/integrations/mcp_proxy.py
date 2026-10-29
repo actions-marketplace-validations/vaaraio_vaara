@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import contextvars
+import hashlib
 import hmac
 import json
 import logging
@@ -37,11 +38,20 @@ import shlex
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from vaara import __version__ as _VAARA_VERSION
+from vaara.attestation._receipt_task import related_task_id as _related_task_id
+from vaara._sanitize import log_safe
+from vaara.audit.decision_receipts import default_sink
 from vaara.audit.sqlite_backend import SQLiteAuditBackend
 from vaara.audit.trail import AuditTrail
+from vaara.integrations._mcp_beacon import Beacon
+from vaara.integrations._record_before_effect import RecordGate, refusal
+from vaara.integrations._mcp_input_schema import (
+    check_arguments,
+    unchecked_keywords,
+)
 from vaara.integrations._mcp_notify import (
     HttpRouter,
     NotificationRouter,
@@ -66,6 +76,7 @@ from vaara.integrations._mcp_overt import (
 from vaara.integrations._mcp_upstream import (
     ProxyError, UpstreamClient, UpstreamMCPClient, strict_json_dumps,
 )
+from vaara.integrations._mcp_tool_surface import ToolSurfaceTracker
 from vaara.integrations._mcp_upstream_http import HttpUpstreamClient
 from vaara.pipeline import InterceptionPipeline
 from vaara.taxonomy.actions import ActionRequest
@@ -105,17 +116,32 @@ _REQUEST_INTENT: contextvars.ContextVar[str] = contextvars.ContextVar(
     "vaara_mcp_intent", default="",
 )
 
-def _safe_log(value: Any, max_len: int = 200) -> str:
-    """Sanitise a user-supplied string for safe logging.
+_safe_log = log_safe
 
-    Strips CR/LF and other control characters so an attacker who controls
-    a tool / resource / prompt name can't inject fake log lines, and caps
-    length so a multi-megabyte name doesn't blow the log up.
-    """
-    if not isinstance(value, str):
-        value = str(value)
-    cleaned = "".join(c if c.isprintable() and c not in ("\r", "\n") else "?" for c in value)
-    return cleaned[:max_len]
+
+def _json_type_name(value: Any) -> str:
+    """The JSON type of a decoded value, for refusal reasons."""
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if value is None:
+        return "null"
+    return "object" if isinstance(value, dict) else type(value).__name__
+
+
+def _outcome_state(exc: BaseException) -> str:
+    """The trail state an upstream exception names; unclassified is unobserved."""
+    return getattr(exc, "outcome_state", "unobserved")
+
+
+def _outcome_description(status: str, **fields: Any) -> str:
+    """The outcome description: one JSON object, so a reader can parse it."""
+    return json.dumps({"status": status, **fields}, sort_keys=True)
 
 
 # Largest single MCP JSON-RPC message accepted on the /mcp HTTP endpoint.
@@ -238,7 +264,43 @@ class VaaraMCPProxy:
         shadow: bool = False,
         api_key: Optional[str] = None,
         allowed_origins: Optional[set[str]] = None,
+        deny_rules: Optional[list[dict]] = None,
+        tool_surface_state: Optional[Path] = None,
+        tool_surface_hold: bool = False,
+        tool_surface_accept: bool = False,
+        value_origin: bool = False,
+        value_origin_strict: bool = False,
+        trusted_values: Optional[list[str]] = None,
+        authority_args: Optional[dict[str, list[str]]] = None,
+        value_origin_store: Optional[Any] = None,
+        fail_open: bool = False,
     ) -> None:
+        # A call whose decision record did not reach the audit store is not
+        # forwarded, unless this is set. Shadow mode never refuses.
+        self._fail_open = bool(fail_open)
+        self._record_gate = RecordGate()
+        # Value origin (vaara.scorer.value_origin). Off unless asked for.
+        # When on, recipient, payee and endpoint values in tools/call and
+        # resources/read results are remembered, and a later call that puts
+        # one of them into an authority argument is held for a human. The
+        # store is the one the Claude Code hook uses, so a value the user
+        # typed there is known here too. Strict passes only trusted values.
+        self._value_origin = bool(value_origin or value_origin_strict)
+        self._value_origin_strict = bool(value_origin_strict)
+        self._trusted_values: list[str] = list(trusted_values or [])
+        self._authority_args = dict(authority_args) if authority_args else None
+        self._origin_store = value_origin_store
+        # Layer-1 deny rules, shared with the Claude Code hook. Loaded from
+        # the bundled file unless the caller passes a list; an empty list
+        # switches the layer off, and VAARA_MCP_DENY_RULES=0 does the same
+        # from the environment.
+        if deny_rules is None:
+            if os.environ.get("VAARA_MCP_DENY_RULES", "1").strip().lower() in ("0", "false", "no", "off"):
+                deny_rules = []
+            else:
+                from vaara.deny_rules import load_deny_rules
+                deny_rules = load_deny_rules()
+        self._deny_rules: list[dict] = list(deny_rules)
         # Browser origins permitted on the Streamable HTTP transport. Empty by
         # default, which refuses every request that carries an Origin header at
         # all. Native MCP clients send none, so the default costs them nothing;
@@ -264,6 +326,12 @@ class VaaraMCPProxy:
             db = db_path or Path(os.environ.get("VAARA_DB", "vaara_audit.db"))
             self._backend = SQLiteAuditBackend(db)
             trail = AuditTrail(on_record=self._backend.write_record)
+            # The receipt sink load_trail wires; without it decisions reached
+            # the database with no signed receipt beside them. The trail is
+            # not loaded whole: on a long trail that costs seconds and
+            # hundreds of megabytes per proxy, and the store chains appends
+            # from its own head.
+            trail._receipt_sink = default_sink(db)
             self._pipeline = InterceptionPipeline(trail=trail, enforce=not shadow)
         if policy is not None:
             # Same rebinding `vaara serve` does: thresholds and sequence
@@ -327,6 +395,14 @@ class VaaraMCPProxy:
         # correctly. Request-id ownership is the only stable identifier.
         self._inflight_requests: dict[Any, str] = {}
         self._inflight_lock = threading.Lock()
+        # Each tool's inputSchema as the client saw it in tools/list, keyed
+        # by the upstream that advertised it and the client-facing tool name.
+        # tools/call is checked against it. The upstream is part of the key
+        # because two upstreams in a fan-out can each expose a tool of the
+        # same name with a different shape, and a call is routed to one of
+        # them.
+        self._tool_schemas: dict[tuple[str, str], Any] = {}
+        self._tool_schemas_lock = threading.Lock()
         # v0.40 fan-out: hold N upstream MCP servers in a name -> client map.
         # The single-upstream legacy entry point (positional ``upstream_command``)
         # lands under the "default" name. ``--upstream NAME=CMD`` via CLI or
@@ -376,16 +452,16 @@ class VaaraMCPProxy:
             # cloning the transport so we never open a duplicate connection.
             default_alias_target = sorted(all_names)[0]
         # Wrap on_notification per upstream so the reader/listener callback
-        # carries the upstream's name. Default-arg ``n=name`` binds the loop
-        # variable at definition, avoiding the late-binding bug that would
-        # otherwise pin every upstream to the last name iterated.
+        # carries the upstream's name. ``_notifier`` binds the name at the
+        # call, avoiding the late-binding bug that would otherwise pin every
+        # upstream to the last name iterated.
+        # Set by run(): only a stdio session has a parent process to name.
+        self._beacon: Optional[Beacon] = None
         self._upstreams: dict[str, UpstreamClient] = {}
         for name, command in upstream_map.items():
             self._upstreams[name] = UpstreamMCPClient(
                 command=command,
-                on_notification=(
-                    lambda msg, n=name: self._on_upstream_notification(n, msg)
-                ),
+                on_notification=self._notifier(name),
             )
         for name, url in url_map.items():
             # SSRF egress floor defaults SAFE; allow_private_upstream_hosts (or
@@ -394,13 +470,35 @@ class VaaraMCPProxy:
             self._upstreams[name] = HttpUpstreamClient(
                 url=url,
                 headers=header_map.get(name),
-                on_notification=(
-                    lambda msg, n=name: self._on_upstream_notification(n, msg)
-                ),
+                on_notification=self._notifier(name),
                 allow_private_hosts=allow_private_upstream_hosts,
             )
         if default_alias_target is not None:
             self._upstreams["default"] = self._upstreams[default_alias_target]
+        # The tool surface each upstream presents, digested on every complete
+        # tools/list. An upstream is identified across sessions by its slot
+        # name plus a hash of its command or URL, so the same slot name
+        # pointed at a different server is a different baseline.
+        identity: dict[str, str] = {
+            name: "cmd:" + hashlib.sha256(shlex.join(cmd).encode("utf-8")).hexdigest()
+            for name, cmd in upstream_map.items()
+        }
+        identity.update({
+            name: "url:" + hashlib.sha256(url.encode("utf-8")).hexdigest()
+            for name, url in url_map.items()
+        })
+        if default_alias_target is not None:
+            identity["default"] = identity[default_alias_target]
+        self._tool_surface = ToolSurfaceTracker(
+            state_path=tool_surface_state,
+            upstream_identity=identity,
+            hold=tool_surface_hold,
+            accept=tool_surface_accept,
+        )
+        # Pages of a paginated tools/list collected per upstream until the
+        # page without a nextCursor arrives. Only a complete list is digested.
+        self._tool_pages: dict[str, list] = {}
+        self._tool_pages_lock = threading.Lock()
         # ``self._upstream`` resolves to the per-request upstream via the
         # ``_REQUEST_UPSTREAM`` ContextVar. stdio transport leaves the
         # default ("default") in place, so existing single-upstream callers
@@ -448,6 +546,17 @@ class VaaraMCPProxy:
             return True
         return False
 
+    def _deny_rule_match(self, arguments: dict) -> Optional[tuple[str, str]]:
+        if not self._deny_rules:
+            return None
+        from vaara.deny_rules import match_deny_rule_any_field
+
+        try:
+            return match_deny_rule_any_field(self._deny_rules, arguments)
+        except Exception as exc:  # a broken rule must not take the proxy down
+            logger.warning("deny rules failed (%r); skipping layer 1", exc)
+            return None
+
     def _tool_filtered(self, name: str) -> bool:
         return self._is_filtered(name, self._allowlist, self._denylist)
 
@@ -460,6 +569,7 @@ class VaaraMCPProxy:
     def run(self) -> None:
         """Read JSON-RPC from stdin, write to stdout, route through upstream."""
         logger.info("Vaara MCP proxy starting on stdio (%s)", self.PROXY_NAME)
+        self._beacon = Beacon("vaara-mcp-proxy")
         for line in sys.stdin:
             line = line.strip()
             if not line:
@@ -485,6 +595,7 @@ class VaaraMCPProxy:
                 )
             if response is not None:
                 self._write_to_client(response)
+        self._beacon.wait()
 
     def _build_http_app(self):
         """Construct the FastAPI app that backs the Streamable HTTP transport.
@@ -1073,6 +1184,8 @@ class VaaraMCPProxy:
             return self._error_response(
                 req_id, -32600, "Invalid Request: 'method' must be a string",
             )
+        if method == "initialize" and self._beacon is not None:
+            self._beacon.on_initialize(request.get("params"))
         if method == "tools/call":
             try:
                 return self._handle_tools_call(request)
@@ -1135,6 +1248,7 @@ class VaaraMCPProxy:
                 parameters=_passthrough_params(request),
                 decision="allow",
                 reason="method not modelled by the proxy; forwarded and recorded",
+                enforcement="recorded_only",
             )
         try:
             return self._upstream.request(request)
@@ -1145,11 +1259,128 @@ class VaaraMCPProxy:
         response = self._handle_list(
             request, "tools", "name", self._allowlist, self._denylist,
         )
-        if self._attest is not None:
-            self._attest.update_manifest_fingerprint(
-                _REQUEST_UPSTREAM.get(), response
-            )
+        result = response.get("result") if isinstance(response, dict) else None
+        tools = result.get("tools") if isinstance(result, dict) else None
+        if isinstance(tools, list):
+            upstream_name = _REQUEST_UPSTREAM.get()
+            with self._tool_schemas_lock:
+                for tool in tools:
+                    if isinstance(tool, dict) and isinstance(tool.get("name"), str):
+                        key = (upstream_name, tool["name"])
+                        schema = tool.get("inputSchema")
+                        if isinstance(schema, dict):
+                            self._tool_schemas[key] = schema
+                        else:
+                            self._tool_schemas.pop(key, None)
+            params = request.get("params")
+            first_page = not (isinstance(params, dict) and params.get("cursor"))
+            with self._tool_pages_lock:
+                pages = [] if first_page else self._tool_pages.get(upstream_name, [])
+                pages = [*pages, *tools]
+                complete: Optional[list] = None
+                if isinstance(result, dict) and result.get("nextCursor"):
+                    self._tool_pages[upstream_name] = pages
+                else:
+                    self._tool_pages.pop(upstream_name, None)
+                    complete = pages
+            if complete is not None:
+                self._observe_tool_surface(upstream_name, complete, trigger="tools/list")
         return response
+
+    def _observe_tool_surface(
+        self, upstream_name: str, tools: list, *, trigger: str,
+    ) -> None:
+        """Digest a complete tool list, rebind receipts to it, record a change.
+
+        Receipts written after this point name the surface just seen. A
+        surface that differs from the baseline writes a
+        ``mcp.tool_surface_changed`` record naming the tools added, removed
+        and changed (and in which fields), with the old and new manifest
+        digests, which are the values receipts carry as serverFingerprint.
+        """
+        try:
+            digest, change = self._tool_surface.observe(upstream_name, tools)
+        except Exception:
+            logger.exception("Tool-surface digest failed for upstream %r", upstream_name)
+            return
+        if self._attest is not None:
+            self._attest.set_manifest_fingerprint(upstream_name, digest)
+        if change is None:
+            return
+        record = {**change.to_record(), "trigger": trigger}
+        if change.accepted:
+            reason = "upstream tool surface changed; baseline updated"
+        else:
+            reason = (
+                "upstream tool surface changed; calls to "
+                + ", ".join(change.held) + " held until the operator accepts"
+            )
+        logger.warning(
+            "Tool surface of upstream %r changed: +%s -%s ~%s%s",
+            upstream_name, change.added, change.removed, sorted(change.changed),
+            f" (held: {change.held})" if change.held else "",
+        )
+        self._record_perimeter_audit(
+            agent_id=self._agent_id_default,
+            tool_name="mcp.tool_surface_changed",
+            parameters=record,
+            decision="allow",
+            reason=reason,
+            policy_id="tool_surface",
+            violation_type="tool_surface_changed",
+            enforcement="recorded_only",
+        )
+        self._overt_emit(
+            surface="mcp.tool_surface",
+            identifier=upstream_name,
+            identifier_field="upstream",
+            request_obj=record,
+            decision="CHANGED",
+            reason=reason,
+        )
+
+    def _refresh_tool_surface(self, upstream_name: str) -> None:
+        """Fetch an upstream's full tool list after it says the list changed.
+
+        Runs on its own thread: the notification arrives on the upstream
+        reader thread, and a request from there would wait on itself. The
+        client usually lists again too; that second sighting digests the same
+        surface and records nothing new.
+        """
+        client = self._upstreams.get(upstream_name)
+        if client is None:
+            return
+        tools: list = []
+        cursor: Optional[str] = None
+        try:
+            for _ in range(100):
+                req: dict = {
+                    "jsonrpc": "2.0",
+                    "id": f"vaara-tool-surface-{os.urandom(6).hex()}",
+                    "method": "tools/list",
+                }
+                if cursor:
+                    req["params"] = {"cursor": cursor}
+                resp = client.request(req)
+                result = resp.get("result") if isinstance(resp, dict) else None
+                if not isinstance(result, dict) or not isinstance(result.get("tools"), list):
+                    return
+                page = result["tools"]
+                tools.extend(
+                    t for t in page
+                    if isinstance(t, dict)
+                    and not self._is_filtered(t.get("name", ""), self._allowlist, self._denylist)
+                )
+                cursor = result.get("nextCursor")
+                if not cursor:
+                    break
+            else:
+                logger.warning("tools/list from %r paged past 100 pages; not digested", upstream_name)
+                return
+        except Exception:
+            logger.exception("Tool-surface refresh failed for upstream %r", upstream_name)
+            return
+        self._observe_tool_surface(upstream_name, tools, trigger="notifications/tools/list_changed")
 
     def _handle_list(
         self,
@@ -1189,23 +1420,57 @@ class VaaraMCPProxy:
         return {**response, "result": new_result}
 
     def _handle_tools_call(self, request: dict) -> dict:
-        params = request.get("params") or {}
-        if not isinstance(params, dict):
+        # MCP declares params and params.arguments objects. Anything else is
+        # refused here, never read as {} and forwarded: the gates would score
+        # an empty call while the server ran the original. Absent or null
+        # arguments stay {} (a tool with no inputs). Refused in shadow mode
+        # too, since there is no faithful call to record as having proceeded.
+        params = request.get("params")
+        if params is None:
             params = {}
+        arguments = params.get("arguments") if isinstance(params, dict) else None
+        if not isinstance(params, dict) or not isinstance(arguments, (dict, type(None))):
+            bad, value = ("params", params) if not isinstance(params, dict) else ("arguments", arguments)
+            tool_name = params.get("name", "") if isinstance(params, dict) else ""
+            if not isinstance(tool_name, str):
+                tool_name = ""
+            reason = f"Invalid params: '{bad}' must be an object, got {_json_type_name(value)}"
+            self._record_perimeter_audit(
+                self._agent_id_default, tool_name, {}, "deny", reason,
+                policy_id="mcp_params_shape",
+                violation_type="invalid_params",
+                enforcement="could_block",
+            )
+            logger.warning("tools/call refused: %s (%s)", reason, _safe_log(tool_name))
+            return self._error_response(request.get("id"), -32602, reason)
         tool_name = params.get("name", "")
-        arguments = params.get("arguments", {}) or {}
-        if not isinstance(arguments, dict):
-            arguments = {}
+        arguments = arguments or {}
+        # Which gates ran, in the order they ran. The sequence here is a
+        # property of the code and was previously only knowable by reading
+        # it: a reader of the record could not tell a gate that passed from
+        # one that never ran. Recording it makes the ordering observable
+        # rather than inferred, and keeps "did not run" distinct from
+        # "ran and allowed".
+        gates: list[str] = []
         if self._tool_filtered(tool_name):
+            gates.append("operator_filter:filtered")
             logger.warning(
                 "tools/call rejected at perimeter (operator filter): %s",
                 _safe_log(tool_name),
+            )
+            self._record_perimeter_audit(
+                self._agent_id_default, tool_name, arguments, "deny",
+                "Tool filtered by operator policy",
+                policy_id="operator_perimeter",
+                violation_type="perimeter_filter",
+                enforcement="could_block",
             )
             block_payload = {
                 "vaara_blocked": True,
                 "reason": "Tool filtered by operator policy",
                 "decision": "FILTERED",
                 "tool": tool_name,
+                "gates": list(gates),
             }
             self._overt_emit(
                 surface="mcp.tool.call",
@@ -1214,7 +1479,7 @@ class VaaraMCPProxy:
                 request_obj={"tool": tool_name, "arguments": arguments},
                 decision="FILTERED",
                 reason="Tool filtered by operator policy",
-                extra={"agent_id": self._agent_id_default},
+                extra={"agent_id": self._agent_id_default, "gates": list(gates)},
             )
             return {
                 "jsonrpc": "2.0", "id": request.get("id"),
@@ -1236,14 +1501,206 @@ class VaaraMCPProxy:
         if isinstance(params, dict) and isinstance(params.get("arguments"), dict):
             params["arguments"].pop("_vaara_agent_id", None)
         agent_id = self._agent_id_default
+        gates.append("operator_filter:pass")
+        # Layer-1 deny rules, the same file the Claude Code hook applies.
+        # An MCP tool is named whatever its server likes, so the rules run
+        # over every string argument rather than by tool name. In shadow
+        # mode a match is recorded and the call proceeds.
+        deny_match = self._deny_rule_match(arguments)
+        if deny_match is not None:
+            rule_id, message = deny_match
+            if self._pipeline._enforce:
+                gates.append(f"deny_rules:deny:{rule_id}")
+                reason = f"Deny rule {rule_id}: {message}"
+                self._record_perimeter_audit(
+                    agent_id, tool_name, arguments, "deny", reason,
+                    policy_id=f"deny_rule:{rule_id}",
+                    violation_type="policy_rule",
+                    enforcement="could_block",
+                )
+                block_payload = {
+                    "vaara_blocked": True,
+                    "reason": reason,
+                    "decision": "DENY",
+                    "rule_id": rule_id,
+                    "tool": tool_name,
+                    "gates": list(gates),
+                }
+                self._overt_emit(
+                    surface="mcp.tool.call",
+                    identifier=tool_name,
+                    identifier_field="tool_name",
+                    request_obj={"tool": tool_name, "arguments": arguments},
+                    decision="DENY",
+                    reason=reason,
+                    extra={"agent_id": agent_id, "rule_id": rule_id, "gates": list(gates)},
+                )
+                return {
+                    "jsonrpc": "2.0", "id": request.get("id"),
+                    "result": {
+                        "content": [{"type": "text", "text": strict_json_dumps(block_payload, indent=2)}],
+                        "isError": True,
+                    },
+                }
+            gates.append(f"deny_rules:shadow:{rule_id}")
+            logger.warning(
+                "SHADOW deny rule %s on %s: %s", rule_id, _safe_log(tool_name), message,
+            )
+        else:
+            gates.append("deny_rules:pass" if self._deny_rules else "deny_rules:off")
+        # Tool-surface hold. A tool whose definition changed, or that appeared,
+        # after the operator's accepted baseline is refused until the operator
+        # accepts the new surface. Off unless the proxy runs with the hold on;
+        # in shadow mode a held call is recorded and proceeds.
+        if not self._tool_surface.hold:
+            gates.append("tool_surface:off")
+        elif self._tool_surface.is_held(_REQUEST_UPSTREAM.get(), tool_name):
+            reason = (
+                f"Tool {tool_name!r} changed or appeared after the accepted tool "
+                "surface; held until the operator accepts it"
+            )
+            if self._pipeline._enforce:
+                gates.append("tool_surface:hold")
+                self._record_perimeter_audit(
+                    agent_id, tool_name, arguments, "deny", reason,
+                    policy_id="tool_surface",
+                    violation_type="tool_surface_hold",
+                    enforcement="could_block",
+                )
+                block_payload = {
+                    "vaara_blocked": True,
+                    "reason": reason,
+                    "decision": "DENY",
+                    "tool": tool_name,
+                    "gates": list(gates),
+                }
+                self._overt_emit(
+                    surface="mcp.tool.call",
+                    identifier=tool_name,
+                    identifier_field="tool_name",
+                    request_obj={"tool": tool_name, "arguments": arguments},
+                    decision="DENY",
+                    reason=reason,
+                    extra={"agent_id": agent_id, "gates": list(gates)},
+                )
+                return {
+                    "jsonrpc": "2.0", "id": request.get("id"),
+                    "result": {
+                        "content": [{"type": "text", "text": strict_json_dumps(block_payload, indent=2)}],
+                        "isError": True,
+                    },
+                }
+            gates.append("tool_surface:shadow")
+            logger.warning("SHADOW tool-surface hold on %s", _safe_log(tool_name))
+        else:
+            gates.append("tool_surface:pass")
+        # The tool's own inputSchema from tools/list. Arguments outside the
+        # declared shape are refused before the call is scored or run, and
+        # the record names the parameter that failed. In shadow mode the
+        # violation is recorded and the call proceeds.
+        with self._tool_schemas_lock:
+            schema = self._tool_schemas.get((_REQUEST_UPSTREAM.get(), tool_name))
+        if schema is None:
+            gates.append("parameter_schema:no_schema")
+        else:
+            violations = check_arguments(arguments, schema)
+            partial = unchecked_keywords(schema)
+            if violations and self._pipeline._enforce:
+                gates.append("parameter_schema:deny")
+                reason = "Arguments outside the tool's inputSchema: " + "; ".join(violations)
+                self._record_perimeter_audit(
+                    agent_id, tool_name, arguments, "deny", reason,
+                    policy_id="upstream_input_schema",
+                    violation_type="parameter_schema",
+                    enforcement="could_block",
+                )
+                block_payload = {
+                    "vaara_blocked": True,
+                    "reason": reason,
+                    "decision": "DENY",
+                    "violations": violations,
+                    "tool": tool_name,
+                    "gates": list(gates),
+                }
+                self._overt_emit(
+                    surface="mcp.tool.call",
+                    identifier=tool_name,
+                    identifier_field="tool_name",
+                    request_obj={"tool": tool_name, "arguments": arguments},
+                    decision="DENY",
+                    reason=reason,
+                    extra={"agent_id": agent_id, "gates": list(gates)},
+                )
+                return {
+                    "jsonrpc": "2.0", "id": request.get("id"),
+                    "result": {
+                        "content": [{"type": "text", "text": strict_json_dumps(block_payload, indent=2)}],
+                        "isError": True,
+                    },
+                }
+            if violations:
+                gates.append("parameter_schema:shadow")
+                # The violations quote argument values; the gate list and the
+                # record carry them, the log only counts them.
+                logger.warning(
+                    "SHADOW inputSchema violation on %s (%d)",
+                    _safe_log(tool_name), len(violations),
+                )
+            elif partial:
+                gates.append("parameter_schema:pass_partial:" + ",".join(partial))
+            else:
+                gates.append("parameter_schema:pass")
+        origin = self._origin_hold(tool_name, arguments, gates)
         # Unknown upstream tool names classify as generic high-risk in the
         # registry (fail-closed). Correct default for runtime governance.
-        result = self._pipeline.intercept(
+        result, unrecorded = self._record_gate.intercept(
+            self._pipeline,
             agent_id=agent_id, tool_name=tool_name, parameters=arguments,
-            tenant_id=_REQUEST_TENANT.get(),
+            tenant_id=_REQUEST_TENANT.get(), value_origin=origin,
         )
+        if unrecorded is not None and result.allowed:
+            # Record before effect: the decision did not reach the store, and
+            # an allowed call would run with nothing on the chain to say so.
+            if self._pipeline._enforce and not self._fail_open:
+                gates.append("record_before_effect:refuse")
+                reason = refusal(self._pipeline, unrecorded, who="this proxy")
+                logger.error("refusing an unrecorded call: %s", unrecorded)
+                block_payload = {
+                    "vaara_blocked": True,
+                    "type": "vaara_trail_not_recording",
+                    "reason": reason,
+                    "decision": "NOT_RECORDED",
+                    "tool": tool_name,
+                    "gates": list(gates),
+                }
+                self._overt_emit(
+                    surface="mcp.tool.call",
+                    identifier=tool_name,
+                    identifier_field="tool_name",
+                    request_obj={"tool": tool_name, "arguments": arguments},
+                    decision="DENY",
+                    reason=reason,
+                    extra={"agent_id": agent_id, "gates": list(gates)},
+                )
+                return {
+                    "jsonrpc": "2.0", "id": request.get("id"),
+                    "result": {
+                        "content": [{"type": "text", "text": strict_json_dumps(block_payload, indent=2)}],
+                        "isError": True,
+                    },
+                }
+            gates.append(
+                "record_before_effect:shadow" if not self._pipeline._enforce
+                else "record_before_effect:fail_open"
+            )
+            logger.error(
+                "forwarding UNRECORDED (%s): %s",
+                "shadow mode" if not self._pipeline._enforce else "--fail-open",
+                unrecorded,
+            )
         progress_token = self._progress_token(params)
         if not result.allowed:
+            gates.append("policy:deny")
             decision = getattr(result, "decision", None) or "DENY"
             reason = getattr(result, "reason", None) or "Blocked by Vaara policy"
             block_payload = {
@@ -1251,6 +1708,7 @@ class VaaraMCPProxy:
                 "reason": reason,
                 "decision": decision,
                 "action_id": getattr(result, "action_id", None),
+                "gates": list(gates),
             }
             self._overt_emit(
                 surface="mcp.tool.call",
@@ -1262,6 +1720,7 @@ class VaaraMCPProxy:
                 extra={
                     "agent_id": agent_id,
                     "action_id": getattr(result, "action_id", None) or "",
+                    "gates": list(gates),
                 },
             )
             return {
@@ -1271,6 +1730,7 @@ class VaaraMCPProxy:
                     "isError": True,
                 },
             }
+        gates.append("policy:allow")
         request_id = request.get("id")
         upstream_name = _REQUEST_UPSTREAM.get()
         attest_pair = None
@@ -1304,19 +1764,18 @@ class VaaraMCPProxy:
                         upstream_name=upstream_name,
                         tenant_id=_REQUEST_TENANT.get(),
                     )
-        if (
-            self._mint_credentials
-            and self._attest is not None
-            and self._attest.gateway is not None
-            and self._attest.is_constrained(tool_name)
-        ):
+        attest = self._attest
+        gateway = attest.gateway if attest is not None and self._mint_credentials else None
+        _gateway_present = gateway is not None
+        if attest is not None and gateway is not None and attest.is_constrained(tool_name):
             _gw_params = request.get("params")
-            verdict = self._attest.gateway.authorize(
+            verdict = gateway.authorize(
                 _gw_params,
                 tool_name=tool_name,
                 arguments=arguments,
             )
             if not verdict.ok:
+                gates.append("credential_gateway:refuse")
                 # The policy decision at step 1 already went into the chain,
                 # and for a constrained tool it can be `allow` while the
                 # gateway refuses here — runtime arguments that no longer
@@ -1354,6 +1813,7 @@ class VaaraMCPProxy:
                     extra={
                         "agent_id": agent_id,
                         "action_id": getattr(result, "action_id", None) or "",
+                        "gates": list(gates),
                     },
                 )
                 return self._error_response(
@@ -1361,6 +1821,16 @@ class VaaraMCPProxy:
                     -32603,
                     f"vaara: grant required but not valid for tool {tool_name!r}: {verdict.reason}",
                 )
+            gates.append("credential_gateway:pass")
+        elif _gateway_present:
+            # A gateway exists but this tool declares no constraints, so it
+            # was never consulted. Not the same as passing it.
+            gates.append("credential_gateway:not_constrained")
+        else:
+            # No gateway in this deployment at all. `tool_constraints` empty
+            # means no gateway is constructed and no binding is enforced
+            # anywhere, which a reader of the record has to be able to see.
+            gates.append("credential_gateway:not_configured")
         with self._inflight_lock:
             if progress_token is not None:
                 self._inflight_progress[progress_token] = (
@@ -1377,9 +1847,20 @@ class VaaraMCPProxy:
         # attestation was already written above; pairing it with a receipt on
         # every path keeps the evidence trail complete with no orphans.
         outcome_severity = 1.0
+        outcome_description = ""
+        outcome_state: Optional[str] = None
         try:
             upstream_response = self._upstream.request(request)
             outcome_severity = self._severity_from_response(upstream_response)
+            if outcome_severity > 0.0:
+                outcome_description = _outcome_description("failed")
+        except Exception as exc:
+            # The request raised, so no reply was read. The trail tells the
+            # three cases apart; the receipt below says unobserved for the one
+            # where the call may have run, and errored for not_sent and failed.
+            outcome_state = _outcome_state(exc)
+            self._record_unanswered(str(getattr(result, "action_id", None) or ""), exc)
+            raise
         finally:
             with self._inflight_lock:
                 if progress_token is not None:
@@ -1394,10 +1875,15 @@ class VaaraMCPProxy:
                     outcome_severity=outcome_severity,
                     upstream_name=upstream_name,
                     tenant_id=_REQUEST_TENANT.get(),
+                    task_id=_related_task_id(params),
+                    outcome_state=outcome_state,
                 )
+        self._harvest_origin(tool_name, upstream_response,
+                             str(getattr(result, "action_id", None) or ""))
         try:
             self._pipeline.report_outcome(
                 action_id=result.action_id, outcome_severity=outcome_severity,
+                description=outcome_description,
             )
         except Exception:
             logger.exception("report_outcome failed for action_id=%s", result.action_id)
@@ -1412,9 +1898,32 @@ class VaaraMCPProxy:
                 "agent_id": agent_id,
                 "action_id": getattr(result, "action_id", None) or "",
                 "outcome_severity": int(outcome_severity),
+                "gates": list(gates),
             },
         )
         return upstream_response
+
+    def _record_unanswered(self, action_id: str, exc: Exception) -> None:
+        """Close an allowed call whose upstream request raised.
+
+        The trail says which of three things happened: ``not_sent`` (the
+        request provably never left the proxy), ``unobserved`` (it may have
+        reached the server and no reply was read, so the proxy cannot say
+        whether the call ran) or ``failed`` (the server answered with an error
+        status). The error class is recorded, never its message, which can
+        quote a response body. A call that did not run or may have run is
+        closed at the neutral 0.5 severity, as an aborted stream is: the
+        scorer is not told it failed. Failures here are logged and swallowed.
+        """
+        state = _outcome_state(exc)
+        try:
+            self._pipeline.report_outcome(
+                action_id=action_id,
+                outcome_severity=1.0 if state == "failed" else 0.5,
+                description=_outcome_description(state, error=type(exc).__name__),
+            )
+        except Exception:
+            logger.exception("report_outcome failed for action_id=%s", action_id)
 
     def _handle_resources_read(self, request: dict) -> dict:
         params = request.get("params") or {}
@@ -1427,6 +1936,16 @@ class VaaraMCPProxy:
             logger.warning(
                 "resources/read rejected at perimeter (operator filter): %s",
                 _safe_log(uri),
+            )
+            self._record_perimeter_audit(
+                agent_id=self._agent_id_default,
+                tool_name="mcp.resource.read",
+                parameters={"uri": uri},
+                decision="deny",
+                reason="Resource filtered by operator policy",
+                policy_id="operator_perimeter",
+                violation_type="perimeter_filter",
+                enforcement="could_block",
             )
             self._overt_emit(
                 surface="mcp.resource.read",
@@ -1453,6 +1972,7 @@ class VaaraMCPProxy:
             parameters={"uri": uri},
             decision="allow",
             reason="resource within operator perimeter",
+            enforcement="could_block",
         )
         self._overt_emit(
             surface="mcp.resource.read",
@@ -1463,7 +1983,47 @@ class VaaraMCPProxy:
             reason="resource within operator perimeter",
             extra={"agent_id": self._agent_id_default},
         )
-        return self._upstream.request(request)
+        response = self._upstream.request(request)
+        self._harvest_origin("mcp.resource.read", response, "")
+        return response
+
+    def _store(self) -> Any:
+        if self._origin_store is None:
+            from vaara.scorer.value_origin import OriginStore
+            self._origin_store = OriginStore()
+        return self._origin_store
+
+    def _origin_hold(self, tool_name: str, arguments: dict,
+                     gates: list[str]) -> Optional[dict]:
+        """The authority arguments held on value origin, or None. A failure
+        to read the store holds nothing and is named in the gate list."""
+        if not self._value_origin:
+            gates.append("value_origin:off")
+            return None
+        try:
+            from vaara.scorer.value_origin import origin_hold
+            held = origin_hold(
+                tool_name, arguments, self._store(),
+                trusted=self._trusted_values, extra_args=self._authority_args,
+                strict=self._value_origin_strict,
+            )
+        except Exception as exc:
+            logger.warning("value origin check failed on %s: %r", _safe_log(tool_name), exc)
+            gates.append("value_origin:error")
+            return None
+        gates.append("value_origin:hold" if held else "value_origin:pass")
+        return held
+
+    def _harvest_origin(self, tool_name: str, response: Any, action_id: str) -> None:
+        """Remember the authority-shaped values in an upstream result."""
+        if not self._value_origin or not isinstance(response, dict):
+            return
+        try:
+            from vaara.scorer.value_origin import extract_any
+            self._store().note_external(extract_any(response.get("result")),
+                                        tool_name=tool_name, action_id=action_id)
+        except Exception as exc:
+            logger.warning("value origin not recorded for %s: %r", _safe_log(tool_name), exc)
 
     def _handle_prompts_get(self, request: dict) -> dict:
         params = request.get("params") or {}
@@ -1479,6 +2039,16 @@ class VaaraMCPProxy:
             logger.warning(
                 "prompts/get rejected at perimeter (operator filter): %s",
                 _safe_log(name),
+            )
+            self._record_perimeter_audit(
+                agent_id=self._agent_id_default,
+                tool_name="mcp.prompt.get",
+                parameters={"name": name, "arguments": arguments},
+                decision="deny",
+                reason="Prompt filtered by operator policy",
+                policy_id="operator_perimeter",
+                violation_type="perimeter_filter",
+                enforcement="could_block",
             )
             self._overt_emit(
                 surface="mcp.prompt.get",
@@ -1505,6 +2075,7 @@ class VaaraMCPProxy:
             parameters={"name": name, "arguments": arguments},
             decision="allow",
             reason="prompt within operator perimeter",
+            enforcement="could_block",
         )
         self._overt_emit(
             surface="mcp.prompt.get",
@@ -1542,6 +2113,9 @@ class VaaraMCPProxy:
         decision: str,
         reason: str,
         tenant_id: Optional[str] = None,
+        policy_id: str = "",
+        violation_type: str = "",
+        enforcement: str = "",
     ) -> None:
         """Write a request+decision audit pair for a read-oriented MCP access.
 
@@ -1555,7 +2129,9 @@ class VaaraMCPProxy:
         upstream traffic. ``tenant_id`` is taken from the request
         ContextVar by default; async callers that run outside the
         originating request (upstream notification reader thread) pass
-        the captured tenant explicitly.
+        the captured tenant explicitly. ``enforcement`` says whether the
+        proxy could stop what it records (``could_block``) or forwards it
+        regardless (``recorded_only``); every caller names one.
         """
         import time as _time
         if tenant_id is None:
@@ -1580,6 +2156,9 @@ class VaaraMCPProxy:
                 reason=reason,
                 risk_score=0.0,
                 regulatory_domains=action_type.regulatory_domains,
+                policy_id=policy_id,
+                violation_type=violation_type,
+                enforcement=enforcement,
             )
         except Exception:
             logger.exception("Failed to record perimeter audit for %s", tool_name)
@@ -1640,6 +2219,12 @@ class VaaraMCPProxy:
             return 1.0
         return 0.0
 
+    def _notifier(self, name: str) -> Callable[[dict], None]:
+        """An on_notification callback that names the upstream it came from."""
+        def notify(msg: dict) -> None:
+            self._on_upstream_notification(name, msg)
+        return notify
+
     def _on_upstream_notification(self, upstream_name: str, message: dict) -> None:
         """Audit + OVERT-emit upstream-originated notifications, then forward.
 
@@ -1659,6 +2244,20 @@ class VaaraMCPProxy:
                 self._audit_progress_notification(message)
             elif method == "notifications/message":
                 self._audit_message_notification(message)
+            elif method == "notifications/tools/list_changed":
+                self._record_perimeter_audit(
+                    agent_id=self._agent_id_default,
+                    tool_name="mcp.tool_surface_list_changed",
+                    parameters={"upstream": upstream_name},
+                    decision="allow",
+                    reason="upstream announced its tool list changed; re-listing",
+                    tenant_id="",
+                    enforcement="recorded_only",
+                )
+                threading.Thread(
+                    target=self._refresh_tool_surface, args=(upstream_name,),
+                    daemon=True, name=f"tool-surface-{upstream_name}",
+                ).start()
         except Exception:
             logger.exception("Streaming-notification audit failed for %s", method)
         # Resolve the session that originated this notification, if any. Only
@@ -1735,6 +2334,7 @@ class VaaraMCPProxy:
             decision="observed",
             reason="upstream progress notification observed",
             tenant_id=captured_tenant,
+            enforcement="recorded_only",
         )
         self._overt_emit(
             surface="mcp.notification.progress",
@@ -1772,6 +2372,7 @@ class VaaraMCPProxy:
             decision="observed",
             reason="upstream log notification observed",
             tenant_id="",
+            enforcement="recorded_only",
         )
         self._overt_emit(
             surface="mcp.notification.message",
@@ -1814,7 +2415,7 @@ def _vaara_deciding_hook(path: Path) -> Optional[str]:
     was already decided, so it is not a second decision point.
     """
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None  # advisory only; see detect_stacked_governance
     if not isinstance(data, dict):
@@ -2015,6 +2616,33 @@ def main(argv: Optional[list[str]] = None) -> None:
                              "{arg, op, value} objects (op: le/ge/eq/in). Grants for listed "
                              "tools carry typed constraints; unlisted tools get exact-args "
                              "grants. Has no effect without --attest-signing-key.")
+    parser.add_argument("--attest-revocation-registry", type=Path, default=None,
+                        metavar="PATH",
+                        help="JSON revocation registry consulted when authorizing "
+                             "gateway-protected tool calls. WITHOUT THIS FLAG THE PROXY "
+                             "DOES NOT CHECK REVOCATION: the check does not run at all, "
+                             "rather than running and passing. Format is the "
+                             "RevocationRegistry dict ({version, entries[, as_of]}). "
+                             "Has no effect without --tool-constraints.")
+    parser.add_argument("--attest-clock-skew-seconds", type=int, default=30,
+                        metavar="N",
+                        help="Clock skew tolerance applied to credential issuance and "
+                             "expiry when authorizing gateway-protected calls (default "
+                             "30). The tolerance extends a grant's effective lifetime by "
+                             "this many seconds, so a freshness margin smaller than it is "
+                             "absorbed. Set 0 to accept no skew.")
+    parser.add_argument("--attest-expected-tenant", type=str, default=None,
+                        metavar="TENANT",
+                        help="Tenant id every credential's scope must match. When absent "
+                             "the gateway requires an empty tenant scope. Has no effect "
+                             "without --tool-constraints.")
+    parser.add_argument("--attest-max-revocation-staleness-seconds", type=float,
+                        default=None, metavar="SECONDS",
+                        help="Refuse with 'revocation_stale' when the registry's as_of is "
+                             "older than this bound, so a registry that cannot speak to "
+                             "the present stops admitting calls. Requires "
+                             "--attest-revocation-registry. Absent means no bound is "
+                             "stated and a clean answer stands at any registry age.")
     parser.add_argument("--overt-signing-key", type=Path, default=None,
                         help="Ed25519 PEM private key used to sign OVERT 1.0 Base "
                              "Envelopes for every governed MCP interaction. Off when "
@@ -2029,13 +2657,55 @@ def main(argv: Optional[list[str]] = None) -> None:
                              "(one canonical-CBOR file per envelope). Required when "
                              "--overt-signing-key is set.")
     parser.add_argument(
+        "--tool-surface-state", default=None,
+        help="File holding the last tool surface seen per upstream, so a change "
+             "made between sessions is recorded at the next tools/list. Default "
+             "$VAARA_MCP_TOOL_SURFACE_STATE or ~/.vaara/mcp-proxy/tool-surface.json; "
+             "'none' keeps it in memory for this process only.")
+    parser.add_argument(
+        "--tool-surface-hold", action="store_true",
+        help="Refuse calls to a tool whose definition changed, or that appeared, "
+             "after the accepted tool surface. The hold persists across restarts "
+             "until the operator runs once with --tool-surface-accept.")
+    parser.add_argument(
+        "--tool-surface-accept", action="store_true",
+        help="Adopt the tool surface seen in this run as the accepted baseline. "
+             "The change is still recorded.")
+    parser.add_argument(
+        "--value-origin", action="store_true",
+        help="Hold a call whose recipient, payee or endpoint argument carries a "
+             "value seen only in an earlier tool or resource result (email, "
+             "IBAN, host, phone, wallet). Shares ~/.vaara/value_origin.json with "
+             "the Claude Code hook, so values the user typed there pass here.")
+    parser.add_argument(
+        "--value-origin-strict", action="store_true",
+        help="Pass only values on the trusted list in authority arguments. "
+             "Implies --value-origin.")
+    parser.add_argument(
+        "--trusted-value", action="append", default=[], metavar="VALUE",
+        help="A recipient, payee or endpoint that always passes the value-origin "
+             "check. Repeatable.")
+    parser.add_argument(
+        "--authority-arg", action="append", default=[], metavar="TOOL=ARG",
+        help="Declare another authority argument for a tool, on top of the preset. "
+             "Repeatable.")
+    parser.add_argument(
+        "--fail-open", action="store_true",
+        help="Forward a tool call even when its audit record could not be "
+             "written. Off by default: the proxy first repairs the trail and "
+             "retries, and if the record still cannot be written the call is "
+             "refused and the upstream never sees it. With this flag the call "
+             "goes out unrecorded and the log says so on every one. Shadow "
+             "mode never refuses.")
+    parser.add_argument(
         "--stacked", choices=("warn", "fail", "ignore"), default="warn",
         help="What to do when a second Vaara governance layer is detected in "
              "front of this proxy (the Claude Code PreToolUse hook): 'warn' "
              "names it on stderr and continues (default), 'fail' refuses to "
              "start, 'ignore' says nothing. Detection never changes what is "
              "recorded.")
-    args = parser.parse_args(argv)
+    args = parser.parse_args(_bind_upstream_arg_values(
+        sys.argv[1:] if argv is None else argv))
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s",
                         stream=sys.stderr)
@@ -2137,6 +2807,14 @@ def main(argv: Optional[list[str]] = None) -> None:
             shadow=args.shadow,
             api_key=args.api_key,
             allowed_origins=set(args.allow_origins) if args.allow_origins else None,
+            tool_surface_state=_tool_surface_state_path(args.tool_surface_state),
+            tool_surface_hold=args.tool_surface_hold,
+            tool_surface_accept=args.tool_surface_accept,
+            value_origin=args.value_origin,
+            value_origin_strict=args.value_origin_strict,
+            trusted_values=args.trusted_value or None,
+            authority_args=_parse_authority_args(args.authority_arg, parser),
+            fail_open=args.fail_open,
         )
     except (ValueError, ProxyError) as e:
         # ProxyError here means a --upstream-url target was refused by the SSRF
@@ -2156,10 +2834,50 @@ def main(argv: Optional[list[str]] = None) -> None:
         proxy.close()
 
 
+def _parse_authority_args(specs: list[str], parser: Any) -> Optional[dict[str, list[str]]]:
+    """``["pay=iban", "pay=payee"]`` -> ``{"pay": ["iban", "payee"]}``."""
+    out: dict[str, list[str]] = {}
+    for spec in specs:
+        tool, sep, arg = spec.partition("=")
+        if not sep or not tool.strip() or not arg.strip():
+            parser.error(f"--authority-arg expects TOOL=ARG, got {spec!r}")
+        out.setdefault(tool.strip(), []).append(arg.strip())
+    return out or None
+
+
+def _tool_surface_state_path(value: Optional[str]) -> Optional[Path]:
+    raw = value or os.environ.get("VAARA_MCP_TOOL_SURFACE_STATE") or ""
+    if raw.strip().lower() == "none":
+        return None
+    if raw.strip():
+        return Path(raw).expanduser()
+    return Path.home() / ".vaara" / "mcp-proxy" / "tool-surface.json"
+
+
 # A fan-out slot name is a short alphanumeric slug. The narrow pattern
 # stops _parse_upstream_specs from confusing a command that itself
 # contains '=' (e.g. ``python -m foo --bar=baz``) with a NAME=CMD prefix.
 _UPSTREAM_NAME_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
+
+
+def _bind_upstream_arg_values(argv: list[str]) -> list[str]:
+    """Join each ``--upstream-arg`` with the token after it as ``--upstream-arg=VALUE``.
+
+    Upstream arguments are often flags of their own (``npx -y``, ``docker run
+    -i --rm``). Given ``--upstream-arg -y``, argparse takes ``-y`` for a new
+    option and exits with "expected one argument", which broke every config
+    in the docs that passes a flag through to the upstream.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--upstream-arg" and i + 1 < len(argv):
+            out.append(f"--upstream-arg={argv[i + 1]}")
+            i += 2
+        else:
+            out.append(argv[i])
+            i += 1
+    return out
 
 
 def _parse_upstream_specs(
@@ -2330,6 +3048,14 @@ def _build_attest_emitter_from_args(
             receipts_dir=args.attest_receipts_dir,
             upstream_commands=upstreams,
             tool_constraints_path=getattr(args, "tool_constraints", None),
+            revocation_registry_path=getattr(
+                args, "attest_revocation_registry", None
+            ),
+            clock_skew_seconds=getattr(args, "attest_clock_skew_seconds", 30),
+            expected_tenant=getattr(args, "attest_expected_tenant", None),
+            max_staleness_seconds=getattr(
+                args, "attest_max_revocation_staleness_seconds", None
+            ),
         )
     except AttestConfigError as exc:
         print(f"vaara-mcp-proxy: {exc}", file=sys.stderr)

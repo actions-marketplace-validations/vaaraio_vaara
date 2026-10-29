@@ -1,0 +1,511 @@
+"""Trail repair: keep every readable record, and declare the ones that are gone.
+
+The trail on the maintainer's machine was damaged seven times on a virtiofs
+mount. One morning repair used `.recover` and silently dropped seq 1505; the
+evening's REINDEX dropped nothing. Seq 30415 of the llm-proxy trail is missing
+from every copy on disk and nothing in the trail says so. These tests damage a
+real trail at the page level the way those files were damaged, then check the
+two properties the repair has to have: nothing readable is lost, and anything
+that is lost is named inside the chain.
+
+The page walker below reads the b-tree directly rather than through `dbstat`,
+which not every SQLite build carries.
+"""
+from __future__ import annotations
+
+import hashlib
+import sqlite3
+import os
+import struct
+import sys
+from pathlib import Path
+
+import pytest
+
+from vaara.audit.sqlite_backend import SQLiteAuditBackend, repair_trail_file
+from vaara.audit.trail import AuditTrail, EventType
+from vaara.pipeline import InterceptionPipeline
+
+N_CALLS = 400  # three to four records each, enough for several leaves per b-tree
+
+
+def _build(path: Path) -> None:
+    backend = SQLiteAuditBackend(path)
+    pipeline = InterceptionPipeline(trail=backend.load_trail())
+    for i in range(N_CALLS):
+        pipeline.intercept(
+            agent_id="repair-test", tool_name="file.read",
+            parameters={"path": f"/srv/data/{i:05d}.txt", "pad": "x" * 120},
+        )
+    backend.close()
+
+
+def _page_size(data: bytes) -> int:
+    size = struct.unpack(">H", data[16:18])[0]
+    return 65536 if size == 1 else size
+
+
+def _root(path: Path, name: str) -> int:
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute(
+            "SELECT rootpage FROM sqlite_master WHERE name = ?", (name,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _leaves(data: bytes, root: int) -> list[int]:
+    ps = _page_size(data)
+    out: list[int] = []
+
+    def walk(n: int) -> None:
+        base = (n - 1) * ps
+        hdr = base + (100 if n == 1 else 0)
+        kind = data[hdr]
+        if kind in (0x0A, 0x0D):
+            out.append(n)
+            return
+        assert kind in (0x02, 0x05), f"page {n} is not a b-tree page"
+        cells = struct.unpack(">H", data[hdr + 3:hdr + 5])[0]
+        right = struct.unpack(">I", data[hdr + 8:hdr + 12])[0]
+        for i in range(cells):
+            ptr = struct.unpack(">H", data[hdr + 12 + 2 * i:hdr + 14 + 2 * i])[0]
+            walk(struct.unpack(">I", data[base + ptr:base + ptr + 4])[0])
+        walk(right)
+
+    walk(root)
+    return out
+
+
+def _seqs(path: Path) -> set[int]:
+    conn = sqlite3.connect(path)
+    try:
+        return {r[0] for r in conn.execute("SELECT seq FROM audit_records NOT INDEXED")}
+    finally:
+        conn.close()
+
+
+def _integrity(path: Path) -> list[str]:
+    conn = sqlite3.connect(path)
+    try:
+        return [r[0] for r in conn.execute("PRAGMA integrity_check")]
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def trail_db(tmp_path: Path) -> Path:
+    path = tmp_path / "audit.db"
+    _build(path)
+    assert _integrity(path) == ["ok"]
+    return path
+
+
+def test_a_clean_trail_is_left_alone(trail_db: Path):
+    before = hashlib.sha256(trail_db.read_bytes()).hexdigest()
+    report = repair_trail_file(trail_db)
+    assert report.method == "clean"
+    assert not report.lost
+    assert hashlib.sha256(trail_db.read_bytes()).hexdigest() == before
+
+
+def test_index_damage_is_rebuilt_and_nothing_is_lost(trail_db: Path):
+    seqs = _seqs(trail_db)
+    data = bytearray(trail_db.read_bytes())
+    ps = _page_size(data)
+    leaves = _leaves(bytes(data), _root(trail_db, "idx_seq"))
+    assert len(leaves) >= 2
+    a, b = leaves[0], leaves[-1]
+    pa, pb = data[(a - 1) * ps:a * ps], data[(b - 1) * ps:b * ps]
+    data[(a - 1) * ps:a * ps], data[(b - 1) * ps:b * ps] = pb, pa
+    trail_db.write_bytes(bytes(data))
+    assert _integrity(trail_db) != ["ok"]
+
+    backend = SQLiteAuditBackend(trail_db)
+    trail = AuditTrail(on_record=backend.write_record)
+    report = trail.repair_store()
+    backend.close()
+
+    assert report.method == "reindex"
+    assert not report.lost
+    assert _integrity(trail_db) == ["ok"]
+    assert _seqs(trail_db) == seqs
+    assert not list(trail_db.parent.glob("audit.db.corrupt-*"))
+    # Nothing was lost, so nothing is declared.
+    conn = sqlite3.connect(trail_db)
+    gaps = conn.execute(
+        "SELECT count(*) FROM audit_records WHERE event_type = 'repair_gap'"
+    ).fetchone()[0]
+    conn.close()
+    assert gaps == 0
+
+
+def test_table_damage_keeps_every_readable_record_and_declares_the_rest(trail_db: Path):
+    seqs = _seqs(trail_db)
+    conn = sqlite3.connect(trail_db)
+    head_before = dict(conn.execute("SELECT seq, record_hash FROM audit_records").fetchall())
+    conn.close()
+    data = bytearray(trail_db.read_bytes())
+    ps = _page_size(data)
+    leaves = _leaves(bytes(data), _root(trail_db, "audit_records"))
+    assert len(leaves) >= 3
+    victim = leaves[len(leaves) // 2]
+    data[(victim - 1) * ps:victim * ps] = bytes(ps)
+    trail_db.write_bytes(bytes(data))
+
+    backend = SQLiteAuditBackend(trail_db)
+    trail = AuditTrail(on_record=backend.write_record)
+    report = trail.repair_store()
+
+    assert report.method == "salvage"
+    assert report.lost_seqs, "zeroing a leaf page must lose the rows on it"
+    survivors = seqs - set(report.lost_seqs)
+    assert report.records_kept == len(survivors)
+    assert report.damaged_copy and Path(report.damaged_copy).is_file()
+    assert _integrity(trail_db) == ["ok"]
+
+    conn = sqlite3.connect(trail_db)
+    rows = conn.execute(
+        "SELECT seq, record_hash, event_type, data FROM audit_records ORDER BY seq"
+    ).fetchall()
+    conn.close()
+    kept = {s: h for s, h, _e, _d in rows[:-1]}
+    # Every surviving record keeps its seq and its original hash.
+    assert set(kept) == survivors
+    assert all(kept[s] == head_before[s] for s in kept)
+    # The last record is the trail's own statement of the hole.
+    import json
+    seq, _h, event, payload = rows[-1]
+    assert event == EventType.REPAIR_GAP.value
+    body = json.loads(payload)
+    assert body["lost_seqs"] == report.lost_seqs
+    assert body["lost_seq_count"] == len(report.lost_seqs)
+    assert body["method"] == "salvage"
+    assert seq == max(survivors) + 1
+
+    # And the repaired store takes new records.
+    pipeline = InterceptionPipeline(trail=trail)
+    pipeline.intercept(agent_id="repair-test", tool_name="file.read",
+                       parameters={"path": "/srv/after-repair"})
+    backend.close()
+    assert max(_seqs(trail_db)) > seq
+
+
+def test_a_trail_nothing_can_read_is_left_exactly_where_it_was(trail_db: Path):
+    data = bytearray(trail_db.read_bytes())
+    data[:_page_size(data)] = bytes(_page_size(data))
+    trail_db.write_bytes(bytes(data))
+    before = hashlib.sha256(trail_db.read_bytes()).hexdigest()
+
+    report = repair_trail_file(trail_db)
+
+    assert report.method == "failed"
+    assert report.error
+    assert hashlib.sha256(trail_db.read_bytes()).hexdigest() == before
+    assert not list(trail_db.parent.glob("audit.db.corrupt-*"))
+    assert not list(trail_db.parent.glob("audit.db.repair-*"))
+
+
+def test_a_missing_file_is_a_failed_repair_not_a_new_trail(tmp_path: Path):
+    report = repair_trail_file(tmp_path / "nope.db")
+    assert report.method == "failed"
+    assert not (tmp_path / "nope.db").exists()
+
+
+def _zero_a_middle_leaf(path: Path) -> None:
+    data = bytearray(path.read_bytes())
+    ps = _page_size(data)
+    leaves = _leaves(bytes(data), _root(path, "audit_records"))
+    victim = leaves[len(leaves) // 2]
+    data[(victim - 1) * ps:victim * ps] = bytes(ps)
+    path.write_bytes(bytes(data))
+
+
+def test_the_cli_repairs_and_declares(trail_db: Path, capsys):
+    import json
+
+    from vaara.cli import main as cli_main
+
+    _zero_a_middle_leaf(trail_db)
+    code = cli_main(["trail", "repair", "--db", str(trail_db), "--format", "json"])
+    assert code == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["method"] == "salvage"
+    assert report["lost_seqs"]
+    conn = sqlite3.connect(trail_db)
+    gap = conn.execute(
+        "SELECT data FROM audit_records WHERE event_type = 'repair_gap'"
+    ).fetchone()
+    conn.close()
+    assert json.loads(gap[0])["lost_seqs"] == report["lost_seqs"]
+
+
+def test_the_cli_says_clean_and_changes_nothing(trail_db: Path, capsys):
+    from vaara.cli import main as cli_main
+
+    before = hashlib.sha256(trail_db.read_bytes()).hexdigest()
+    assert cli_main(["trail", "repair", "--db", str(trail_db)]) == 0
+    assert "reads clean" in capsys.readouterr().out
+    assert hashlib.sha256(trail_db.read_bytes()).hexdigest() == before
+
+
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="Windows does not move a file another process holds open")
+def test_an_open_writer_follows_a_trail_replaced_under_it(trail_db: Path, tmp_path: Path):
+    backend = SQLiteAuditBackend(trail_db)
+    trail = backend.load_trail()
+    # Another process repairs the trail by hand while this writer holds it.
+    _zero_a_middle_leaf(trail_db)
+    report = repair_trail_file(trail_db)
+    assert report.method == "salvage"
+    old_copy = Path(report.damaged_copy)
+    old_bytes = old_copy.read_bytes()
+
+    pipeline = InterceptionPipeline(trail=trail)
+    pipeline.intercept(agent_id="repair-test", tool_name="file.read",
+                       parameters={"path": "/srv/after-hand-repair"})
+    backend.close()
+
+    conn = sqlite3.connect(trail_db)
+    landed = conn.execute(
+        "SELECT count(*) FROM audit_records WHERE data LIKE '%after-hand-repair%'"
+    ).fetchone()[0]
+    conn.close()
+    assert landed >= 1
+    assert old_copy.read_bytes() == old_bytes
+
+
+def test_a_trail_that_cannot_be_moved_is_left_in_place(trail_db: Path, monkeypatch):
+    """Windows refuses to move an open file: the repair fails and undoes itself."""
+    _zero_a_middle_leaf(trail_db)
+    before = trail_db.read_bytes()
+    real = os.replace
+    calls = []
+
+    def refuse_second(src, dst):
+        calls.append((src, dst))
+        if len(calls) == 2:
+            raise PermissionError(32, "The process cannot access the file")
+        return real(src, dst)
+
+    monkeypatch.setattr(os, "replace", refuse_second)
+    report = repair_trail_file(trail_db)
+    assert report.method == "failed" and "PermissionError" in report.error
+    assert trail_db.read_bytes() == before
+    assert not any(p.name.startswith(trail_db.name + ".corrupt")
+                   for p in trail_db.parent.iterdir())
+
+
+def _readable_by_rowid(path: Path) -> set[int]:
+    conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+    conn.execute("PRAGMA writable_schema=ON")
+    out: set[int] = set()
+    try:
+        for rowid in range(1, N_CALLS * 8):
+            try:
+                row = conn.execute(
+                    "SELECT seq FROM audit_records WHERE rowid = ?", (rowid,)
+                ).fetchone()
+            except sqlite3.DatabaseError:
+                continue
+            if row:
+                out.add(row[0])
+    finally:
+        conn.close()
+    return out
+
+
+def test_a_trail_cut_short_by_its_last_pages_is_salvaged(trail_db: Path):
+    # The llm-proxy trail on 2026-09-23: the header counted 13614 pages, the
+    # file held 13612, and the missing two were the newest table leaf and an
+    # index page. SQLite refuses such a file outright as malformed, and the
+    # salvage opened it without the flag that lets it read the rest. Then the
+    # range read over the last surviving leaf stepped onto the missing page
+    # and dropped a row that reads fine on its own.
+    data = trail_db.read_bytes()
+    ps = _page_size(data)
+    last_leaf = _leaves(data, _root(trail_db, "audit_records"))[-1]
+    trail_db.write_bytes(data[:(last_leaf - 1) * ps])
+    readable = _readable_by_rowid(trail_db)
+    assert readable, "the leaves before the cut must still read"
+
+    report = repair_trail_file(trail_db)
+
+    assert report.method == "salvage", report.error
+    assert _integrity(trail_db) == ["ok"]
+    assert _seqs(trail_db) == readable
+    assert report.records_kept == len(readable)
+
+
+def _zero_the_last_leaf(path: Path) -> set[int]:
+    """Zero the newest table leaf in place; return the seqs it held."""
+    before = _seqs(path)
+    data = bytearray(path.read_bytes())
+    ps = _page_size(data)
+    victim = _leaves(bytes(data), _root(path, "audit_records"))[-1]
+    data[(victim - 1) * ps:victim * ps] = bytes(ps)
+    path.write_bytes(bytes(data))
+    return before - _readable_by_rowid(path)
+
+
+def test_records_lost_at_the_tail_are_named_from_the_seq_index(trail_db: Path):
+    gone = _zero_the_last_leaf(trail_db)
+    assert gone, "the newest leaf must have held records"
+
+    report = repair_trail_file(trail_db)
+
+    assert report.method == "salvage", report.error
+    assert report.tail_named is True
+    assert gone <= set(report.lost_seqs)
+    assert max(report.lost_seqs) == max(gone)
+
+
+def test_the_declaration_never_reuses_a_lost_seq(trail_db: Path, capsys):
+    import json
+
+    from vaara.cli import main as cli_main
+
+    gone = _zero_the_last_leaf(trail_db)
+    assert cli_main(["trail", "repair", "--db", str(trail_db), "--format", "json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert set(report["lost_seqs"]) >= gone
+
+    conn = sqlite3.connect(trail_db)
+    gap_seq, gap_data = conn.execute(
+        "SELECT seq, data FROM audit_records WHERE event_type = 'repair_gap'"
+    ).fetchone()
+    conn.close()
+    assert gap_seq > max(gone)
+    assert json.loads(gap_data)["lost_seqs"] == report["lost_seqs"]
+
+    backend = SQLiteAuditBackend(trail_db)
+    trail = backend.load_trail()
+    pipeline = InterceptionPipeline(trail=trail)
+    pipeline.intercept(agent_id="repair-test", tool_name="file.read",
+                       parameters={"path": "/srv/after-repair"})
+    backend.close()
+    after = _seqs(trail_db)
+    assert not (after & gone), "a lost seq number was issued again"
+
+
+def test_without_a_readable_seq_index_the_tail_is_reported_unnamed(trail_db: Path):
+    conn = sqlite3.connect(trail_db)
+    conn.execute("DROP INDEX idx_seq")
+    conn.commit()
+    conn.close()
+    _zero_the_last_leaf(trail_db)
+
+    report = repair_trail_file(trail_db)
+
+    assert report.method == "salvage", report.error
+    assert report.tail_named is False
+
+
+def test_a_side_table_column_the_new_trail_lacks_does_not_sink_the_salvage(trail_db: Path):
+    """Side-table columns come from the damaged file, so they are filtered.
+
+    Salvage copies pending_outcomes by the column names the damaged file
+    declares. A file from another version, or one written by hand, can
+    declare a column the fresh trail has no place for, or a name that is not
+    a plain identifier at all. Only the columns the fresh table has are
+    copied; the rest is left behind with the file.
+    """
+    conn = sqlite3.connect(trail_db)
+    conn.execute(
+        "INSERT INTO pending_outcomes "
+        "(action_id, agent_id, tool_name, risk_score, signals, created_at) "
+        "VALUES ('act-1', 'repair-test', 'file.read', 0.25, '{}', 1.0)"
+    )
+    conn.execute("ALTER TABLE pending_outcomes ADD COLUMN legacy_note TEXT")
+    conn.execute('ALTER TABLE pending_outcomes ADD COLUMN "x) VALUES (1); --" TEXT')
+    conn.commit()
+    conn.close()
+    _zero_a_middle_leaf(trail_db)
+
+    report = repair_trail_file(trail_db)
+
+    assert report.method == "salvage", report.error
+    conn = sqlite3.connect(trail_db)
+    ids = [r[0] for r in conn.execute("SELECT action_id FROM pending_outcomes")]
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_outcomes)")}
+    conn.close()
+    assert "act-1" in ids
+    assert "legacy_note" not in cols
+
+
+def test_a_file_with_the_old_redaction_table_still_salvages(trail_db: Path):
+    """Files written before the table left the schema carry it, unread.
+
+    The fresh trail has no gdpr_redactions table, so there is nowhere to copy
+    its rows. The salvage goes through, reports nothing damaged, and the
+    damaged copy keeps the table as it was.
+    """
+    conn = sqlite3.connect(trail_db)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS gdpr_redactions ("
+        "original_id TEXT PRIMARY KEY, replacement TEXT NOT NULL, "
+        "redacted_at REAL NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO gdpr_redactions (original_id, replacement, redacted_at) "
+        "VALUES ('subject-1', '[REDACTED:GDPR-Art17]', 1.0)"
+    )
+    conn.commit()
+    conn.close()
+    _zero_a_middle_leaf(trail_db)
+
+    report = repair_trail_file(trail_db)
+
+    assert report.method == "salvage", report.error
+    assert "gdpr_redactions" not in report.tables_damaged
+    conn = sqlite3.connect(trail_db)
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    conn.close()
+    assert "gdpr_redactions" not in tables
+    assert report.damaged_copy and Path(report.damaged_copy).is_file()
+    kept = sqlite3.connect(report.damaged_copy)
+    rows = kept.execute("SELECT original_id FROM gdpr_redactions").fetchall()
+    kept.close()
+    assert rows == [("subject-1",)]
+
+
+def _interior_child_ptrs(data: bytes, page: int) -> list[int]:
+    """Byte offsets of the child pointers in an interior table page."""
+    ps = _page_size(data)
+    base = (page - 1) * ps
+    hdr = base + (100 if page == 1 else 0)
+    assert data[hdr] == 0x05, "not an interior table page"
+    cells = struct.unpack(">H", data[hdr + 3:hdr + 5])[0]
+    ptrs = [base + struct.unpack(">H", data[hdr + 12 + 2 * i:hdr + 14 + 2 * i])[0]
+            for i in range(cells)]
+    return ptrs + [hdr + 8]  # the right-most child pointer
+
+
+def test_a_page_referenced_twice_is_salvaged_once(trail_db: Path):
+    # Seen on a live trail 2026-10-12: integrity_check said "2nd reference to
+    # page N", a scan returned those rows twice, and salvage stopped on
+    # UNIQUE record_id with the trail left broken.
+    seqs = _seqs(trail_db)
+    data = bytearray(trail_db.read_bytes())
+    root = _root(trail_db, "audit_records")
+    ptrs = _interior_child_ptrs(bytes(data), root)
+    assert len(ptrs) >= 2
+    # The first cell now points at the right-most child: that subtree is read
+    # twice and the first cell's own subtree is unreachable.
+    data[ptrs[0]:ptrs[0] + 4] = data[ptrs[-1]:ptrs[-1] + 4]
+    trail_db.write_bytes(bytes(data))
+    assert any("2nd reference" in line or "out of order" in line
+               for line in _integrity(trail_db))
+
+    report = repair_trail_file(trail_db)
+
+    assert report.method == "salvage", report.error
+    assert report.duplicate_rows > 0
+    assert report.lost_seqs, "the leaf nobody points at any more is lost"
+    assert report.records_kept == len(seqs) - len(report.lost_seqs)
+    assert _integrity(trail_db) == ["ok"]
+    conn = sqlite3.connect(trail_db)
+    ids = [r[0] for r in conn.execute("SELECT record_id FROM audit_records")]
+    conn.close()
+    assert len(ids) == len(set(ids))

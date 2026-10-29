@@ -1,0 +1,57 @@
+{
+  "evidence": {
+    "actionId": "vector-action-4",
+    "agentId": "vector-agent",
+    "cage": {
+      "confirmed": false,
+      "driver": "none"
+    },
+    "decidedAt": "2026-10-14T19:51:39.695Z",
+    "decision": "deny",
+    "eventType": "action_blocked",
+    "previousHash": "sha256:cfcee3de535a5b9d94ba63370d0655b94d3679a8bb4f297d1f3593e3458ef20c",
+    "reason": "external scorer transport failure: URLError",
+    "recordHash": "sha256:051a900a3292d62b4958caae37c3bcdc2755baac3be33919cabe99808255da50",
+    "recordId": "80b9181e-fffa-4d9b-8b53-cee839a4886d",
+    "refusal": {
+      "basis": "not_evaluated",
+      "policyId": "scorer:ExternalScorer",
+      "unavailableInput": "scorer:risk.example.net",
+      "violationType": "scorer_unavailable"
+    },
+    "riskScore": "1",
+    "schema": "vaara.trail-decision/v0",
+    "tenantId": "",
+    "toolName": "tx.transfer"
+  },
+  "receipt": {
+    "alg": "ES256",
+    "backLink": {
+      "attestationDigest": "sha256:cfcee3de535a5b9d94ba63370d0655b94d3679a8bb4f297d1f3593e3458ef20c",
+      "attestationNonce": "80b9181e-fffa-4d9b-8b53-cee839a4886d"
+    },
+    "decisionDerived": {
+      "decidedAt": "2026-10-14T19:51:39.695Z",
+      "decision": "block",
+      "evidenceRef": {
+        "canonicalization": "jcs-rfc8785",
+        "digest": "sha256:65e8524483484c08c197bb5da878723dc9b216b65bb5babccc1fa2079c4665d3",
+        "ref": "vaara:trail/80b9181e-fffa-4d9b-8b53-cee839a4886d",
+        "schema": "vaara.trail-decision/v0"
+      },
+      "policyId": "policy:vaara-engine/1",
+      "reason": "external scorer transport failure: URLError",
+      "riskScore": "1"
+    },
+    "issuerAsserted": {
+      "alg": "ES256",
+      "iat": "2026-10-14T19:51:39Z",
+      "iss": "vaara:engine",
+      "nonce": "8yJwGeR5imKjXmC6QbmI8LIU",
+      "secretVersion": "es256:dfa441deb94a9c1c",
+      "sub": "vector-agent"
+    },
+    "signature": "61ce15d81508453caf23e641b63fa77deaea5bc825eedfc43553af3fcdf87f3f8ff216d39ca0a03298d9dc65d0065900dc42eac1e684ea376c41c15c430cef14",
+    "version": 1
+  }
+}

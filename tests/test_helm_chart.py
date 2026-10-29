@@ -119,7 +119,7 @@ def test_the_trail_is_written_onto_the_mounted_volume():
     assert values["trail"]["path"].startswith(mount + "/")
     assert values["signing"]["receiptsDir"].startswith(mount)
     assert values["proxy"]["approvals"]["path"].startswith(mount)
-    assert f"mountPath: {mount}" in (TEMPLATES / "statefulset.yaml").read_text()
+    assert f"mountPath: {mount}" in (TEMPLATES / "statefulset.yaml").read_text(encoding="utf-8")
 
 
 def test_the_chart_does_not_offer_to_scale_the_chain():
@@ -143,7 +143,7 @@ def test_probe_path_is_a_route_the_proxy_answers_itself():
         ROOT / "src" / "vaara" / "integrations" / "_infer_proxy_app.py"
     ).read_text(encoding="utf-8")
     assert '@app.get("/healthz")' in app_source
-    assert "path: /healthz" in (TEMPLATES / "statefulset.yaml").read_text()
+    assert "path: /healthz" in (TEMPLATES / "statefulset.yaml").read_text(encoding="utf-8")
 
 
 def test_chart_flags_exist_in_the_cli():
@@ -160,9 +160,43 @@ def test_chart_flags_exist_in_the_cli():
     )
     accepted = set(re.findall(r"(--[a-z][\w-]+)", help_text.stdout + help_text.stderr))
     assert accepted, "vaara proxy --help produced no flags"
-    used = set(re.findall(r"- (--[a-z][\w-]+)", (TEMPLATES / "statefulset.yaml").read_text()))
+    used = set(re.findall(r"- (--[a-z][\w-]+)", (TEMPLATES / "statefulset.yaml").read_text(encoding="utf-8")))
     assert used, "the statefulset passes no flags at all"
     assert used <= accepted, f"chart passes flags vaara proxy rejects: {sorted(used - accepted)}"
+
+
+# --- the files a chart repository expects to find --------------------------
+
+
+def test_the_chart_carries_an_app_readme():
+    """Rancher's partner-charts repository requires `app-readme.md`.
+
+    It is the text an operator reads in the Rancher Apps catalogue before
+    installing, which is a different audience from the repository README:
+    someone deciding whether to install, not someone reading the source.
+    Without it the chart is technically installable and fails submission.
+    """
+    readme = CHART / "app-readme.md"
+    assert readme.is_file(), "partner-charts requires deploy/helm/vaara/app-readme.md"
+
+    text = readme.read_text(encoding="utf-8")
+    # The three settings that decide whether a first install works. Each has
+    # a default that is right for a demo and wrong for somebody else's
+    # cluster, and none of them fails loudly when left alone.
+    for key in ("upstream.url", "proxy.mode", "signing.existingSecret"):
+        assert key in text, f"app-readme.md does not mention {key}"
+
+
+def test_the_app_readme_is_not_excluded_from_the_package():
+    """`.helmignore` decides what `helm package` puts in the tarball.
+
+    A pattern that swept up `app-readme.md` would leave the chart passing
+    every check here and arriving at the catalogue without the file.
+    """
+    ignored = (CHART / ".helmignore").read_text(encoding="utf-8").split()
+    assert not any(
+        pattern in {"app-readme.md", "*.md", "app-readme*"} for pattern in ignored
+    )
 
 
 # --- the documented platforms agree with the chart -------------------------
@@ -179,13 +213,54 @@ def test_supported_platforms_names_the_image_and_the_chart_version():
     assert _values()["image"]["repository"] in page
 
 
+def test_tested_operating_systems_each_name_what_ran_and_when():
+    """SUSE Ready asks for the host versions a product was tested on. A row
+    without the code that ran and the day it ran is a support claim, not a
+    test result, so every row carries both."""
+    page = (ROOT / "docs" / "supported-platforms.md").read_text(encoding="utf-8")
+    section = page.split("## Operating systems tested", 1)[1].split("\n## ", 1)[0]
+    rows = [
+        line for line in section.splitlines()
+        if line.startswith("| ") and not line.startswith("| ---")
+    ][1:]
+    assert rows
+    for row in rows:
+        cells = [c.strip() for c in row.strip("|").split("|")]
+        assert len(cells) == 5, row
+        system, python, ran, when, result = cells
+        assert system and python and result, row
+        assert re.fullmatch(r"(\d+\.\d+\.\d+|[0-9a-f]{8})", ran), row
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", when), row
+    assert any(row.startswith("| SUSE Linux Enterprise Server 15 SP6 ") for row in rows)
+    assert any(row.startswith("| Red Hat Enterprise Linux 9.8 ") for row in rows)
+
+
+def test_supported_platforms_lists_rhel_9_and_points_at_the_ubi_image():
+    """Red Hat Partner Validation asks that RHEL be listed as a supported
+    platform in the product's own documentation. The page names RHEL 9, the
+    UBI 9 Containerfile that goes with it, and the Node.js floor a rerun of
+    the suite needs, so a stock RHEL 9 runner does not read as a product
+    fault. OpenShift is not claimed: no cluster run is recorded."""
+    page = (ROOT / "docs" / "supported-platforms.md").read_text(encoding="utf-8")
+    assert "Red Hat Enterprise Linux 9" in page
+    assert "packaging/ubi9/README.md" in page
+    assert (ROOT / "packaging" / "ubi9" / "README.md").is_file()
+    assert "Node.js 20" in page
+    kubernetes = page.split("## Kubernetes", 1)[1].split("\n## ", 1)[0]
+    assert "OpenShift" not in kubernetes
+
+
 # --- the real thing, when helm is available --------------------------------
 
 
 def _helm() -> str:
-    path = shutil.which("helm") or str(Path.home() / ".local" / "bin" / "helm")
-    if not Path(path).exists():
-        pytest.skip("helm is not installed")
+    # PATH only. The old fallback to ~/.local/bin/helm read Path.home(),
+    # which conftest.py redirects to an empty sandbox at import, so the
+    # fallback could never hit and six tests skipped on any machine where
+    # helm lived only there. Put helm on PATH to run them.
+    path = shutil.which("helm")
+    if path is None:
+        pytest.skip("helm is not on PATH")
     return path
 
 
@@ -269,3 +344,55 @@ def test_the_helm_test_pod_checks_vaara_not_the_model():
     assert pod["metadata"]["annotations"]["helm.sh/hook"] == "test"
     command = json.dumps(pod["spec"]["containers"][0]["command"])
     assert "/healthz" in command
+
+
+_POLICY_JSON = json.dumps({
+    "version": "0.1",
+    "domains": ["eu_ai_act"],
+    "action_classes": {},
+    "thresholds": {
+        "default": {"escalate": 0.35, "deny": 0.65},
+        "shell.exec": {"escalate": 0.01, "deny": 0.1},
+    },
+})
+
+
+def test_a_policy_reaches_the_proxy_as_json():
+    done = subprocess.run(
+        [_helm(), "template", "release", str(CHART),
+         "--set-json", f"proxy.policy={_POLICY_JSON}"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert done.returncode == 0, done.stderr
+    docs = [doc for doc in _yaml().safe_load_all(done.stdout) if doc]
+    config = next(doc for doc in docs if doc["kind"] == "ConfigMap")
+    assert json.loads(config["data"]["policy.json"]) == json.loads(_POLICY_JSON)
+    sts = next(doc for doc in docs if doc["kind"] == "StatefulSet")
+    pod = sts["spec"]["template"]
+    args = pod["spec"]["containers"][0]["args"]
+    assert args[args.index("--policy") + 1] == "/etc/vaara/policy/policy.json"
+    volume = next(v for v in pod["spec"]["volumes"] if v["name"] == "policy")
+    assert volume["configMap"]["name"] == config["metadata"]["name"]
+    # A changed policy has to roll the pod, or the old one keeps deciding.
+    assert pod["metadata"]["annotations"]["checksum/policy"]
+
+
+def test_no_policy_renders_no_configmap_and_no_flag():
+    done = subprocess.run(
+        [_helm(), "template", "release", str(CHART)],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert done.returncode == 0, done.stderr
+    docs = [doc for doc in _yaml().safe_load_all(done.stdout) if doc]
+    assert not any(doc["kind"] == "ConfigMap" for doc in docs)
+    sts = next(doc for doc in docs if doc["kind"] == "StatefulSet")
+    assert "--policy" not in sts["spec"]["template"]["spec"]["containers"][0]["args"]
+
+
+def test_enforce_with_only_a_policy_renders():
+    done = subprocess.run(
+        [_helm(), "template", "release", str(CHART),
+         "--set", "proxy.mode=enforce", "--set-json", f"proxy.policy={_POLICY_JSON}"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert done.returncode == 0, done.stderr

@@ -175,11 +175,14 @@ def govern(
 
     On a fresh install the scorer has no outcome history, so its conformal
     interval is wide and a call whose point estimate sits under the allow
-    threshold can still escalate on the interval's upper bound. Expect
-    ``Blocked`` from early calls on a sensitive taxonomy name such as
-    ``tx.transfer``. The interval narrows as ``report_outcome`` feeds real
-    outcomes back. Use ``shadow=True`` to record decisions without acting
-    on them while that happens.
+    threshold can still escalate on the interval's upper bound. At the
+    default ``balanced`` point (0.55 / 0.85) a single first call is decided
+    mostly on its taxonomy name and allows: ``tx.transfer`` scores 0.275
+    [0.085, 0.465]. A burst of calls escalates, and so does a known sequence
+    such as a read followed by an export. Under ``strict``
+    (0.30 / 0.55) the same first call escalates. The interval narrows as
+    ``report_outcome`` feeds real outcomes back. Use ``shadow=True`` to
+    record decisions without acting on them while that happens.
 
     Args:
         agent_id: Identity recorded against the action ("default" if unset).
@@ -199,8 +202,7 @@ def govern(
                 return pipeline
             return _shadow_pipeline() if shadow else default_pipeline()
 
-        @functools.wraps(fn)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
+        def _decide(args: tuple, kwargs: dict) -> tuple[InterceptionPipeline, Any]:
             pipe = _pipe()
             result = pipe.intercept(
                 agent_id=agent_id,
@@ -209,6 +211,30 @@ def govern(
             )
             if not result.allowed:
                 raise Blocked(result)
+            return pipe, result
+
+        if inspect.iscoroutinefunction(fn):
+            # Decided when awaited, immediately before the body, so a block
+            # raises where the caller awaits and the body never starts. The
+            # outcome is reported after the body finishes: the sync wrapper
+            # reported success when it handed back the coroutine, for a body
+            # that had not run yet, and never saw it fail.
+            @functools.wraps(fn)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                pipe, result = _decide(args, kwargs)
+                try:
+                    outcome = await fn(*args, **kwargs)
+                except Exception:
+                    pipe.report_outcome(result.action_id, 1.0, description="raised exception")
+                    raise
+                pipe.report_outcome(result.action_id, 0.0)
+                return outcome
+
+            return async_wrapper  # type: ignore[return-value]
+
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            pipe, result = _decide(args, kwargs)
             try:
                 outcome = fn(*args, **kwargs)
             except Exception:

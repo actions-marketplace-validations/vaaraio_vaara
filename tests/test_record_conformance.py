@@ -29,7 +29,7 @@ RECORDS = VECTORS / "records"
 
 
 def _expected() -> dict:
-    return json.loads((VECTORS / "expected.json").read_text())
+    return json.loads((VECTORS / "expected.json").read_text(encoding="utf-8"))
 
 
 def _cases():
@@ -37,7 +37,7 @@ def _cases():
 
 
 def _record(name: str) -> dict:
-    return json.loads((RECORDS / f"{name}.json").read_text())
+    return json.loads((RECORDS / f"{name}.json").read_text(encoding="utf-8"))
 
 
 # ── Vectors ───────────────────────────────────────────────────────────────────
@@ -112,7 +112,7 @@ def test_report_to_dict_shape():
 
 def test_cli_conforming_exit_0(tmp_path, capsys):
     target = tmp_path / "record.json"
-    target.write_text((RECORDS / "conforming_executed_projection.json").read_text())
+    target.write_text((RECORDS / "conforming_executed_projection.json").read_text(encoding="utf-8"))
     rc = main(["verify-record", str(target)])
     out = capsys.readouterr().out
     assert rc == 0
@@ -121,7 +121,7 @@ def test_cli_conforming_exit_0(tmp_path, capsys):
 
 def test_cli_non_conforming_exit_1(tmp_path, capsys):
     target = tmp_path / "record.json"
-    target.write_text((RECORDS / "neg_digest_mismatch.json").read_text())
+    target.write_text((RECORDS / "neg_digest_mismatch.json").read_text(encoding="utf-8"))
     rc = main(["verify-record", str(target)])
     out = capsys.readouterr().out
     assert rc == 1
@@ -131,7 +131,7 @@ def test_cli_non_conforming_exit_1(tmp_path, capsys):
 
 def test_cli_json_output(tmp_path, capsys):
     target = tmp_path / "record.json"
-    target.write_text((RECORDS / "conforming_executed_projection.json").read_text())
+    target.write_text((RECORDS / "conforming_executed_projection.json").read_text(encoding="utf-8"))
     rc = main(["verify-record", str(target), "--json"])
     payload = json.loads(capsys.readouterr().out)
     assert rc == 0
@@ -179,7 +179,7 @@ def test_cli_back_link_mismatch_gates(tmp_path, capsys):
     # Conforming record, but paired with a tampered attestation whose wire bytes
     # (and so whose digest) no longer match the one the record pins: the
     # back-link fails and the command exits 1 even though conformance passed.
-    att = json.loads((case / "attestation.json").read_text())
+    att = json.loads((case / "attestation.json").read_text(encoding="utf-8"))
     att["issuerAsserted"]["nonce"] = "tampered-nonce-deadbeef"
     tampered = tmp_path / "attestation.json"
     tampered.write_text(json.dumps(att))
@@ -190,3 +190,44 @@ def test_cli_back_link_mismatch_gates(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 1
     assert "back-link: FAIL" in out
+
+
+# ── unobserved (receipt -15, Table 4) ─────────────────────────────────────────
+
+
+def _conforming_record_without_commitment() -> dict:
+    for name in _cases():
+        want = _expected()[name]
+        rec = _record(name)
+        if want["conforms"] and not want["advisories"]:
+            rec["outcomeDerived"].pop("resultCommitment", None)
+            return rec
+    raise AssertionError("no conforming vector record")
+
+
+def test_unobserved_status_conforms():
+    rec = _conforming_record_without_commitment()
+    rec["outcomeDerived"]["status"] = "unobserved"
+    report = check_record_conformance(rec)
+    assert report.conforms, report.required_failed
+    assert not report.advisories
+
+
+def test_unobserved_with_a_result_commitment_is_an_advisory():
+    base = _record(next(
+        n for n in _cases()
+        if _expected()[n]["conforms"] and not _expected()[n]["advisories"]
+        and "resultCommitment" in _record(n)["outcomeDerived"]
+    ))
+    base["outcomeDerived"]["status"] = "unobserved"
+    report = check_record_conformance(base)
+    assert report.conforms
+    assert "unobserved_has_no_result" in report.advisories
+
+
+def test_a_status_outside_the_four_fails():
+    rec = _conforming_record_without_commitment()
+    rec["outcomeDerived"]["status"] = "unknown"
+    report = check_record_conformance(rec)
+    assert not report.conforms
+    assert "status_valid" in report.required_failed

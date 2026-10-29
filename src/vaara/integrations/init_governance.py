@@ -13,12 +13,14 @@ Two surfaces:
 
 * ``run_init`` — detect installed clients, write the Claude Code
   PreToolUse/PostToolUse/SessionStart hooks into ``~/.claude/settings.json``,
-  rewrite known MCP client configs through ``vaara-mcp-proxy``, and point
-  everything at one trail. Idempotent: it re-asserts the hooks on every run
+  install the OpenCode plugin and the Cursor hooks where those clients are
+  installed, rewrite known MCP
+  client configs through ``vaara-mcp-proxy``, and point everything at one
+  trail. Idempotent: it re-asserts the hooks on every run
   (self-heal — a settings.json that was reset or truncated is repaired), and
   re-running never duplicates entries or clobbers the pre-Vaara MCP backup.
-* ``run_ungovern`` — remove the Vaara-managed hooks and restore each MCP config
-  from its ``.vaara-backup``.
+* ``run_ungovern`` — remove the Vaara-managed hooks and the OpenCode plugin,
+  and restore each MCP config from its ``.vaara-backup``.
 
 The hooks call the ``vaara`` binary on PATH directly (``vaara hook
 pre-tool-use`` etc.), so this does not depend on the plugin marketplace being
@@ -33,6 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from vaara.integrations import _hook_gate
 from vaara.integrations.discovery import (
     DiscoverReport,
     run_discovery,
@@ -51,9 +54,20 @@ CLAUDE_CODE_CONFIG = Path.home() / ".vaara" / "claude-code" / "config.json"
 # Claude Code global settings file the hooks are written into.
 CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
 
-# The tool-call surface the hooks intercept — Bash, WebFetch, WebSearch, and
-# every MCP tool. Kept identical to the plugin's hooks.json matcher.
-HOOK_MATCHER = "Bash|WebFetch|WebSearch|mcp__.*"
+# The tool-call surface the hooks intercept: all of it. Kept identical to the
+# plugin's hooks.json matcher, and pinned by a test, because the two drifted.
+# This read "Bash|WebFetch|WebSearch|mcp__.*" while the plugin had grown to
+# fifteen names, so a `vaara init` install ran deny rules for Write,
+# Edit, Agent and Workflow that the matcher never dispatched. A rule the
+# matcher drops is dead, and nothing said so.
+HOOK_MATCHER = ".*"
+
+# The operating point a fresh install is written with. Equal to what the
+# engine and the macOS client both fall back to, so writing it changes no
+# behaviour. It makes the choice visible in the file instead of implied:
+# an install with no `protection` key gave the client one number to display
+# and the scorer another to run, and nothing in between said so.
+DEFAULT_PROTECTION_PRESET = "balanced"
 
 # Substring that marks a hook entry as Vaara-managed. Used to find and remove
 # our own entries on re-run / ungovern without touching the operator's other
@@ -61,20 +75,28 @@ HOOK_MATCHER = "Bash|WebFetch|WebSearch|mcp__.*"
 _HOOK_MARKER = "vaara hook "
 
 # Known MCP client config locations. Paths are ~-relative and expanded at
-# scan time.
+# scan time. OpenCode is not here: its plugin gates every tool call, MCP
+# included (see vaara.integrations.opencode). The entry that was here named
+# a path in the maintainer's own checkout and a format OpenCode does not use,
+# so it governed nothing on any machine.
 KNOWN_MCP_CLIENTS: list[tuple[str, str]] = [
     ("Claude Desktop",
      "~/Library/Application Support/Claude/claude_desktop_config.json"),
     ("Claude Code", "~/.claude.json"),
     ("Cursor", "~/.cursor/mcp.json"),
     ("Windsurf", "~/.codeium/windsurf/mcp_config.json"),
-    ("OpenCode", "~/Projects/vaara/opencode.json"),
 ]
 
 _HOOK_EVENTS = (
     ("SessionStart", "session-start", None),
+    ("UserPromptSubmit", "user-prompt-submit", None),
     ("PreToolUse", "pre-tool-use", HOOK_MATCHER),
     ("PostToolUse", "post-tool-use", HOOK_MATCHER),
+    # A call that failed, and one the host's permission step refused after
+    # Vaara let it through: neither fires PostToolUse, so without these a
+    # call reads "allowed, no outcome" and nothing says why.
+    ("PostToolUseFailure", "post-tool-use-failure", HOOK_MATCHER),
+    ("PermissionDenied", "permission-denied", HOOK_MATCHER),
 )
 
 
@@ -88,6 +110,9 @@ class MCPClientStatus:
     governed: int = 0
     ungoverned: int = 0
     has_backup: bool = False
+    # False when the file exists but holds no ``mcpServers`` map Vaara can
+    # read, so its servers can be neither counted nor routed.
+    readable: bool = True
 
 
 @dataclass
@@ -108,6 +133,160 @@ class InitReport:
     discovery: Optional[DiscoverReport] = None
     policy_path: Optional[Path] = None
     config_path: Optional[Path] = None
+    # OpenCode plugin: where it was installed (None: OpenCode not found or
+    # skipped), whether this run changed it, and whether ungovern removed it.
+    opencode_plugin: Optional[Path] = None
+    opencode_changed: bool = False
+    opencode_removed: bool = False
+    # Cursor hooks.json, same three fields.
+    cursor_hooks: Optional[Path] = None
+    cursor_changed: bool = False
+    cursor_removed: bool = False
+    # Codex hooks.json, the same three fields, and whether Codex will run
+    # the hook (see codex.trust_status).
+    codex_hooks: Optional[Path] = None
+    codex_changed: bool = False
+    codex_removed: bool = False
+    codex_trust: str = "missing"
+    # Gemini CLI settings.json, the same three fields, and whether Gemini
+    # CLI will run the hook (see gemini.hook_status).
+    gemini_settings: Optional[Path] = None
+    gemini_changed: bool = False
+    gemini_removed: bool = False
+    gemini_status: str = "missing"
+    # Copilot CLI hooks/vaara.json, the same three fields, and whether
+    # Copilot CLI will run the hook (see copilot.hook_status).
+    copilot_hooks: Optional[Path] = None
+    copilot_changed: bool = False
+    copilot_removed: bool = False
+    copilot_status: str = "missing"
+
+
+def codex_trust_line(status: str) -> str:
+    """Why Codex is not running Vaara's hook, and what to do about it."""
+    if status == "disabled":
+        return "Vaara's hook is turned off in Codex's /hooks. Turn it back on there."
+    if status == "unknown":
+        return ("could not read ~/.codex/config.toml to see whether the hook is "
+                "trusted, and Codex runs a hook only once it is.")
+    return ("until you trust the hook. Codex asks at its next start (choose "
+            "\"Trust all and continue\"), or review it in /hooks. codex exec "
+            "skips an untrusted hook without asking.")
+
+
+def gemini_status_line(status: str) -> str:
+    """Why Gemini CLI is not running Vaara's hook, and what to do about it."""
+    if status == "disabled":
+        return ("its hooks are turned off (hooksConfig in ~/.gemini/settings.json, "
+                "or /hooks disable). Turn them back on with /hooks enable-all.")
+    if status == "unknown":
+        return ("could not read ~/.gemini/settings.json, so the hooks were not "
+                "written.")
+    return "the hooks are not in ~/.gemini/settings.json."
+
+
+def copilot_status_line(status: str) -> str:
+    """Why Copilot CLI is not running Vaara's hook, and what to do about it."""
+    if status == "disabled":
+        return ("~/.copilot/hooks/vaara.json sets disableAllHooks. Re-run vaara "
+                "init to rewrite it.")
+    if status == "unknown":
+        return "could not read ~/.copilot/hooks/vaara.json."
+    return "the hooks are not in ~/.copilot/hooks/vaara.json."
+
+
+@dataclass
+class Coverage:
+    """What ``vaara init`` can say about one agent found on this machine."""
+
+    name: str
+    state: str  # "governed", "MCP only" or "NOT governed"
+    detail: str
+
+
+#: Agents Vaara has no adapter for yet, by the binaries and directories that
+#: show one is installed. Listing them is the point: an agent nobody names
+#: is an agent the operator believes is governed.
+_UNADAPTED = (
+    ("Windsurf", ("windsurf",), ("~/.codeium/windsurf",)),
+)
+
+
+def _installed(binaries: tuple, dirs: tuple, which: Any) -> bool:
+    return (any(which(b) for b in binaries)
+            or any(Path(d).expanduser().is_dir() for d in dirs))
+
+
+def coverage(report: InitReport, *, which: Any = shutil.which) -> list[Coverage]:
+    """Every agent found on this machine, and whether Vaara governs it.
+
+    ``init`` used to print what it wrote and then "Vaara is governing",
+    whatever it had found. An agent with no adapter got no line at all, and
+    an MCP config in a shape Vaara could not read was skipped without a word.
+    """
+    rows: list[Coverage] = []
+    every = "every tool call, through its hooks"
+    if _installed(("claude",), ("~/.claude",), which):
+        rows.append(Coverage("Claude Code", "governed", every))
+    if report.cursor_hooks is not None:
+        rows.append(Coverage("Cursor", "governed", every))
+    if report.opencode_plugin is not None:
+        rows.append(Coverage("OpenCode", "governed",
+                             "every tool call, through its plugin"))
+    if report.codex_hooks is not None:
+        if report.codex_trust == "trusted":
+            rows.append(Coverage("Codex", "governed", every))
+        else:
+            rows.append(Coverage("Codex", "NOT governed",
+                                 codex_trust_line(report.codex_trust)))
+    if report.gemini_settings is not None:
+        if report.gemini_status == "active":
+            rows.append(Coverage("Gemini CLI", "governed", every))
+        else:
+            rows.append(Coverage("Gemini CLI", "NOT governed",
+                                 gemini_status_line(report.gemini_status)))
+    if report.copilot_hooks is not None:
+        if report.copilot_status == "active":
+            rows.append(Coverage("Copilot CLI", "governed", every))
+        else:
+            rows.append(Coverage("Copilot CLI", "NOT governed",
+                                 copilot_status_line(report.copilot_status)))
+
+    mcp = {c.name: c for c in report.clients if c.exists}
+
+    def routed(client: MCPClientStatus) -> tuple[int, int]:
+        done = report.mcp_rewritten.get(client.name, 0)
+        return client.governed + done, client.ungoverned - done
+
+    desktop = mcp.get("Claude Desktop")
+    if desktop is not None:
+        on, off = routed(desktop)
+        if not desktop.readable:
+            rows.append(Coverage("Claude Desktop", "NOT governed",
+                                 f"could not read the MCP servers in {desktop.path}"))
+        elif off:
+            rows.append(Coverage("Claude Desktop", "NOT governed",
+                                 f"{off} MCP server(s) not routed through vaara-mcp-proxy"))
+        else:
+            rows.append(Coverage("Claude Desktop", "governed",
+                                 f"its {on} MCP server(s), through vaara-mcp-proxy"))
+
+    for name, binaries, dirs in _UNADAPTED:
+        client = mcp.get(name)
+        if client is None and not _installed(binaries, dirs, which):
+            continue
+        own = "no Vaara adapter yet, so its own tool calls run unchecked"
+        on, off = routed(client) if client is not None else (0, 0)
+        if client is not None and not client.readable:
+            own += f"; could not read the MCP servers in {client.path}"
+        elif off:
+            own += f"; {off} MCP server(s) not routed through vaara-mcp-proxy"
+        if on:
+            rows.append(Coverage(name, "MCP only",
+                                 f"{on} MCP server(s) through vaara-mcp-proxy; {own}"))
+        else:
+            rows.append(Coverage(name, "NOT governed", own))
+    return rows
 
 
 def resolve_vaara_bin() -> str:
@@ -121,6 +300,8 @@ def resolve_vaara_bin() -> str:
 
 
 def _hook_command(vaara_bin: str, subcommand: str) -> str:
+    if subcommand == "pre-tool-use":
+        return _hook_gate.pre_command(vaara_bin)
     return f"{vaara_bin} hook {subcommand}"
 
 
@@ -130,7 +311,7 @@ def _hook_command(vaara_bin: str, subcommand: str) -> str:
 
 def _load_json(path: Path) -> dict:
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except (OSError, json.JSONDecodeError):
         # A missing, empty, or truncated settings.json (the 27-byte-reset bug)
@@ -141,7 +322,7 @@ def _load_json(path: Path) -> dict:
 def _atomic_write_json(path: Path, obj: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".vaara-tmp")
-    tmp.write_text(json.dumps(obj, indent=2, sort_keys=False) + "\n")
+    tmp.write_text(json.dumps(obj, indent=2, sort_keys=False) + "\n", encoding="utf-8", newline="\n")
     os.replace(tmp, path)
 
 
@@ -191,7 +372,11 @@ def _vaara_hook_groups(vaara_bin: str) -> dict:
                 {
                     "type": "command",
                     "command": _hook_command(vaara_bin, subcommand),
-                    "timeout": 30,
+                    # Claude Code lets a call through when its hook times
+                    # out, so pre-tool-use gets the gate's host timeout:
+                    # the gate refuses at its deadline, first.
+                    "timeout": (_hook_gate.HOST_TIMEOUT
+                                if subcommand == "pre-tool-use" else 30),
                 }
             ]
         }
@@ -252,14 +437,35 @@ def remove_claude_hooks(settings_path: Path) -> bool:
     return True
 
 
-def write_hook_config(config_path: Path, trail_db: Path) -> None:
+def write_hook_config(config_path: Path, trail_db: Path, *,
+                      shadow: bool = False, auto: bool = False,
+                      auto_preset: Optional[str] = None) -> None:
     """Point the hook runner at the shared trail via its config.json.
 
     Merges ``audit_db`` into any existing config so a truncated or absent file
     is repaired without dropping the operator's other keys (mode, thresholds).
+
+    ``protection`` is written only when the key is absent, so an operator who
+    has chosen a preset keeps it. Writing it changes no behaviour, because the
+    engine and the macOS client already land on balanced without it. It makes
+    the operating point readable in the file, which is where an operator looks
+    when asking why a call was scored the way it was.
+
+    ``shadow`` sets ``mode: watch``: the operator asked for it. ``auto``
+    sets ``mode: watch`` and the ``auto_preset`` protection only where those
+    keys are absent, because ``--auto`` is documented as a shadow-mode start
+    at its preset. The hook reads this file and no other, so until this was
+    written ``--shadow`` and ``--auto`` left the hooks blocking.
     """
     cfg = _load_json(config_path)
     cfg["audit_db"] = str(trail_db)
+    if shadow:
+        cfg["mode"] = "watch"
+    if auto:
+        cfg.setdefault("mode", "watch")
+        if auto_preset:
+            cfg.setdefault("protection", auto_preset)
+    cfg.setdefault("protection", DEFAULT_PROTECTION_PRESET)
     _atomic_write_json(config_path, cfg)
 
 
@@ -285,13 +491,13 @@ def scan_mcp_client(name: str, raw_path: str, proxy_bin: str) -> MCPClientStatus
         return MCPClientStatus(name=name, path=path, exists=False)
     has_backup = _backup_path(path).exists()
     try:
-        obj = json.loads(path.read_text())
+        obj = json.loads(path.read_text(encoding="utf-8"))
         servers = obj.get("mcpServers", {})
         if not isinstance(servers, dict):
             raise ValueError
     except (OSError, json.JSONDecodeError, ValueError):
         return MCPClientStatus(name=name, path=path, exists=True,
-                               has_backup=has_backup)
+                               has_backup=has_backup, readable=False)
     governed = naked = 0
     for server in servers.values():
         if not isinstance(server, dict):
@@ -325,7 +531,7 @@ def govern_mcp_config(
     overwrites it, so ``restore_mcp_config`` always recovers the original.
     """
     try:
-        obj = json.loads(config_path.read_text())
+        obj = json.loads(config_path.read_text(encoding="utf-8"))
         servers = obj.get("mcpServers")
         if not isinstance(servers, dict):
             return None
@@ -398,6 +604,17 @@ def run_init(
     # Auto-discovery.
     auto: bool = False,
     mode: str = "eco",
+    set_hook_mode: bool = True,
+    govern_opencode: bool = True,
+    opencode_dir: Optional[Path] = None,
+    govern_cursor: bool = True,
+    cursor_dir: Optional[Path] = None,
+    govern_codex: bool = True,
+    codex_dir: Optional[Path] = None,
+    govern_gemini: bool = True,
+    gemini_dir: Optional[Path] = None,
+    govern_copilot: bool = True,
+    copilot_dir: Optional[Path] = None,
 ) -> InitReport:
     """Set up (or self-heal) local governance in one call.
 
@@ -429,9 +646,70 @@ def run_init(
         )
 
     report.hooks_changed = write_claude_hooks(settings_path, vaara_bin)
-    write_hook_config(config_path, trail_db)
+    # ``set_hook_mode=False`` keeps the hook's mode and preset as they are.
+    # The silent first-run setup uses it: it runs on the first use of any
+    # command, and letting it switch the hooks to watch would stop them
+    # blocking with no word to the operator.
+    if set_hook_mode:
+        write_hook_config(config_path, trail_db, shadow=shadow, auto=auto,
+                          auto_preset=mode if auto else None)
+    else:
+        write_hook_config(config_path, trail_db)
+
+    if govern_opencode:
+        from vaara.integrations import opencode
+
+        if opencode.detected(opencode_dir):
+            report.opencode_changed = opencode.install_plugin(vaara_bin, opencode_dir)
+            report.opencode_plugin = opencode.plugin_path(opencode_dir)
+
+    if govern_cursor:
+        from vaara.integrations import cursor
+
+        if cursor.detected(cursor_dir):
+            report.cursor_changed = cursor.install_hooks(vaara_bin, cursor_dir)
+            report.cursor_hooks = cursor.hooks_path(cursor_dir)
+
+    if govern_codex:
+        from vaara.integrations import codex
+
+        if codex.detected(codex_dir):
+            report.codex_changed = codex.install_hooks(vaara_bin, codex_dir)
+            report.codex_hooks = codex.hooks_path(codex_dir)
+            report.codex_trust = codex.trust_status(codex_dir)
+
+    if govern_gemini:
+        from vaara.integrations import gemini
+
+        if gemini.detected(gemini_dir):
+            report.gemini_settings = gemini.settings_path(gemini_dir)
+            try:
+                report.gemini_changed = gemini.install_hooks(vaara_bin, gemini_dir)
+            except (OSError, ValueError) as exc:
+                report.warnings.append(f"Gemini CLI hooks not written: {exc}")
+            report.gemini_status = gemini.hook_status(gemini_dir)
+
+    if govern_copilot:
+        from vaara.integrations import copilot
+
+        if copilot.detected(copilot_dir):
+            report.copilot_hooks = copilot.hooks_path(copilot_dir)
+            try:
+                report.copilot_changed = copilot.install_hooks(vaara_bin, copilot_dir)
+            except OSError as exc:
+                report.warnings.append(f"Copilot CLI hooks not written: {exc}")
+            report.copilot_status = copilot.hook_status(copilot_dir)
 
     report.clients = detect_clients(proxy_bin)
+    for client in report.clients:
+        if (client.name == "Cursor" and client.governed
+                and report.cursor_hooks is not None):
+            report.warnings.append(
+                f"Cursor's MCP servers in {client.path} also run through "
+                f"vaara-mcp-proxy from an earlier init, so each Cursor MCP call "
+                f"is decided twice. Restore that file from "
+                f"{client.path.name}.vaara-backup to leave it to the hook."
+            )
     if govern_mcp:
         if shutil.which("vaara-mcp-proxy") is None:
             report.warnings.append(
@@ -442,8 +720,12 @@ def run_init(
             for client in report.clients:
                 if not client.exists or client.ungoverned == 0:
                     continue
+                if client.name == "Cursor" and report.cursor_hooks is not None:
+                    # Cursor's preToolUse hook already decides its MCP calls;
+                    # the proxy as well would decide each one twice.
+                    continue
                 count = govern_mcp_config(
-                    client.path, proxy_bin, trail_db, shadow=shadow,
+                    client.path, proxy_bin, trail_db, shadow=shadow or auto,
                 )
                 if count:
                     report.mcp_rewritten[client.name] = count
@@ -474,12 +756,32 @@ def run_ungovern(
     service_home: Optional[Path] = None,
     service_system: Optional[str] = None,
     service_runner: Any = None,
+    opencode_dir: Optional[Path] = None,
+    cursor_dir: Optional[Path] = None,
+    codex_dir: Optional[Path] = None,
+    gemini_dir: Optional[Path] = None,
+    copilot_dir: Optional[Path] = None,
 ) -> InitReport:
-    """Reverse ``run_init``: remove the hooks, restore each MCP config, and
-    take down the proxy service if one was installed."""
+    """Reverse ``run_init``: remove the hooks and the OpenCode plugin, restore
+    each MCP config, and take down the proxy service if one was installed."""
+    from vaara.integrations import opencode
+
     proxy_bin = proxy_bin or (shutil.which("vaara-mcp-proxy") or "vaara-mcp-proxy")
     report = InitReport(hooks_path=settings_path)
     report.hooks_changed = remove_claude_hooks(settings_path)
+    report.opencode_removed = opencode.remove_plugin(opencode_dir)
+    from vaara.integrations import cursor
+
+    report.cursor_removed = cursor.remove_hooks(cursor_dir)
+    from vaara.integrations import codex
+
+    report.codex_removed = codex.remove_hooks(codex_dir)
+    from vaara.integrations import gemini
+
+    report.gemini_removed = gemini.remove_hooks(gemini_dir)
+    from vaara.integrations import copilot
+
+    report.copilot_removed = copilot.remove_hooks(copilot_dir)
     for name, raw_path in KNOWN_MCP_CLIENTS:
         path = Path(raw_path).expanduser()
         if restore_mcp_config(path):

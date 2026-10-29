@@ -31,11 +31,13 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
 import _config  # noqa: E402
 from _deny_patterns import load_deny_rules, match_deny_rule  # noqa: E402
 from _notify import notify as _raw_notify  # noqa: E402
+from _trail_health import note_failure  # noqa: E402
 
 CFG = _config.load_config()
 
@@ -81,12 +83,12 @@ def _record_call(
     except ImportError:
         return
     db_path = _audit_db_path()
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    backend = SQLiteAuditBackend(db_path)
-    trail = backend.load_trail()
-    trail._on_record = backend.write_record
-    pipeline = InterceptionPipeline(trail=trail, enforce=False)
     try:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        backend = SQLiteAuditBackend(db_path)
+        trail = backend.load_trail()
+        trail._on_record = backend.write_record
+        pipeline = InterceptionPipeline(trail=trail, enforce=False)
         pipeline.intercept(
             agent_id=agent_id,
             tool_name=tool_name,
@@ -94,12 +96,56 @@ def _record_call(
             context=context,
             session_id=session_id,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        # Fail-open, and say so. Opening the trail used to sit outside this
+        # try, so an unreadable audit.db took the hook down with a traceback;
+        # everything after it was swallowed whole and the trail could stop
+        # recording without anything saying it had.
+        note_failure(db_path, exc, stage="record_call")
+
+
+def _ungovernable(tool_name: str, reason: str, shadow: bool) -> int:
+    """Verdict for an ``mcp__*`` call that cannot be scored or recorded.
+
+    Same posture as the missing engine below, reached by a different
+    route. The SQLite backend refuses to open a damaged trail on purpose
+    -- the evidence chain is the product, so it will not start a fresh
+    trail and leave a silent gap -- and that refusal used to end here at
+    a bare ``return 0``. Measured 2026-09-22: 162 failed writes in a
+    seventeen-minute window, a loud marker on disk throughout, and the
+    MCP calls in that window ran unscored anyway.
+
+    Only this path fails closed. Deny rules reach their verdict without
+    the trail, so a broken trail there costs evidence, not enforcement.
+    """
+    if shadow or _config.fail_open(CFG):
+        _emit(
+            f"vaara-governance: {reason}; passing {tool_name} through "
+            f"UNSCORED and UNRECORDED."
+        )
+        return 0
+    _emit(
+        f"vaara-governance: BLOCKED {tool_name} (fail-closed): {reason}, so "
+        f"this MCP call cannot be scored or recorded. Repair the trail "
+        f"(`vaara trail repair --db <db>` keeps every readable record and "
+        f"declares the rest; keep the damaged file, it is the evidence), or set \"fail_open\": true in "
+        f"~/.vaara/claude-code/config.json to pass through unscored."
+    )
+    notify("BLOCKED", tool_name, f"cannot govern this call: {reason}")
+    return 2
+
+
+def _call_id(event: dict) -> dict:
+    """The host's id for this call as request context, so PostToolUse binds the
+    outcome to it and not to the latest call of the same tool."""
+    value = event.get("tool_use_id")
+    value = value.strip()[:128] if isinstance(value, str) else ""
+    return {"tool_use_id": value} if value else {}
 
 
 def _classify_mcp(
-    tool_name: str, tool_input: dict, agent_id: str, session_id: str, shadow: bool
+    tool_name: str, tool_input: dict, agent_id: str, session_id: str, shadow: bool,
+    context: Optional[dict] = None,
 ) -> int:
     try:
         from vaara.audit.sqlite_backend import SQLiteAuditBackend
@@ -126,10 +172,14 @@ def _classify_mcp(
         return 2
 
     db_path = _audit_db_path()
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    backend = SQLiteAuditBackend(db_path)
-    trail = backend.load_trail()
-    trail._on_record = backend.write_record
+    try:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        backend = SQLiteAuditBackend(db_path)
+        trail = backend.load_trail()
+        trail._on_record = backend.write_record
+    except Exception as exc:
+        note_failure(db_path, exc, stage="open")
+        return _ungovernable(tool_name, "the audit trail cannot be opened", shadow)
     pipeline = InterceptionPipeline(trail=trail, enforce=not shadow)
 
     preset = _config.protection_preset(CFG)
@@ -159,10 +209,15 @@ def _classify_mcp(
             tool_name=tool_name,
             parameters=tool_input,
             session_id=session_id,
+            context=context or None,
         )
     except Exception as exc:
-        _emit(f"vaara-governance: classifier failed ({exc!r}); passing through.")
-        return 0
+        # The trail opened and the append failed underneath the scorer.
+        # Same outcome as a trail that never opened, so the same verdict.
+        note_failure(db_path, exc, stage="intercept")
+        return _ungovernable(
+            tool_name, f"the classifier failed ({exc!r})", shadow
+        )
 
     if result.allowed:
         return 0
@@ -219,6 +274,7 @@ def main() -> int:
                 "vaara_governance_layer": "deny_pattern",
                 "rule_id": rule_id,
                 "rule_message": message,
+                **_call_id(event),
             },
             session_id,
         )
@@ -241,12 +297,13 @@ def main() -> int:
         # against, so the call and its result both land.
         _record_call(
             tool_name, tool_input, agent_id,
-            {"vaara_governance_layer": "regex_pass"},
+            {"vaara_governance_layer": "regex_pass", **_call_id(event)},
             session_id,
         )
         return 0
 
-    return _classify_mcp(tool_name, tool_input, agent_id, session_id, shadow)
+    return _classify_mcp(tool_name, tool_input, agent_id, session_id, shadow,
+                         _call_id(event))
 
 
 if __name__ == "__main__":

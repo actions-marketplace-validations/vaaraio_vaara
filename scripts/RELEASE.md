@@ -53,10 +53,12 @@ What runs:
 1. Verifies the three pre-flight files exist, the CHANGELOG entry is
    present, and that `v<VERSION>`, the co-tag and `release/v<VERSION>`
    do not already exist locally.
-2. Bumps six manifests to `<VERSION>`: `pyproject.toml`,
+2. Bumps every file that carries the version to `<VERSION>`: `pyproject.toml`,
    `clients/ts/package.json`, `src/vaara/__init__.py`, `server.json`,
-   `server-vaara-server.json`, and the Claude Code plugin manifest under
-   `plugins/claude-code-vaara-governance/`. Each one is read back with a
+   `server-vaara-server.json`, the plugin manifest under
+   `plugins/claude-code-vaara-governance/`, the Helm chart `appVersion`,
+   `docs/supported-platforms.md`, and `CFBundleShortVersionString` in both
+   macOS bundles under `clients/macos/Sources/`. Each one is read back with a
    grep, so a sed that matched nothing fails the step.
 3. `ruff check` on changed Python paths, or on all of `src/vaara` and
    `tests` when the diff has no Python in it.
@@ -90,7 +92,9 @@ scripts/release_merge_and_tag.sh <PR_NUMBER> <VERSION> [CO_TAG]
 
 1. `gh pr checks --watch --required` blocks until all required checks
    pass (or fails the script if a required check fails).
-2. `gh pr merge --squash --delete-branch`.
+2. `gh pr merge --squash`, then `git push origin --delete release/v<VERSION>`.
+   The script does not use `--delete-branch`, because that also switches the
+   local checkout to `main` and fails when another worktree holds `main`.
 3. `git fetch origin main` and reads the merged SHA from `origin/main`
    directly (no `git checkout main`/`git pull`, which would need a clean
    local main and risks the destructive-reset path).
@@ -151,6 +155,38 @@ provenance via OIDC is the chunkier path). Token-based, no
 interactive `npm login`. Requires `VAARA_NPM_TOKEN` env var
 (npmjs.org > Access Tokens > Automation). Ships without provenance;
 restore the workflow before the next release.
+
+## 5. Upgrade the box's own install (do this every release)
+
+```
+uv tool upgrade vaara
+vaara --version        # must match the version just tagged
+```
+
+The Linux box runs Vaara against its own audit trail, so a stale install
+there means the trail and the menu-bar client show something other than
+what shipped. The install is a `uv` tool, not a pip package: the binary at
+`~/.local/bin/vaara` symlinks into `~/.local/share/uv/tools/vaara/`, and
+`pip show` will not see it.
+
+Sanity check after the upgrade. The hook writes to `audit_db` from
+`~/.vaara/claude-code/config.json`, and falls back to
+`~/.vaara/claude-code/audit.db` when that key is absent
+(`claude_code_hooks.py:60`). Read the path from there rather than assuming
+one, then check it:
+
+```
+python3 -c "import json,os,sqlite3;cfg=os.path.expanduser('~/.vaara/claude-code/config.json');d=json.load(open(cfg)) if os.path.exists(cfg) else {};p=os.path.expanduser(d.get('audit_db') or '~/.vaara/claude-code/audit.db');print(p);print(open(p,'rb') and [r[0] for r in sqlite3.connect('file:%s?mode=ro'%p,uri=True).execute('pragma integrity_check(5)')])"
+```
+
+It should print the path and `['ok']`. A missing file raises rather than
+reporting corruption, so check the path it printed before reading anything
+into the error. A malformed index fails silently: table scans keep working
+while any indexed query raises, and the client renders an empty feed instead
+of an error. `REINDEX` repairs it without touching the records.
+
+`trail_db` in `~/.vaara/config.json` is a different key, written by
+`vaara init --auto` into its discovery report. No hook reads it.
 
 ## Cross-repo follow-up
 

@@ -14,9 +14,9 @@ Deliberate constraints, each of them the reason this exists:
 - Binds 127.0.0.1 by default. The trail is the most sensitive thing on the box
   and nothing here should be reachable from the network by accident.
 - Settings are editable, because a Linux or Windows user should not be reading
-  a window while a macOS user changes the same values. Writes go through the
-  same vaara.menu helpers the macOS client uses, so the two cannot drift, and
-  only declared keys with declared values are accepted.
+  a window while a macOS user changes settings. Writes go through vaara.menu
+  into the hook's config.json, and only declared keys with declared values are
+  accepted. The macOS app keeps its own display settings in menubar.json.
 
 What stays native: the always-on traffic light and the approval prompt, because
 both have to exist when no browser is open.
@@ -24,10 +24,13 @@ both have to exist when no browser is open.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import secrets
 import socket
+import socketserver
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -93,19 +96,34 @@ def _load_trail(db_path: Optional[Path], trail_path: Optional[Path]) -> Any:
     return trail
 
 
-def _summarize(trail: Any) -> dict:
+def _alert_window(cfg: dict) -> int:
+    """Minutes the summary looks back for recent interventions (default 5)."""
+    try:
+        minutes = int(cfg.get("alert_window_minutes", 5))
+    except (TypeError, ValueError):
+        return 5
+    return minutes if minutes > 0 else 5
+
+
+def _summarize(trail: Any, window_minutes: int = 5) -> dict:
     records = list(trail._records)
     decisions = [r for r in records if (r.data or {}).get("decision")]
     counts = {"allow": 0, "escalate": 0, "deny": 0}
+    since = time.time() - window_minutes * 60
+    recent = {"minutes": window_minutes, "deny": 0, "escalate": 0}
     for r in decisions:
         d = str((r.data or {}).get("decision", "")).lower()
         if d in counts:
             counts[d] += 1
+        if d in ("deny", "escalate") and (r.timestamp or 0) >= since:
+            recent[d] += 1
     gaps = [r for r in records if getattr(r.event_type, "value", "") == "anchor_gap"]
     latest = decisions[-1] if decisions else None
     return {
         "records": len(records),
         "decisions": counts,
+        # Interventions inside the operator's alert window (alert_window_minutes).
+        "recent": recent,
         # A gap is not an error to hide. It is the period nobody witnessed, and
         # it belongs on the front of the dashboard rather than in a log file.
         "gaps": len(gaps),
@@ -137,15 +155,70 @@ def _history(trail: Any, limit: int) -> list[dict]:
     return out
 
 
-# Settings a non-macOS user was previously locked out of. Same config.json the
-# macOS client writes, via the same helpers, so the two cannot drift.
-# macOS-only keys (menubar_graph, webkitGovernance) are deliberately absent
+def _oslayer_state() -> dict:
+    """The Linux OS layer as the operator sees it: guard, picks, open questions."""
+    import sys
+
+    if not sys.platform.startswith("linux"):
+        return {"available": False}
+    from vaara.approvals import APPROVALS_DIR
+    from vaara.oslayer import floor, manage, selection
+
+    return {
+        "available": True,
+        "apparmor": floor.apparmor_enabled(),
+        "guard": manage.guard_status(),
+        "selection": selection.load(str(Path.home())).to_json(),
+        "modes": list(selection.MODES),
+        "pending": manage.pending(APPROVALS_DIR),
+    }
+
+
+def _oslayer_change(payload: dict) -> tuple[dict, int]:
+    """Apply one change from the page. Only these three actions exist."""
+    from vaara.oslayer import manage, selection
+
+    action = payload.get("action")
+    home = str(Path.home())
+    try:
+        if action == "folder":
+            mode = payload.get("mode")
+            if mode not in selection.MODES + ("off",):
+                return {"error": f"mode must be one of {', '.join(selection.MODES)} or off"}, 400
+            sel = selection.set_folder(selection.load(home), str(payload.get("path", "")),
+                                       None if mode == "off" else mode)
+        elif action == "app":
+            sel = selection.set_app(selection.load(home), str(payload.get("path", "")),
+                                    bool(payload.get("attach", True)))
+        elif action == "decide":
+            from vaara.approvals import write_decision
+
+            decision = payload.get("decision")
+            if decision not in ("approve", "deny"):
+                return {"error": "decision must be approve or deny"}, 400
+            if not write_decision(str(payload.get("action_id", "")), decision):
+                return {"error": "that request is no longer waiting"}, 409
+            return {"saved": decision}, 200
+        else:
+            return {"error": "unknown action"}, 400
+    except selection.SelectionError as exc:
+        return {"error": str(exc)}, 400
+    path, told = manage.save(sel, home)
+    return {"saved": action, "path": str(path), "guard_told": told}, 200
+
+
+# Settings a non-macOS user was previously locked out of, written to the hook's
+# config.json. notify_on and user_level are read by the hook's notify(),
+# approval_style by its approvals_timeout(), alert_window_minutes by
+# _summarize here. The macOS app reads its own copies from menubar.json.
+# macOS-only keys (menubar_graph, menubar_icon, webkitGovernance) are deliberately
+# absent
 # rather than shown and ignored.
 _SETTINGS: dict[str, dict] = {
     "user_level": {
         "label": "Detail level",
         "options": ["basic", "professional", "enterprise"],
-        "help": "How much a notification explains before you decide.",
+        "help": "How much a notification explains: basic names the decision and tool, professional adds risk and reason, enterprise adds the action id.",
     },
     "notify_on": {
         "label": "Notify on",
@@ -155,7 +228,7 @@ _SETTINGS: dict[str, dict] = {
     "approval_style": {
         "label": "Approval style",
         "options": ["blocking", "timeout"],
-        "help": "Whether an escalation waits for you, or denies when it times out.",
+        "help": "How long an escalation waits for you before it is denied: timeout waits for the approvals timeout (60 s unless set), blocking waits as long as the hook may (75 s).",
     },
     "alert_window_minutes": {
         "label": "Alert window (minutes)",
@@ -189,7 +262,22 @@ class _Handler(BaseHTTPRequestHandler):
     def _json(self, payload: Any, code: int = 200) -> None:
         self._send(json.dumps(payload).encode(), "application/json", code)
 
+    def _host_refused(self) -> bool:
+        # The token guards against a page in another tab, which cannot read
+        # it. A page whose name was rebound to 127.0.0.1 is same-origin and
+        # can, so the request's Host has to be a name no DNS answer can move:
+        # an IP address or localhost.
+        from vaara.integrations._http_origin import host_is_trusted
+
+        if host_is_trusted(self.headers.get("Host", ""), allowed=set()):
+            return False
+        self._json({"error": "this dashboard only answers to 127.0.0.1 or "
+                             "localhost"}, 403)
+        return True
+
     def do_GET(self) -> None:  # noqa: N802  (BaseHTTPRequestHandler API)
+        if self._host_refused():
+            return
         path = self.path.split("?", 1)[0]
         try:
             if path in ("/", "/index.html"):
@@ -202,8 +290,10 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(asset.read_bytes(), ctype)
                 return
             if path == "/api/summary":
+                from vaara.menu import _load_config
+
                 trail = _load_trail(self.db_path, self.trail_path)
-                self._json(_summarize(trail))
+                self._json(_summarize(trail, _alert_window(_load_config())))
                 return
             if path == "/api/history":
                 trail = _load_trail(self.db_path, self.trail_path)
@@ -211,6 +301,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/policy":
                 self._json(_policy_state(self.policy_path))
+                return
+            if path == "/api/oslayer":
+                self._json(_oslayer_state())
                 return
             if path == "/api/config":
                 from vaara.menu import CONFIG_PATH, _load_config
@@ -227,8 +320,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"error": repr(exc)}, 500)
 
     def do_POST(self) -> None:  # noqa: N802  (BaseHTTPRequestHandler API)
+        if self._host_refused():
+            return
         path = self.path.split("?", 1)[0]
-        if path not in ("/api/config", "/api/policy"):
+        if path not in ("/api/config", "/api/policy", "/api/oslayer"):
             self._json({"error": "not found"}, 404)
             return
         if self.headers.get("X-Vaara-Token", "") != self.token:
@@ -243,6 +338,13 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path == "/api/policy":
             self._write_thresholds(payload)
+            return
+        if path == "/api/oslayer":
+            try:
+                body, code = _oslayer_change(payload if isinstance(payload, dict) else {})
+            except Exception as exc:
+                body, code = {"error": repr(exc)}, 500
+            self._json(body, code)
             return
 
         from vaara.menu import CONFIG_PATH, _load_config, _save_config
@@ -293,11 +395,11 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"error": f"escalate ({esc}) must be below deny ({deny})"}, 400)
             return
 
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
         is_yaml = path.suffix in (".yaml", ".yml")
         if is_yaml:
             try:
-                import yaml
+                import yaml  # type: ignore[import-untyped]
             except ImportError:
                 self._json({"error": "editing a YAML policy needs the yaml extra"}, 400)
                 return
@@ -323,13 +425,40 @@ class _Handler(BaseHTTPRequestHandler):
         new_text = (yaml.safe_dump(data, sort_keys=False) if is_yaml
                     else _json.dumps(data, indent=2) + "\n")
         backup = path.with_suffix(path.suffix + ".bak")
-        backup.write_text(text)
-        path.write_text(new_text)
+        backup.write_text(text, encoding="utf-8", newline="\n")
+        path.write_text(new_text, encoding="utf-8", newline="\n")
         self._json({"saved": {"escalate": esc, "deny": deny},
                     "path": str(path), "backup": str(backup)})
 
     def log_message(self, *args: Any) -> None:
         """Silence the default stderr access log; this is a desktop tool."""
+
+
+def _is_loopback_bind(host: str) -> bool:
+    """Whether a bind address can only be reached from this machine."""
+    name = (host or "").strip().lower()
+    if name == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
+
+
+class _Server(ThreadingHTTPServer):
+    """ThreadingHTTPServer without the reverse lookup in server_bind.
+
+    HTTPServer.server_bind resolves the bound address with socket.getfqdn
+    before the dashboard can say where it is listening. On a host whose
+    resolver stalls on that lookup (seen on macOS) the dashboard sat silent
+    for over 30 seconds. The name is only used for the Server header.
+    """
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = int(port)
 
 
 def serve(
@@ -340,9 +469,30 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 7517,
     open_browser: bool = True,
+    allow_network: bool = False,
 ) -> int:
     if not _PAGE.exists():
         print(f"dashboard page missing: {_PAGE}")
+        return 2
+
+    # Bind guard, the same one `vaara serve` applies. The page carries the
+    # write token, and GET /api/config hands it to whoever fetches it. On a
+    # loopback bind that is the operator's own browser. On any other address
+    # it is anyone who can reach the port, who can then move the policy
+    # thresholds, rewrite the hook config and approve pending OS-layer
+    # escalations. The dashboard has no credential of its own, so a bind off
+    # loopback is refused unless the operator says the network is theirs.
+    local = _is_loopback_bind(host)
+    if not local and not allow_network:
+        print(
+            f"vaara dashboard: refusing to bind {host!r}.\n"
+            "The page carries the write token for policy thresholds, the hook\n"
+            "config and OS-layer approvals, and GET /api/config serves it to\n"
+            "any client that can reach the port. Keep the dashboard on\n"
+            "127.0.0.1 and reach it over an SSH tunnel (ssh -L 7517:127.0.0.1:7517),\n"
+            "or pass --allow-network if this bind is protected another way\n"
+            "(a private network segment, a container mapped to loopback)."
+        )
         return 2
 
     _Handler.db_path = Path(db).expanduser() if db else None
@@ -351,7 +501,7 @@ def serve(
     _Handler.token = secrets.token_urlsafe(24)
 
     try:
-        httpd = ThreadingHTTPServer((host, port), _Handler)
+        httpd = _Server((host, port), _Handler)
     except OSError as exc:
         print(f"cannot bind {host}:{port}: {exc}")
         return 1
@@ -360,9 +510,17 @@ def serve(
     source = db or trail or "(none: pass --db or --trail)"
     print(f"Vaara dashboard on {url}")
     print(f"  reading   {source}")
-    print(f"  bound to  {host} only, not reachable from the network")
-    print("  settings and policy thresholds are writable from the page")
-    print("  writes need a token served only in that page, Ctrl-C to stop")
+    if local:
+        print(f"  bound to  {host} only, not reachable from the network")
+        print("  settings and policy thresholds are writable from the page")
+        print("  writes need a token served only in that page, Ctrl-C to stop")
+    else:
+        print(
+            f"  WARNING   bound to {host}: anyone who can reach this port reads\n"
+            "            the trail and the write token, and can change policy\n"
+            "            thresholds, the hook config and OS-layer approvals"
+        )
+        print("  Ctrl-C to stop")
     if open_browser:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
     try:

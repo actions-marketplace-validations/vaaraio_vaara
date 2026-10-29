@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -36,7 +35,7 @@ CONFIG_PATH = Path.home() / ".vaara" / "claude-code" / "config.json"
 
 def load_config() -> dict:
     try:
-        data = json.loads(CONFIG_PATH.read_text())
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
@@ -91,17 +90,60 @@ def approvals_dir(cfg: dict) -> Path:
 
 
 def approvals_timeout(cfg: dict) -> float:
+    """Seconds an escalation waits for a human, ended inside the gate's
+    deadline so the wait closes on its own timeout record rather than being
+    cut off by the gate with nothing written.
+
+    approval_style, as the dashboard offers it: "timeout" waits for
+    approvals_timeout, "blocking" waits as long as the gate allows."""
+    from vaara.integrations._hook_gate import DEADLINE
+
     raw = os.environ.get("VAARA_PLUGIN_APPROVALS_TIMEOUT") or cfg.get("approvals_timeout")
     try:
         timeout = float(raw)  # type: ignore[arg-type]
     except (TypeError, ValueError):
-        return 60.0
-    return timeout if timeout > 0 else 60.0
+        timeout = 60.0
+    if timeout <= 0:
+        timeout = 60.0
+    deadline = DEADLINE
+    raw_deadline = os.environ.get("VAARA_HOOK_DEADLINE", "")
+    if raw_deadline.isdigit():  # read as the gate reads it
+        deadline = min(deadline, int(raw_deadline))
+    if cfg.get("approval_style") == "blocking":
+        timeout = float(deadline)
+    return max(min(timeout, deadline - 5.0), 0.5)
 
 
 def protection_preset(cfg: dict) -> Optional[str]:
     preset = os.environ.get("VAARA_PLUGIN_PROTECTION") or cfg.get("protection")
     return preset if isinstance(preset, str) and preset else None
+
+
+def policy_path(cfg: dict) -> Optional[Path]:
+    """The operator's policy file, the format ``vaara serve --policy`` takes."""
+    raw = os.environ.get("VAARA_PLUGIN_POLICY") or cfg.get("policy")
+    return Path(raw).expanduser() if isinstance(raw, str) and raw else None
+
+
+def load_policy(cfg: dict):
+    """The configured policy, or why it could not be loaded.
+
+    Returns ``(None, None)`` when no policy is configured, ``(policy, None)``
+    when it loaded, and ``(None, reason)`` when it is named and unusable.
+    """
+    path = policy_path(cfg)
+    if path is None:
+        return None, None
+    try:
+        from vaara.policy.validate import validate_source
+
+        policy, report = validate_source(path)
+    except Exception as exc:
+        return None, f"policy {path} could not be read ({exc!r})"
+    if policy is None:
+        issues = "; ".join(issue.message for issue in report.issues)
+        return None, f"policy {path} failed validation: {issues}"
+    return policy, None
 
 
 def article50_statement(cfg: dict) -> Optional[str]:
@@ -134,7 +176,11 @@ def custom_thresholds(cfg: dict) -> Optional[tuple[float, float]]:
         return None
     if isinstance(escalate, bool) or isinstance(deny, bool):
         return None
-    if not (0 <= escalate <= deny <= 1):
+    # Strictly below, as the policy schema requires. An equal pair used to
+    # pass this check, fail in apply_policy, and take the preset down with
+    # it, so the hook ran on the defaults while the operator's config named
+    # strict. Treated as malformed here, the preset still applies.
+    if not (0 <= escalate < deny <= 1):
         return None
     return float(escalate), float(deny)
 
@@ -142,9 +188,48 @@ def custom_thresholds(cfg: dict) -> Optional[tuple[float, float]]:
 # ---------------------------------------------------------------------------
 # notify (fire-and-forget; must never break a hook)
 
-def notify(cfg: dict, verdict: str, tool_name: str, detail: str) -> None:
-    if not notifications_enabled(cfg):
+# notify_on, as the dashboard offers it: which decisions raise a notification.
+# A trail outage is not a decision, so no choice here silences it.
+_NOTIFY_CLASSES = {
+    "BLOCKED": "deny", "DENIED": "deny", "SHADOW deny": "deny",
+    "ESCALATE": "escalate", "APPROVAL NEEDED": "escalate",
+}
+
+
+def _wanted(cfg: dict, verdict: str) -> bool:
+    kind = _NOTIFY_CLASSES.get(verdict)
+    if kind is None:
+        return True
+    choice = cfg.get("notify_on", "all")
+    if choice == "off":
+        return False
+    return choice not in ("deny", "escalate") or choice == kind
+
+
+def _explained(cfg: dict, verdict: str, detail: str, action_id: Optional[str]) -> str:
+    """user_level, as the dashboard offers it: how much a decision's
+    notification explains. basic names the verdict and tool only,
+    professional adds risk and reason, enterprise also the action id.
+    A trail alarm is not a decision and always explains itself."""
+    if verdict not in _NOTIFY_CLASSES:
+        return detail
+    level = cfg.get("user_level", "professional")
+    if level == "basic":
+        return ""
+    if level == "enterprise" and action_id:
+        suffix = f" (action_id={action_id})"
+        # notify() clips the body at 180; the id is the part to keep.
+        return detail[: max(180 - len(suffix), 0)] + suffix
+    return detail
+
+
+def notify(
+    cfg: dict, verdict: str, tool_name: str, detail: str,
+    action_id: Optional[str] = None,
+) -> None:
+    if not notifications_enabled(cfg) or not _wanted(cfg, verdict):
         return
+    detail = _explained(cfg, verdict, detail, action_id)
     try:
         clean = lambda text, limit: (  # noqa: E731
             text.replace('"', "'").replace("\\", "/").replace("\n", " ")[:limit]
@@ -171,59 +256,39 @@ def notify(cfg: dict, verdict: str, tool_name: str, detail: str) -> None:
 # ---------------------------------------------------------------------------
 # deny patterns
 
-def deny_patterns_path(explicit: Optional[str] = None) -> Optional[Path]:
-    if explicit:
-        return Path(explicit).expanduser()
-    override = os.environ.get("VAARA_PLUGIN_DENY_PATTERNS_FILE")
-    if override:
-        return Path(override).expanduser()
-    plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "")
-    if plugin_root:
-        candidate = Path(plugin_root) / "policies" / "default_deny.json"
-        if candidate.exists():
-            return candidate
-    bundled = Path(__file__).parent / "claude_code_deny.json"
-    return bundled if bundled.exists() else None
+from vaara.deny_rules import (  # noqa: E402
+    load_deny_rules as _load_deny_rules,
+    match_deny_rule as _match_deny_rule,
+)
 
 
 def load_deny_rules(explicit: Optional[str] = None) -> list[dict]:
-    path = deny_patterns_path(explicit)
-    if path is None or not path.exists():
-        return []
-    try:
-        doc = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        _emit(f"vaara-governance: deny-patterns load failed ({exc!r}); skipping layer 1.")
-        return []
-    return doc.get("rules", [])
+    return _load_deny_rules(explicit)
 
 
 def match_deny_rule(
     rules: list[dict], tool_name: str, tool_input: dict
 ) -> Optional[tuple[str, str]]:
-    for rule in rules:
-        if tool_name not in rule.get("tools", []):
-            continue
-        pattern = rule.get("pattern", "")
-        if not pattern:
-            continue
-        try:
-            regex = re.compile(pattern)
-        except re.error:
-            continue
-        for field in rule.get("fields", []):
-            value = tool_input.get(field, "")
-            if not isinstance(value, str):
-                continue
-            if regex.search(value):
-                return rule.get("id", "unknown"), rule.get("message", "deny rule matched")
-    return None
+    return _match_deny_rule(rules, tool_name, tool_input)
 
 
 # ---------------------------------------------------------------------------
 # runners
 
+#: The last line the runner emitted, for clients that carry the reason in
+#: their verdict (Cursor, Codex and Gemini CLI read it from stdout JSON).
+_last_message = ""
+
+#: The reason line when a human approved this call through the approvals
+#: handshake, else None. Claude Code reads a silent exit 0 as "no opinion"
+#: and runs its own permission flow, which can refuse the call the human
+#: just approved; run_pre_tool_use turns this into an explicit allow.
+_human_approval: Optional[str] = None
+
+
 def _emit(message: str) -> None:
+    global _last_message
+    _last_message = message
     print(message, file=sys.stderr, flush=True)
 
 
@@ -265,6 +330,123 @@ def _record_tool_name(record: object) -> str:
     return str(data.get("tool_name", ""))
 
 
+def _scorer():
+    """The hook's scorer: default thresholds, with the lineage store, so a
+    file planted by an outbound-then-persist sequence is remembered past this
+    session and a later session that touches it is labelled."""
+    from vaara.scorer.adaptive import AdaptiveScorer
+    from vaara.scorer.lineage import LineageStore
+
+    return AdaptiveScorer(lineage=LineageStore())
+
+
+def _sequence_relevant(tool_name: str, tool_input: dict) -> bool:
+    """True when this call can complete a dangerous sequence: it sends data
+    out, writes an agent-persistent file, or names a file an earlier session
+    planted. Such a call goes through the enforced pipeline, which replays
+    the session from the trail, rather than the record-only regex path, so a
+    matched sequence can hold it when the thresholds say so. At the default
+    thresholds these calls are allowed as before."""
+    try:
+        from vaara.scorer._param_signals import (
+            outbound_action, persist_paths_named, persistent_write,
+        )
+        from vaara.scorer.lineage import LineageStore
+
+        if outbound_action(tool_name, None, tool_input):
+            return True
+        if persistent_write(tool_name, None, tool_input):
+            return True
+        store = LineageStore()
+        return any(store.tainted(p) for p in persist_paths_named(tool_input))
+    except Exception:
+        return False
+
+
+def value_origin_enabled(cfg: dict) -> bool:
+    """Value-origin holds are on when the config says ``"value_origin": true``.
+
+    Off by default. Replayed over 34,601 recorded calls (256 sessions), 92 of
+    99 mail sends would have been held, every one a send the operator meant:
+    recipients found on web pages, in local files, and echoed back by a mail
+    allowlist tool. Right for an agent that pays or mails on content it reads;
+    too many questions for one whose job is outreach."""
+    return cfg.get("value_origin") is True
+
+
+def _value_origin(cfg: dict, tool_name: str, tool_input: dict) -> Optional[dict]:
+    """The authority arguments of this call whose value came only from a tool
+    result (``vaara.scorer.value_origin``), or None. Trusted values and extra
+    authority arguments come from the config (``trusted_values``,
+    ``authority_args``); ``"value_origin_strict": true`` passes only trusted
+    values. Never raises: a broken store holds nothing."""
+    if not value_origin_enabled(cfg):
+        return None
+    try:
+        from vaara.scorer.value_origin import OriginStore, authority_args, origin_hold
+
+        extra = cfg.get("authority_args")
+        extra = extra if isinstance(extra, dict) else None
+        if not authority_args(tool_name, tool_input, extra):
+            return None
+        trusted = cfg.get("trusted_values")
+        return origin_hold(
+            tool_name, tool_input, OriginStore(),
+            trusted=trusted if isinstance(trusted, list) else (),
+            extra_args=extra,
+            strict=cfg.get("value_origin_strict") is True,
+        )
+    except Exception as exc:
+        _emit(f"vaara-governance: value origin check failed ({exc!r}); not held on origin.")
+        return None
+
+
+#: Home directories whose files are the agent's own configuration and memory,
+#: not content it was handed.
+_OWN_DIRS = (".claude", ".vaara", ".config", ".codex", ".cursor", ".gemini")
+
+
+def _external_result(tool_name: str, tool_input: dict, cwd: object) -> bool:
+    """True when this tool's result is content from outside: the web, an MCP
+    server, or a file outside the project and outside the agent's own
+    configuration."""
+    if tool_name in ("WebFetch", "WebSearch") or tool_name.startswith("mcp__"):
+        return True
+    if tool_name != "Read":
+        return False
+    path = tool_input.get("file_path")
+    if not isinstance(path, str) or not path:
+        return False
+    try:
+        target = Path(path).expanduser().resolve()
+        home = Path.home().resolve()
+        if any(target.is_relative_to(home / d) for d in _OWN_DIRS):
+            return False
+        return not (isinstance(cwd, str) and cwd
+                    and target.is_relative_to(Path(cwd).resolve()))
+    except (OSError, ValueError):
+        return False
+
+
+def _harvest_result(cfg: dict, event: dict, action_id: str) -> None:
+    """Remember the authority-shaped values in an external tool result."""
+    if not value_origin_enabled(cfg):
+        return
+    tool_name = event.get("tool_name", "")
+    tool_input = event.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+    try:
+        if not _external_result(tool_name, tool_input, event.get("cwd")):
+            return
+        from vaara.scorer.value_origin import OriginStore, extract_any
+
+        OriginStore().note_external(extract_any(event.get("tool_response")),
+                                    tool_name=tool_name, action_id=action_id)
+    except Exception as exc:
+        _emit(f"vaara-governance: value origin not recorded ({exc!r}).")
+
+
 def _record_call(cfg: dict, agent: str, tool_name: str, tool_input: dict,
                  context: dict, session_id: str = "") -> None:
     """Write an ACTION_REQUESTED record for a call on the regex path.
@@ -283,63 +465,193 @@ def _record_call(cfg: dict, agent: str, tool_name: str, tool_input: dict,
     try:
         from vaara.pipeline import InterceptionPipeline
 
-        pipeline = InterceptionPipeline(trail=_open_trail(cfg), enforce=False)
+        pipeline = InterceptionPipeline(trail=_open_trail(cfg), enforce=False,
+                                        scorer=_scorer())
+        rule_id = context.get("rule_id")
         pipeline.intercept(
             agent_id=agent, tool_name=tool_name, parameters=tool_input,
             context=context, session_id=session_id,
+            # A deny rule's verdict is the decision on the record. Without
+            # this the chain carried the scorer's allow for a call the rule
+            # had blocked, so no view of the trail ever showed a block.
+            policy_decision="deny" if rule_id else None,
+            policy_reason=(f"deny rule {rule_id}: {context.get('rule_message', '')}"
+                           if rule_id else ""),
+            policy_id=f"deny_rule:{rule_id}" if rule_id else "",
+            # The pipeline here only scores; the hook's exit code is what
+            # stops the call, and it stops nothing in shadow mode.
+            enforcement="shadow" if shadow_mode(cfg) else "could_block",
         )
+    except Exception as exc:
+        _note_trail_failure(cfg, exc, stage="record_call")
+
+
+def _note_trail_failure(cfg: dict, exc: BaseException, *, stage: str) -> None:
+    """Say the trail is not recording, in those words, without blocking.
+
+    The call still goes through: fail-open is the right default, because a
+    governance hook that stops the session gets uninstalled and an
+    uninstalled hook records nothing at all. What changes is that the
+    operator finds out. Rate-limited by the marker, so a persistent outage
+    stays one visible line a minute instead of the per-call traceback that
+    hid this failure mode for thirteen days.
+    """
+    try:
+        from vaara.audit.write_failure import failure_banner, record_failure
+
+        state = record_failure(audit_db_path(cfg), exc, stage=stage)
+        if state is None:
+            _emit(f"vaara-governance: trail write failed ({exc!r}); NOT recording.")
+            return
+        if state.get("notify"):
+            _emit(failure_banner(state))
+            notify(
+                cfg, "TRAIL NOT RECORDING", "audit trail",
+                f"{state.get('count', '?')} failed writes since "
+                f"{state.get('first_failure_utc', 'an unknown time')}",
+            )
     except Exception:
+        # Reporting a failure must never become the failure.
         pass
 
 
-def run_pre_tool_use(deny_patterns: Optional[str] = None) -> int:
+def _ungovernable(cfg: dict, tool_name: str, reason: str, *,
+                  scored: bool = False) -> int:
+    """Verdict for an ``mcp__*`` call that cannot be scored or recorded.
+
+    The posture is not new. A missing ``vaara`` package already fails
+    closed on this path, with ``"fail_open": true`` as the documented
+    escape hatch, because a gate that waves everything through when its
+    engine is gone is not a gate. A trail that will not open is the same
+    condition reached by a different route, and the backend says so in
+    the exception it raises: the evidence chain is the product, so it
+    refuses rather than starting a fresh trail with a silent gap. That
+    refusal used to stop here, at a bare ``return 0``.
+
+    Measured 2026-09-22: 162 failed writes in a seventeen-minute window,
+    a loud marker on disk the whole time, and the calls in that window
+    still ran unscored. The marker was never the missing part.
+
+    Only the ``mcp__*`` path fails closed. Deny rules reach a verdict
+    without the trail, so a broken trail on the regex path costs evidence
+    and not enforcement; blocking every shell call there is how the hook
+    gets uninstalled, and an uninstalled hook records nothing at all.
+
+    ``scored`` is for the third route to the same place: the trail opened and
+    the pipeline scored the call, but the append behind the verdict was
+    refused. An allowed call would run with nothing on the chain to say so
+    (ran 2026-10-24), so it gets the same answer.
+    """
+    if shadow_mode(cfg) or fail_open(cfg):
+        passed = "UNRECORDED" if scored else "UNSCORED and UNRECORDED"
+        _emit(f"vaara-governance: {reason}; passing {tool_name} through {passed}.")
+        return 0
+    cannot = "was not recorded" if scored else "cannot be scored or recorded"
+    through = "unrecorded" if scored else "unscored"
+    _emit(
+        f"vaara-governance: BLOCKED {tool_name} (fail-closed): {reason}, so "
+        f"this MCP call {cannot}. Repair the trail "
+        f"(`vaara trail repair --db <db>` keeps every readable record and "
+        f"declares the rest; keep the damaged file, it is the evidence), or set \"fail_open\": true in "
+        f"~/.vaara/claude-code/config.json to pass through {through}."
+    )
+    notify(cfg, "BLOCKED", tool_name, f"cannot govern this call: {reason}")
+    return 2
+
+
+#: Clients whose events arrive in their own shape, and the module that
+#: translates them. Claude Code's events are already in the runner's shape.
+_CLIENT_MODULES = {
+    "opencode": "vaara.integrations.opencode",
+    "cursor": "vaara.integrations.cursor",
+    "codex": "vaara.integrations.codex",
+    "gemini": "vaara.integrations.gemini",
+    "copilot": "vaara.integrations.copilot",
+}
+
+
+def _client_module(client: Optional[str]):
+    name = _CLIENT_MODULES.get(client or "")
+    if name is None:
+        return None
+    import importlib
+
+    return importlib.import_module(name)
+
+
+def _client_events(
+    cfg: dict, client: Optional[str], event: dict,
+) -> tuple[list[dict], str, Optional[str], Optional[str]]:
+    """The hook events for this call, its agent id, its client, and who
+    renders the verdict.
+
+    A translated client's call becomes one or more events in the runner's
+    shape; a patch over several files becomes one per file for the deny
+    rules. Cursor also runs the Claude Code hooks it imports from
+    ``~/.claude/settings.json``, so a Cursor payload can arrive without
+    ``--client``. It is recognised by its shape and decided as Cursor's,
+    except when Vaara's native Cursor hook is installed too: then it
+    returns no events and the native hook decides, so one call is decided
+    once. The client is None for Claude Code. The renderer is None on the
+    imported path too, where Claude Code's exit codes apply.
+    """
+    render: Optional[str] = client
+    if client in (None, "claude-code"):
+        from vaara.integrations import cursor
+
+        if cursor.is_cursor_event(event):
+            if cursor.native_hook_installed():
+                return [], cursor.AGENT_ID, "cursor", None
+            client, render = "cursor", None
+    module = _client_module(client)
+    if module is None:
+        return [event], agent_id(cfg), None, None
+    agent = os.environ.get("VAARA_PLUGIN_AGENT_ID") or module.AGENT_ID
+    return module.to_hook_events(event), agent, client, render
+
+
+def _render(render: Optional[str], code: int) -> int:
+    """Print the verdict the client expects on stdout, if it expects one."""
+    module = _client_module(render)
+    if module is None or not hasattr(module, "render_pre"):
+        return code
+    out, code = module.render_pre(code, _last_message)
+    if out:
+        print(out, flush=True)
+    return code
+
+
+def run_pre_tool_use(deny_patterns: Optional[str] = None,
+                     client: Optional[str] = None) -> int:
     """PreToolUse: exit 0 allows, exit 2 blocks or holds for review."""
     cfg = load_config()
     if plugin_disabled(cfg):
+        return _render(client, 0)
+    events, agent, client, render = _client_events(cfg, client, _read_event())
+    if not events:
         return 0
-    event = _read_event()
-    tool_name = event.get("tool_name", "")
-    tool_input = event.get("tool_input", {}) or {}
-    if not isinstance(tool_input, dict):
-        tool_input = {"_raw": tool_input}
-    session_id = event.get("session_id", "")
-    agent = agent_id(cfg)
-    shadow = shadow_mode(cfg)
-
-    match = match_deny_rule(load_deny_rules(deny_patterns), tool_name, tool_input)
-    if match is not None:
-        rule_id, message = match
-        _record_call(
-            cfg, agent, tool_name, tool_input,
-            {
-                "vaara_governance_layer": "deny_pattern",
-                "rule_id": rule_id, "rule_message": message,
-            },
-            session_id,
-        )
-        if shadow:
-            _emit(f"vaara-governance: SHADOW deny on {tool_name} (rule={rule_id}): {message}")
-            notify(cfg, "SHADOW deny", tool_name, message)
-            return 0
-        _emit(f"vaara-governance: BLOCKED {tool_name} (rule={rule_id}). {message}")
-        notify(cfg, "BLOCKED", tool_name, message)
-        return 2
-
-    if not tool_name.startswith("mcp__"):
-        # Passed the deny rules. Record it anyway: a trail holding only
-        # the blocked calls cannot answer "what did the agent do", which
-        # is the question it exists for, and PostToolUse needs an
-        # ACTION_REQUESTED to correlate its outcome against.
-        _record_call(
-            cfg, agent, tool_name, tool_input,
-            {"vaara_governance_layer": "regex_pass"}, session_id,
-        )
+    code = _decide_pre(cfg, events, agent, deny_patterns,
+                       claude_code=client is None)
+    if client is None and code == 0 and _human_approval:
+        # Claude Code itself: only a human's approval speaks for the call.
+        # Anything else that passed stays silent, so Claude Code's own
+        # rules and mode still decide it.
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": _human_approval,
+        }}), flush=True)
         return 0
+    return _render(render, code)
 
-    from vaara.pipeline import InterceptionPipeline
 
-    pipeline = InterceptionPipeline(trail=_open_trail(cfg), enforce=not shadow)
-
+def _apply_protection(cfg: dict, pipeline) -> None:
+    """Bind the configured policy, or else the preset and custom thresholds,
+    to the scorer. A policy file is the whole policy and replaces both."""
+    policy, _ = load_policy(cfg)
+    if policy is not None:
+        pipeline.scorer.apply_policy(policy)
+        return
     preset = protection_preset(cfg)
     custom = custom_thresholds(cfg)
     if preset or custom:
@@ -359,14 +671,191 @@ def run_pre_tool_use(deny_patterns: Optional[str] = None) -> int:
                 f"using default thresholds."
             )
 
+
+#: What the session-start canary sends: one call that must be held for a
+#: human and one that must pass. Built at runtime so this file's own text
+#: does not trip a shell rule in a governed session.
+_CANARY_HOLD = ("Bash", {"command": "r" + "m -rf ./vaara-canary"})
+_CANARY_PASS = ("Bash", {"command": "ls"})
+
+
+def _report_hold_canary(cfg: dict) -> bool:
+    """Prove, at every session start, that this install holds a delete.
+
+    Fixes were tested, passed, and then stopped working unnoticed, because
+    the tests ran in a development environment and not in the install that
+    governs agents. This runs the installed code with the configured
+    thresholds against an in-memory trail, so nothing lands in the real
+    trail, and says so loudly when a delete would not reach a human.
+    """
+    try:
+        from vaara.audit.trail import AuditTrail
+        from vaara.pipeline import InterceptionPipeline
+        from vaara.scorer._param_signals import destructive_action
+
+        pipeline = InterceptionPipeline(trail=AuditTrail(), enforce=True)
+        _apply_protection(cfg, pipeline)
+        tool, params = _CANARY_HOLD
+        routed = bool(destructive_action(tool, params))
+        held = pipeline.intercept(agent_id="vaara-canary", tool_name=tool,
+                                  parameters=params).decision
+        tool, params = _CANARY_PASS
+        passed = pipeline.intercept(agent_id="vaara-canary", tool_name=tool,
+                                    parameters=params).decision
+        problem = []
+        if not routed:
+            problem.append("the hook does not route a delete to the scorer")
+        if held not in ("escalate", "deny"):
+            problem.append(f"a delete scored {held!r}")
+        if passed != "allow":
+            problem.append(f"a listing scored {passed!r}")
+    except Exception as exc:
+        problem = [f"the canary could not run ({exc!r})"]
+    if not problem:
+        _emit("vaara-governance: canary ok, a delete is held for you and a listing passes.")
+        return True
+    detail = "; ".join(problem)
+    _emit(f"vaara-governance: CANARY FAILED: {detail}. Deletes are NOT reaching you.")
+    notify(cfg, "CANARY FAILED", "session start", detail)
+    return False
+
+
+def _decide_pre(cfg: dict, events: list[dict], agent: str,
+                deny_patterns: Optional[str], claude_code: bool = False) -> int:
+    event = events[0]
+    tool_name = event.get("tool_name", "")
+    tool_input = event.get("tool_input", {}) or {}
+    if not isinstance(tool_input, dict):
+        tool_input = {"_raw": tool_input}
+    session_id = event.get("session_id", "")
+    shadow = shadow_mode(cfg)
+    # The host's id for this call rides on the request, so the outcome that
+    # follows binds to it rather than to the latest call of the same tool.
+    call_id = _tool_use_id(event)
+    call_context = {"tool_use_id": call_id} if call_id else {}
+
+    rules = load_deny_rules(deny_patterns)
+    match = match_deny_rule(rules, tool_name, tool_input)
+    for extra in events[1:]:
+        if match is not None:
+            break
+        match = match_deny_rule(rules, extra.get("tool_name", ""),
+                                extra.get("tool_input") or {})
+    matched_by = "tool"
+    if match is None and tool_name.startswith("mcp__"):
+        # An MCP server names its tools whatever it likes, so no rule's
+        # tool list can name them and the by-name match above never fires.
+        # The same payload a rule catches on Bash or Write reached the
+        # classifier here with nothing in front of it, and the classifier
+        # scores the tool-name taxonomy, not the payload (measured
+        # 2026-09-22: an upload of .env to a remote host through
+        # mcp__shell__run_command scored exactly as `ls`). Match by
+        # content instead, the way the MCP proxy already does.
+        from vaara.deny_rules import match_deny_rule_any_field
+
+        try:
+            match = match_deny_rule_any_field(rules, tool_input)
+        except Exception as exc:  # a broken rule must not take the hook down
+            _emit(f"vaara-governance: content deny rules failed ({exc!r}); skipping.")
+            match = None
+        matched_by = "content"
+    if match is not None:
+        rule_id, message = match
+        _record_call(
+            cfg, agent, tool_name, tool_input,
+            {
+                "vaara_governance_layer": "deny_pattern",
+                "rule_id": rule_id, "rule_message": message,
+                "matched_by": matched_by, **call_context,
+            },
+            session_id,
+        )
+        if shadow:
+            _emit(f"vaara-governance: SHADOW deny on {tool_name} (rule={rule_id}): {message}")
+            notify(cfg, "SHADOW deny", tool_name, message)
+            return 0
+        _emit(f"vaara-governance: BLOCKED {tool_name} (rule={rule_id}). {message}")
+        notify(cfg, "BLOCKED", tool_name, message)
+        return 2
+
+    from vaara.scorer._param_signals import argument_hold, destructive_action
+
+    policy, policy_error = load_policy(cfg)
+    if policy_error is not None:
+        # The operator named a policy and believes it decides. Deciding on
+        # the defaults instead would be the hook claiming what it does not do.
+        if shadow or fail_open(cfg):
+            _emit(f"vaara-governance: {policy_error}; deciding {tool_name} "
+                  f"WITHOUT the policy.")
+        else:
+            _emit(f"vaara-governance: BLOCKED {tool_name} (fail-closed): "
+                  f"{policy_error}. Fix the file, or remove \"policy\" from "
+                  f"~/.vaara/claude-code/config.json.")
+            notify(cfg, "BLOCKED", tool_name, policy_error)
+            return 2
+
+    origin = _value_origin(cfg, tool_name, tool_input)
+    if (policy is None and not tool_name.startswith("mcp__")
+            and origin is None
+            and not destructive_action(tool_name, tool_input)
+            and not argument_hold(tool_name, tool_input)
+            and not _sequence_relevant(tool_name, tool_input)):
+        # With a policy configured every call is the policy's to decide, so
+        # this shortcut is taken only without one.
+        # Passed the deny rules. Record it anyway: a trail holding only
+        # the blocked calls cannot answer "what did the agent do", which
+        # is the question it exists for, and PostToolUse needs an
+        # ACTION_REQUESTED to correlate its outcome against.
+        # A call that deletes or discards state, or whose arguments carry a
+        # short link, a literal credential or a form submission, does not stop
+        # here: it goes through the enforced pipeline below, which holds it
+        # for a human.
+        _record_call(
+            cfg, agent, tool_name, tool_input,
+            {"vaara_governance_layer": "regex_pass", **call_context}, session_id,
+        )
+        return 0
+
+    from vaara.integrations._record_before_effect import (
+        UNRECORDED, trail_failures,
+    )
+    from vaara.pipeline import InterceptionPipeline
+
+    try:
+        trail = _open_trail(cfg)
+    except Exception as exc:
+        # A trail that will not open used to take the hook down with it, with
+        # a traceback and no statement of what that meant. Record the outage
+        # durably, say plainly that nothing is being recorded, and do not let
+        # an MCP call through unscored on the strength of a warning.
+        _note_trail_failure(cfg, exc, stage="open")
+        return _ungovernable(cfg, tool_name, "the audit trail cannot be opened")
+    pipeline = InterceptionPipeline(trail=trail, enforce=not shadow, scorer=_scorer())
+    _apply_protection(cfg, pipeline)
+
+    failures_before = trail_failures(pipeline)
     try:
         result = pipeline.intercept(
             agent_id=agent, tool_name=tool_name,
             parameters=tool_input, session_id=session_id,
+            value_origin=origin, context=call_context or None,
         )
     except Exception as exc:
-        _emit(f"vaara-governance: classifier failed ({exc!r}); passing through.")
-        return 0
+        # The trail opened and the append failed underneath the scorer: the
+        # shape of the 05:08 window on 2026-09-22, where `load_trail` read
+        # the file and `intercept` raised on the write. Same outcome as a
+        # trail that never opened, so the same verdict.
+        _note_trail_failure(cfg, exc, stage="intercept")
+        return _ungovernable(cfg, tool_name, f"the classifier failed ({exc!r})")
+
+    if (result.allowed and tool_name.startswith("mcp__")
+            and trail_failures(pipeline) != failures_before):
+        # The append behind an allow was refused. The failure marker is
+        # already written by the trail; this is the verdict that follows it.
+        # Only the mcp__ path: a shell or file call reaches its verdict
+        # through the deny rules, and see _ungovernable for why that stays
+        # fail-open.
+        return _ungovernable(cfg, tool_name, UNRECORDED, scored=True)
 
     if result.allowed:
         return 0
@@ -374,18 +863,69 @@ def run_pre_tool_use(deny_patterns: Optional[str] = None) -> int:
     # `allowed` is `decision == "allow"`, so escalate never reached the
     # branch above; the handshake below is what actually handles it.
     if result.decision == "escalate":
-        return _handle_escalation(cfg, pipeline, result, tool_name)
+        if claude_code:
+            refused = _claude_code_denies(cfg, pipeline, result, tool_name,
+                                          tool_input, event.get("cwd"))
+            if refused is not None:
+                return refused
+        return _handle_escalation(cfg, pipeline, result, tool_name, tool_input)
 
     _emit(
         f"vaara-governance: BLOCKED {tool_name} "
         f"(risk {result.risk_score:.2f}, action_id={result.action_id}). "
         f"Reason: {result.reason}"
     )
-    notify(cfg, "BLOCKED", tool_name, f"risk {result.risk_score:.2f}: {result.reason}")
+    notify(cfg, "BLOCKED", tool_name, f"risk {result.risk_score:.2f}: {result.reason}",
+           action_id=result.action_id)
     return 2
 
 
-def _handle_escalation(cfg: dict, pipeline, result, tool_name: str) -> int:
+def _claude_code_denies(cfg: dict, pipeline, result, tool_name: str,
+                        tool_input: dict, cwd: object) -> Optional[int]:
+    """Refuse, without asking, a call a Claude Code deny rule refuses.
+
+    Claude Code applies its deny rules after this hook and a deny rule
+    beats the hook's allow, so a human approval of such a call is spent
+    on nothing (2026-10-01, twice in one evening). The rule's refusal is
+    recorded as the resolution, by policy and not by a person, and said
+    in the words the operator needs: which rule, and that nobody was asked.
+    None when no rule certainly refuses the call; the human is asked.
+    """
+    try:
+        from vaara.integrations.claude_code_permissions import (
+            deny_rules, matching_deny_rule,
+        )
+
+        rule = matching_deny_rule(
+            tool_name, tool_input,
+            deny_rules(cwd=cwd if isinstance(cwd, str) else None),
+        )
+    except Exception:
+        return None
+    if rule is None:
+        return None
+    try:
+        pipeline.resolve_escalation(
+            result.action_id, "deny",
+            reviewer="claude-code-deny-rule",
+            justification=f"Claude Code deny rule {rule} refuses this call",
+            approver="policy",
+        )
+    except Exception as exc:
+        _emit(f"vaara-governance: could not record resolution ({exc!r}).")
+    _emit(
+        f"vaara-governance: BLOCKED {tool_name} by Claude Code deny rule {rule} "
+        f"(action_id={result.action_id}). Not asking for approval: Claude Code "
+        f"refuses this call whatever the answer. Change the command, or the "
+        f"rule in your Claude Code settings."
+    )
+    notify(cfg, "BLOCKED", tool_name, f"Claude Code deny rule {rule}",
+           action_id=result.action_id)
+    return 2
+
+
+def _handle_escalation(cfg: dict, pipeline, result, tool_name: str,
+                       tool_input: Optional[dict] = None) -> int:
     """Block on the file-based approval handshake for an escalated action.
 
     The approvals directory is watched by whatever surface fronts the
@@ -395,7 +935,7 @@ def _handle_escalation(cfg: dict, pipeline, result, tool_name: str) -> int:
     """
     detail = f"risk {result.risk_score:.2f}: {result.reason}"
     if approvals_enabled(cfg):
-        notify(cfg, "APPROVAL NEEDED", tool_name, detail)
+        notify(cfg, "APPROVAL NEEDED", tool_name, detail, action_id=result.action_id)
         try:
             from vaara.approvals import request_approval
 
@@ -403,6 +943,7 @@ def _handle_escalation(cfg: dict, pipeline, result, tool_name: str) -> int:
                 result.action_id, tool_name, detail,
                 approvals_dir=approvals_dir(cfg),
                 timeout=approvals_timeout(cfg),
+                parameters=tool_input,
             )
         except Exception as exc:
             _emit(f"vaara-governance: approval handshake failed ({exc!r}); "
@@ -410,33 +951,62 @@ def _handle_escalation(cfg: dict, pipeline, result, tool_name: str) -> int:
             human = "timeout"
         if human in ("approve", "deny"):
             resolution = "allow" if human == "approve" else "deny"
+            justification = "human decision via ~/.vaara/approvals"
+            # A v2 decision was signed over these arguments' digest; say so,
+            # so the record shows which call the human answered. A v1
+            # decision (older surfaces) is not bound and says nothing more.
+            bound = getattr(human, "parameters_sha256", None)
+            if bound:
+                justification += f", signed over arguments sha256 {bound}"
             try:
                 pipeline.resolve_escalation(
                     result.action_id, resolution,
                     reviewer="approvals-handshake",
-                    justification="human decision via ~/.vaara/approvals",
+                    justification=justification,
+                    # A person wrote the decision file. Only approve and deny
+                    # reach here; timeout and an unreadable file both fall
+                    # through without resolving, so this branch is the one
+                    # place a human demonstrably acted.
+                    approver="human",
+                    human_disposed=True,
                 )
             except Exception as exc:
                 _emit(f"vaara-governance: could not record resolution ({exc!r}).")
         if human == "approve":
+            global _human_approval
             _emit(
                 f"vaara-governance: APPROVED {tool_name} by human "
                 f"(action_id={result.action_id})."
             )
+            _human_approval = _last_message
             return 0
         if human == "deny":
             _emit(
                 f"vaara-governance: DENIED {tool_name} by human "
                 f"(action_id={result.action_id})."
             )
-            notify(cfg, "DENIED", tool_name, detail)
+            notify(cfg, "DENIED", tool_name, detail, action_id=result.action_id)
             return 2
+        # Nobody answered. The hold ends here as a deny, and the trail says
+        # so: an escalation with no resolution reads the same as one still
+        # waiting, and AARM's conformance test for an unanswered STEP_UP or
+        # DEFER expects the deny and its resolution on the receipt. Policy
+        # disposed of it, so no human is claimed.
+        try:
+            pipeline.resolve_escalation(
+                result.action_id, "deny",
+                reviewer="approvals-timeout",
+                justification="no human decision before the approval timeout",
+                approver="policy",
+            )
+        except Exception as exc:
+            _emit(f"vaara-governance: could not record resolution ({exc!r}).")
     _emit(
         f"vaara-governance: ESCALATE {tool_name} blocked pending review "
         f"(risk {result.risk_score:.2f}, action_id={result.action_id}). "
         f"Reason: {result.reason}"
     )
-    notify(cfg, "ESCALATE", tool_name, detail)
+    notify(cfg, "ESCALATE", tool_name, detail, action_id=result.action_id)
     return 2
 
 
@@ -453,39 +1023,178 @@ def _outcome_severity(tool_response: object) -> float:
     return 0.0
 
 
-def run_post_tool_use() -> int:
+def run_post_tool_use(client: Optional[str] = None) -> int:
     """PostToolUse: append the outcome, feed the online learner. Never blocks."""
     cfg = load_config()
     if plugin_disabled(cfg):
         return 0
-    event = _read_event()
+    raw = _read_event()
+    events, agent, resolved, _ = _client_events(cfg, client, raw)
+    if not events:
+        return 0
+    event = events[0]
+    module = _client_module(resolved)
+    if module is not None:
+        event["tool_response"] = module.tool_response(raw)
     tool_name = event.get("tool_name", "")
     severity = _outcome_severity(event.get("tool_response", {}))
+    target_action_id = None
+    try:
+        target_action_id = _record_outcome(
+            cfg, agent, tool_name, severity, _tool_use_id(event))
+    finally:
+        _harvest_result(cfg, event, target_action_id or "")
+    return 0
 
+
+#: Outcome severity for a call that never ran. The learner is not told (see
+#: _record_outcome); this only rides on the record, at the middle of the range
+#: where the MCP proxy puts a request it never sent.
+_NOT_RUN_SEVERITY = 0.5
+
+
+def run_post_tool_use_failure() -> int:
+    """PostToolUseFailure: the call ran and failed. Never blocks.
+
+    The host's error text is not copied: it can quote file contents or a
+    credential the call touched, and the record only needs the state.
+    """
+    return _run_host_outcome(_failure_outcome)
+
+
+def run_permission_denied() -> int:
+    """PermissionDenied: the host's permission step refused a call Vaara let
+    through, so the call did not run. Never blocks and never asks for a retry.
+
+    The host's reason is not copied, for the same reason as a failure's error.
+    Claude Code sends this event only when auto mode denies; whether it does
+    while these hooks are installed has not been checked on a live session.
+    """
+    return _run_host_outcome(_denial_outcome)
+
+
+def _failure_outcome(event: dict) -> tuple[float, str, bool]:
+    if event.get("is_interrupt") is True:
+        return 1.0, "host reported the tool call was interrupted", True
+    return 0.7, "host reported the tool call failed", True
+
+
+def _denial_outcome(event: dict) -> tuple[float, str, bool]:
+    return (_NOT_RUN_SEVERITY,
+            "host permission step denied the call; it did not run", False)
+
+
+def _run_host_outcome(describe) -> int:
+    cfg = load_config()
+    if plugin_disabled(cfg):
+        return 0
+    events, agent, _, _ = _client_events(cfg, None, _read_event())
+    if not events:
+        return 0
+    event = events[0]
+    severity, description, ran = describe(event)
+    _record_outcome(cfg, agent, event.get("tool_name", ""), severity,
+                    _tool_use_id(event), description=description, ran=ran)
+    return 0
+
+
+def _tool_use_id(event: dict) -> str:
+    """The host's id for this call, or "" when it sent none or sent junk."""
+    value = event.get("tool_use_id")
+    return value.strip()[:128] if isinstance(value, str) else ""
+
+
+def _record_tool_use_id(record: object) -> str:
+    data = getattr(record, "data", None) or {}
+    context = data.get("context") if isinstance(data, dict) else None
+    value = context.get("tool_use_id") if isinstance(context, dict) else None
+    return value if isinstance(value, str) else ""
+
+
+def _outcome_target(trail, agent: str, tool_name: str,
+                    tool_use_id: str) -> Optional[str]:
+    """The action this outcome belongs to, or None.
+
+    With the host's id, exactly the request that carried it, once: a call the
+    host denied and then reports on again does not get a second outcome. A
+    request recorded without an id (a host that sends none, a call made before
+    the upgrade) is a fallback for an id nothing matches, and a request that
+    carries a different id is never one: that is another call. Without an id
+    the latest request for the tool that has no outcome yet, which is the old
+    rule less the duplicate.
+    """
+    answered = {r.action_id for r in trail._records
+                if _event_name(r.event_type) == "OUTCOME_RECORDED"}
+    unlabelled = None
+    for record in reversed(trail._records):
+        if record.agent_id != agent or _record_tool_name(record) != tool_name:
+            continue
+        if _event_name(record.event_type) != "ACTION_REQUESTED":
+            continue
+        recorded = _record_tool_use_id(record)
+        if tool_use_id and recorded == tool_use_id:
+            return None if record.action_id in answered else record.action_id
+        if record.action_id in answered:
+            continue
+        if not tool_use_id:
+            return record.action_id
+        if not recorded and unlabelled is None:
+            unlabelled = record.action_id
+    return unlabelled
+
+
+def _record_outcome(cfg: dict, agent: str, tool_name: str, severity: float,
+                    tool_use_id: str = "", *, description: str = "",
+                    ran: bool = True) -> Optional[str]:
+    """Report the outcome against the call it belongs to; its action id.
+
+    ``ran=False`` is a call the host refused after Vaara allowed it. The
+    pipeline does not learn from a call that never ran, so the pending slot is
+    cleared and the outcome goes on the chain without the scorer hearing it.
+    """
     db_path = audit_db_path(cfg)
     if not db_path.exists():
-        return 0
+        return None
     try:
         trail = _open_trail(cfg)
-        agent = agent_id(cfg)
-        target_action_id = None
-        for record in reversed(trail._records):
-            if record.agent_id != agent:
-                continue
-            if _record_tool_name(record) != tool_name:
-                continue
-            if _event_name(record.event_type) == "ACTION_REQUESTED":
-                target_action_id = record.action_id
-                break
+        target_action_id = _outcome_target(trail, agent, tool_name, tool_use_id)
         if target_action_id is None:
-            return 0
+            return None
         from vaara.pipeline import InterceptionPipeline
 
         pipeline = InterceptionPipeline(trail=trail)
         pipeline._pending_outcomes[target_action_id] = (0.5, {})
-        pipeline.report_outcome(target_action_id, outcome_severity=severity)
-    except Exception:
+        if ran:
+            pipeline.report_outcome(target_action_id, outcome_severity=severity,
+                                    description=description)
+        else:
+            pipeline._claim_pending_outcome(target_action_id)
+            trail.record_outcome(
+                action_id=target_action_id, agent_id=agent, tool_name=tool_name,
+                outcome_severity=severity, description=description,
+            )
+    except Exception as exc:
+        _note_trail_failure(cfg, exc, stage="post_tool_use")
+        return None
+    return target_action_id
+
+
+def run_user_prompt_submit() -> int:
+    """UserPromptSubmit: remember the authority-shaped values the user typed,
+    so a recipient or payee the user named is never held on origin. Prints
+    nothing (this hook's output joins the model's context) and never blocks."""
+    cfg = load_config()
+    if plugin_disabled(cfg) or not value_origin_enabled(cfg):
         return 0
+    prompt = _read_event().get("prompt")
+    if not isinstance(prompt, str) or not prompt:
+        return 0
+    try:
+        from vaara.scorer.value_origin import OriginStore, extract
+
+        OriginStore().note_user(extract(prompt))
+    except Exception:
+        pass
     return 0
 
 
@@ -505,11 +1214,19 @@ def run_session_start() -> int:
     notif = "on" if notifications_enabled(cfg) else "off"
     db_path = audit_db_path(cfg)
     existed = db_path.exists()
+    reported = False
+    verdict = None
     try:
-        _open_trail(cfg)
+        verdict = _open_trail(cfg)._load_verdict
         db_state = "existing" if existed else "created"
     except Exception as exc:
         db_state = f"unavailable ({exc!r})"
+        _note_trail_failure(cfg, exc, stage="open")
+        # That call already printed the banner and fired the notification for
+        # this exact marker. Letting the health report print it again would
+        # make session start say the same thing three times, which is the
+        # noise this whole change exists to remove.
+        reported = True
 
     disclosure = ""
     statement = article50_statement(cfg)
@@ -543,4 +1260,103 @@ def run_session_start() -> int:
         f"protection={preset}, notifications={notif}, audit_db={db_path} "
         f"[{db_state}]{disclosure}). Settings: /vaara-setup"
     )
+    _report_hook_registration()
+    if not reported:
+        _report_trail_health(cfg, db_path, existed, verdict)
+    _report_hold_canary(cfg)
     return 0
+
+
+def _report_hook_registration() -> None:
+    """Say what is registered to govern this session, when it is not one layer.
+
+    Silent on a healthy install. Session start is the only place this can
+    be said: the registration is fixed for the whole session, and from
+    inside a tool call neither a second layer nor a stale matcher is
+    visible. A doubled decision looks like two ordinary actions, and a
+    narrow matcher looks like a quiet day.
+    """
+    try:
+        from vaara.integrations.hook_registration import inspect_registration
+
+        for finding in inspect_registration():
+            _emit(finding.render())
+    except Exception:
+        # Reporting the wiring must never become the reason a session fails.
+        pass
+
+
+def _report_trail_health(cfg: dict, db_path: Path, existed: bool,
+                         verdict=None) -> None:
+    """Once per session, on the line the operator already reads.
+
+    Three questions, in order of how bad the answer is. Has this trail been
+    failing to record — the marker knows, across processes, which is the
+    thing nothing knew on 2026-08-22. Does the file still read clean —
+    which catches a trail damaged while nothing was writing to it, where
+    the first symptom would otherwise be the next record nobody is
+    watching. And is it running in a journal mode its filesystem can
+    survive — the one that has not gone wrong yet.
+
+    Last, a chain with gaps a repair declared. Opening the trail on every
+    tool call no longer logs them, because a known and recorded hole printed
+    as an integrity failure on every call reads the same as a new one. Here
+    it is said once, as what it is: not intact, and declared.
+    """
+    try:
+        from vaara.audit.sqlite_backend import journal_mode_warning
+        from vaara.audit.write_failure import active_failure, failure_banner, quick_check
+
+        state = active_failure(db_path)
+        if state is not None:
+            _emit(failure_banner(state))
+            notify(
+                cfg, "TRAIL NOT RECORDING", "audit trail",
+                f"{state.get('count', '?')} failed writes since "
+                f"{state.get('first_failure_utc', 'an unknown time')}",
+            )
+            return
+        if not existed:
+            return
+        problem = quick_check(db_path)
+        if problem is not None:
+            _emit(
+                f"vaara-governance: the audit trail at {db_path} does not read "
+                f"clean ({problem}). Records may not be persisting. Repair it "
+                f"with `vaara trail repair --db {db_path}`, which keeps every "
+                "readable record and declares any it cannot keep. Do not "
+                "delete the file, it is the evidence."
+            )
+            notify(cfg, "TRAIL DAMAGED", "audit trail", problem)
+            return
+        unsafe = journal_mode_warning(db_path)
+        if unsafe is not None:
+            _emit(
+                f"vaara-governance: the audit trail at {db_path} is intact, but "
+                f"{unsafe}. Vaara asks for DELETE journal mode on these mounts "
+                "and the switch needs a brief exclusive lock it did not get. "
+                "Close other Vaara processes and reopen the trail, or set "
+                "VAARA_TRAIL_JOURNAL_MODE=delete. If that variable is set to "
+                "wal, unset it."
+            )
+            notify(cfg, "TRAIL AT RISK", "audit trail", unsafe)
+        if verdict is not None and verdict.declared_gaps:
+            _emit(
+                f"vaara-governance: the audit trail at {db_path} is not "
+                f"intact. {verdict.summary()}. A repair recorded these losses "
+                "in the chain itself, and `vaara trail export` still reports "
+                "the chain as not intact. A break no repair declares is still "
+                "reported as an integrity failure on every call."
+            )
+        elif verdict is not None and verdict.erased:
+            _emit(
+                f"vaara-governance: the audit trail at {db_path} is not "
+                f"intact. {verdict.summary()}. Each erasure is named by a "
+                "record_erased record on the chain, and `vaara trail export` "
+                "still reports the chain as not intact."
+            )
+    except Exception:
+        # Reporting on the trail's health must never break the session it is
+        # reporting to. There is nowhere left to escalate to from here: the
+        # thing that would carry the error is the trail itself.
+        pass

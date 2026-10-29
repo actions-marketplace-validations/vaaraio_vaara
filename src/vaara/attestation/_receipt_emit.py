@@ -20,6 +20,7 @@ from vaara.attestation._receipt_types import (
     CryptoPosture,
     ExecutionReceipt,
     OutcomeDerived,
+    TIME_SOURCES,
     ReceiptAsserted,
     back_link_to_dict,
     outcome_to_dict,
@@ -78,6 +79,10 @@ def emit_receipt(
     version: int = 1,
     sig_suite: Optional[str] = None,
     crypto_posture: Optional[CryptoPosture] = None,
+    completeness: Optional[dict[str, Any]] = None,
+    aud: Optional[str] = None,
+    task_id: Optional[str] = None,
+    time_source: Optional[str] = None,
 ) -> ExecutionReceipt:
     """Build, JCS-canonicalize, and sign an ExecutionReceipt envelope.
 
@@ -93,7 +98,38 @@ def emit_receipt(
     Derive it with ``crypto_posture_for(alg=..., sig_suite=...)`` so it stays
     consistent with the signing algorithm and any hybrid suite; it is written
     into ``receiptAsserted`` and so covered by the signature.
+
+    ``completeness`` is the per-boundary ``{boundaryId, seq, runningCount}``
+    block. It rides inside ``receiptAsserted`` and therefore inside the signed
+    preimage, which is what makes a dropped receipt a provable gap with no
+    external witness. It closes dropped-in-the-middle; a pure tail truncation
+    still needs a timestamp anchor over the running count.
+
+    ``aud`` names the relying party the receipt is issued for. It rides inside
+    ``receiptAsserted`` and so inside the signed preimage. Absent means no
+    audience was bound; see ``verify_receipt_audience``.
+
+    ``task_id`` names the durable task this execution belongs to (an MCP
+    ``taskId`` when the call carried ``io.modelcontextprotocol/related-task``).
+    Same treatment as ``aud``: signed when present, absent means unbound; see
+    ``verify_receipt_task``.
+
+    ``time_source`` declares where ``iat`` came from (``ntp``, ``rtc``,
+    ``unsynced`` or ``tsa``). Signed when present, absent means unknown. An
+    issuer that declares ``tsa`` attaches the token afterwards with
+    ``attach_existence_proof``; see ``verify_receipt_time_source``.
     """
+    if aud is not None and not aud:
+        raise AttestationError("aud must be a non-empty string or None")
+    if task_id is not None and not task_id:
+        raise AttestationError("task_id must be a non-empty string or None")
+    if time_source is not None and not (
+        isinstance(time_source, str) and time_source in TIME_SOURCES
+    ):
+        raise AttestationError(
+            f"time_source must be one of {sorted(TIME_SOURCES)} or None; "
+            f"got {time_source!r}"
+        )
     if alg not in VALID_ALGS:
         raise AttestationError(f"unsupported alg: {alg!r}")
     if not back_link.attestation_digest.startswith("sha256:"):
@@ -112,6 +148,10 @@ def emit_receipt(
         alg=alg,
         sig_suite=sig_suite,
         crypto_posture=crypto_posture,
+        completeness=completeness,
+        aud=aud,
+        task_id=task_id,
+        time_source=time_source,
     )
 
     payload = _signing_payload(
@@ -159,6 +199,11 @@ def verify_receipt_signature(
     ``verifying_material`` is either a bytes shared secret (HS256) or a
     public-key object from ``cryptography.hazmat`` (ES256 / RS256).
     """
+    # The issuer block names the algorithm too, inside the signed bytes. A
+    # record whose two names disagree is refused before any key is tried, so
+    # no verifier has to pick which one to believe.
+    if receipt.receipt_asserted.alg != receipt.alg:
+        return False
     payload = _signing_payload(
         version=receipt.version,
         alg=receipt.alg,

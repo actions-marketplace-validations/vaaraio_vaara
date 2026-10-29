@@ -73,14 +73,14 @@ def _make_proxy(monkeypatch, *, emitter, **kwargs):
 
 def _attests(receipts_dir: Path) -> list[dict]:
     return [
-        json.loads(f.read_text())
+        json.loads(f.read_text(encoding="utf-8"))
         for f in sorted(receipts_dir.glob("*-attest.json"))
     ]
 
 
 def _receipts(receipts_dir: Path) -> list[dict]:
     return [
-        json.loads(f.read_text())
+        json.loads(f.read_text(encoding="utf-8"))
         for f in sorted(receipts_dir.glob("*-receipt.json"))
     ]
 
@@ -203,12 +203,14 @@ def test_upstream_error_maps_to_errored(monkeypatch, emitter, attest_receipts_di
     assert receipt["outcomeDerived"]["status"] == "errored"
 
 
-def test_upstream_raise_still_writes_paired_errored_receipt(
+def test_upstream_raise_still_writes_paired_receipt(
     monkeypatch, emitter, attest_receipts_dir
 ):
     # Transport failure: the upstream raises rather than returning an error
-    # response. The attestation is already written, so a paired errored
-    # receipt must still be emitted instead of leaving an orphan.
+    # response. The attestation is already written, so a paired receipt must
+    # still be emitted instead of leaving an orphan. A bare ProxyError may
+    # have reached the server with no reply read, so the receipt says
+    # unobserved, not errored.
     # _handle_tools_call re-raises; the proxy dispatch turns ProxyError into a
     # client error response one level up.
     from vaara.integrations._mcp_upstream import ProxyError
@@ -224,9 +226,9 @@ def test_upstream_raise_still_writes_paired_errored_receipt(
     receipt_files = sorted(attest_receipts_dir.glob("*-receipt.json"))
     assert len(attest_files) == 1
     assert len(receipt_files) == 1
-    # Pair shares the counter+nonce prefix, and the outcome is errored.
+    # Pair shares the counter+nonce prefix, and the outcome is unobserved.
     assert attest_files[0].name[:19] == receipt_files[0].name[:19]
-    assert _receipts(attest_receipts_dir)[0]["outcomeDerived"]["status"] == "errored"
+    assert _receipts(attest_receipts_dir)[0]["outcomeDerived"]["status"] == "unobserved"
 
 
 # ---------------------------------------------------------------------------
@@ -306,17 +308,27 @@ def test_manifest_fingerprint_upgrades_on_tools_list(
     assert emitter.fingerprint_for("default").startswith("manifest:sha256:")
 
 
-def test_manifest_fingerprint_idempotent(monkeypatch, emitter):
+def test_manifest_fingerprint_follows_every_tools_list(monkeypatch, emitter):
+    # The same list twice keeps the fingerprint; a changed list moves it.
+    # It used to freeze at the first list, so receipts certified a surface
+    # the server might no longer present.
     p, _ = _make_proxy(monkeypatch, emitter=emitter)
-    tools_response = {
+    p._upstream.request.return_value = {
         "jsonrpc": "2.0", "id": 1,
         "result": {"tools": [{"name": "t1"}]},
     }
-    p._upstream.request.return_value = tools_response
     p._handle_tools_list({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     first_fp = emitter.fingerprint_for("default")
     p._handle_tools_list({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     assert emitter.fingerprint_for("default") == first_fp
+    p._upstream.request.return_value = {
+        "jsonrpc": "2.0", "id": 1,
+        "result": {"tools": [{"name": "t1", "description": "now different"}]},
+    }
+    p._handle_tools_list({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    second_fp = emitter.fingerprint_for("default")
+    assert second_fp.startswith("manifest:sha256:")
+    assert second_fp != first_fp
 
 
 # ---------------------------------------------------------------------------
@@ -466,3 +478,46 @@ def test_emitted_authz_receipts_carry_contiguous_completeness(emitter):
         assert block["boundaryId"] == auth.evidence["coverage"]["boundary"]
         seqs.append((block["seq"], block["runningCount"]))
     assert seqs == [(0, 1), (1, 2)]
+
+
+# ------------------------------------------------- MCP Tasks: related-task id
+
+def test_related_task_id_is_signed_into_the_receipt(
+    monkeypatch, emitter, attest_receipts_dir, attest_key
+):
+    from vaara.attestation.receipt import (
+        RELATED_TASK_META_KEY,
+        parse_receipt,
+        verify_receipt_signature,
+        verify_receipt_task,
+    )
+    task = "786512e2-9e0d-44bd-8f29-789f320fe840"
+    p, _ = _make_proxy(monkeypatch, emitter=emitter)
+    p._handle_tools_call({
+        "jsonrpc": "2.0", "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "run_cmd", "arguments": {},
+            "_meta": {RELATED_TASK_META_KEY: {"taskId": task}},
+        },
+    })
+    receipt = parse_receipt(_receipts(attest_receipts_dir)[0])
+    assert verify_receipt_signature(receipt, verifying_material=attest_key.read_bytes())
+    assert receipt.receipt_asserted.task_id == task
+    assert verify_receipt_task(receipt, task).verdict == "bound"
+    assert verify_receipt_task(receipt, "another").verdict == "conflict"
+
+
+def test_call_without_related_task_emits_an_unbound_receipt(
+    monkeypatch, emitter, attest_receipts_dir
+):
+    from vaara.attestation.receipt import parse_receipt, verify_receipt_task
+    p, _ = _make_proxy(monkeypatch, emitter=emitter)
+    p._handle_tools_call({
+        "jsonrpc": "2.0", "id": 1,
+        "method": "tools/call",
+        "params": {"name": "run_cmd", "arguments": {}},
+    })
+    raw = _receipts(attest_receipts_dir)[0]
+    assert "taskId" not in raw["receiptAsserted"]
+    assert verify_receipt_task(parse_receipt(raw), "any").verdict == "unsupported"

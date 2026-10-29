@@ -17,7 +17,7 @@ jobs:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -36,8 +36,96 @@ jobs:
       - name: Lint (ruff)
         run: ruff check .
 
+      - name: Run tests, failing on an unreviewed skip
+        env:
+          # Read-only, for the PRIOR_ART date check against the releases API.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # This job installs only the server extra, so tests needing another
+        # extra skip here and run in the job that installs it. Each reason
+        # that may appear is listed in tests/ci_allowed_skips.txt; any other
+        # skip means a test stopped running and nothing said so.
+        run: |
+          set -o pipefail
+          pytest -q -rs | tee result.txt
+          python scripts/check_skips.py result.txt tests/ci_allowed_skips.txt
+
+  tests-rhel:
+    # The suite inside Red Hat's Universal Base Image 9, built from Red Hat
+    # Enterprise Linux 9 packages and free to use, so the result says whether
+    # Vaara works on RHEL and not only on Ubuntu.
+    runs-on: ubuntu-latest
+    container:
+      image: registry.access.redhat.com/ubi9/python-312:latest
+      options: --user 0
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Show the platform
+        run: |
+          cat /etc/redhat-release
+          python3 --version
+
+      # The checkout belongs to another uid than the container user, so git
+      # refuses it until the directory is marked safe. System config, because
+      # the suite points HOME elsewhere and a --global entry would not be read.
+      - name: Trust the checkout
+        run: git config --system --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install pinned deps
+        run: python3 -m pip install --require-hashes -r requirements-dev.txt
+
+      - name: Install Vaara (editable, no deps)
+        run: python3 -m pip install -e . --no-deps
+
+      - name: Install server extra (fastapi, uvicorn, httpx) for HTTP transport tests
+        run: python3 -m pip install 'fastapi>=0.110' 'uvicorn>=0.27' 'httpx>=0.27'
+
+      - name: Run tests, failing on an unreviewed skip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          python3 -m pytest -q -rs | tee result.txt
+          cat tests/ci_allowed_skips.txt tests/ci_allowed_skips_rhel.txt > allowed_skips_rhel.txt
+          python3 scripts/check_skips.py result.txt allowed_skips_rhel.txt
+
+  tests-other-os:
+    # Until this job existed the suite ran on Ubuntu only, so nothing said
+    # whether Vaara works on the macOS laptops most developers carry, or on
+    # Windows. Both legs are green and both now fail the run when they break.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install pinned deps
+        run: pip install --require-hashes -r requirements-dev.txt
+
+      - name: Install Vaara (editable, no deps)
+        run: pip install -e . --no-deps
+
+      - name: Install server extra (fastapi, uvicorn, httpx) for HTTP transport tests
+        run: pip install 'fastapi>=0.110' 'uvicorn>=0.27' 'httpx>=0.27'
+
       - name: Run tests
-        run: pytest -q
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          pytest -q -rs | tee result.txt
 
   adapter-contracts:
     name: Cloud adapter contracts
@@ -52,7 +140,7 @@ jobs:
     # optional extras, and pulling boto3, azure-core and google-cloud into
     # the hash-pinned dev lock would slow every matrix leg of the main job.
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python 3.12
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -62,7 +150,8 @@ jobs:
       - name: Install Vaara and the provider SDKs
         run: |
           pip install -e . --no-deps
-          pip install pytest boto3 azure-ai-contentsafety google-cloud-modelarmor rebuff
+          # rebuff pinned: an unpinned install resolves to 0.0.5, which predates RebuffSdk and rebuff.sdk
+          pip install pytest boto3 azure-ai-contentsafety google-cloud-modelarmor rebuff==0.1.1
 
       - name: Run contract tests, failing on any skip
         # Each contract class skips when its SDK is missing. In this job an
@@ -86,7 +175,7 @@ jobs:
     # one of the two cannot import. Keeping the sets apart means each
     # contract runs against the version a deployer would actually have.
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python 3.12
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -105,6 +194,68 @@ jobs:
                  tests/test_integrations_openai_agents_contract.py -q -rs | tee result.txt
           if grep -qE '[0-9]+ skipped' result.txt; then
             echo "::error::A contract test skipped, so a framework SDK did not import."
+            exit 1
+          fi
+
+  guardrail-contracts:
+    name: Guardrail and crew contracts
+    runs-on: ubuntu-latest
+    # The same idea for guardrails-ai, NeMo Guardrails and CrewAI: a real
+    # Guard with a local validator, a real LLMRails over langchain-core's
+    # fake chat model, real CrewAI tools, agents and hook contexts. Offline:
+    # no model is called and telemetry is off. llm-guard has its own job
+    # because it cannot resolve to a current release alongside these three.
+    env:
+      OTEL_SDK_DISABLED: 'true'
+      CREWAI_DISABLE_TELEMETRY: 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install Vaara and the libraries
+        run: |
+          pip install -e . --no-deps
+          pip install pytest guardrails-ai nemoguardrails crewai langchain-core "cbor2>=5.4" "cryptography>=41.0" "rfc8785>=0.1.4"
+
+      - name: Run contract tests, failing on any skip
+        run: |
+          set -o pipefail
+          pytest tests/test_integrations_guardrails_ai_contract.py \
+                 tests/test_integrations_nemo_guardrails_contract.py \
+                 tests/test_integrations_crewai_contract.py -q -rs | tee result.txt
+          if grep -qE '[0-9]+ skipped' result.txt; then
+            echo "::error::A contract test skipped, so a library did not import."
+            exit 1
+          fi
+
+  llm-guard-contract:
+    name: LLM Guard contract
+    runs-on: ubuntu-latest
+    # llm-guard pulls torch; the CPU wheel index keeps that to one download
+    # without CUDA. The scanners used (BanSubstrings, Secrets) load no model.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install Vaara and llm-guard
+        run: |
+          pip install -e . --no-deps
+          pip install pytest llm-guard --extra-index-url https://download.pytorch.org/whl/cpu
+
+      - name: Run contract tests, failing on any skip
+        run: |
+          set -o pipefail
+          pytest tests/test_integrations_llm_guard_contract.py -q -rs | tee result.txt
+          if grep -qE '[0-9]+ skipped' result.txt; then
+            echo "::error::A contract test skipped, so llm-guard did not import."
             exit 1
           fi
 
@@ -127,7 +278,7 @@ jobs:
     # score() to fetch all-MiniLM-L6-v2 at its pinned revision, the same
     # exposure preflight.sh already has.
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python 3.12
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -151,6 +302,49 @@ jobs:
             exit 1
           fi
 
+  gate-backends:
+    name: Scorer gate backends (trained, MC dropout, stacked)
+    runs-on: ubuntu-latest
+    # Same failure as the classifier job above, one layer over: the three
+    # per-action-step gate backends load a .joblib bundle from ~/.vaara/cache,
+    # no bundle ships, and nothing in the tree builds one. So the twelve tests
+    # over those 586 lines skipped on every machine and every matrix leg. The
+    # backends were executed nowhere at all.
+    #
+    # tests/gate_bundle_factory.py now builds bundles in the real format from
+    # the shipped featurizer, so the tests have something to load. They still
+    # cannot run in the main matrix: requirements-dev.txt carries no numpy,
+    # scikit-learn, joblib or torch, and torch on four legs is not worth it.
+    #
+    # Hence this job. Real extra, real code paths, and no skip tolerated — a
+    # skip here means an import broke and the backends went unexecuted again.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install Vaara with the gate extra
+        # The CPU wheel index keeps this off the CUDA build, which is ~2.5 GB.
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e '.[gate]'
+          pip install pytest
+
+      - name: Run the gate backend tests, failing on any skip
+        run: |
+          set -o pipefail
+          pytest tests/test_trained_gate.py \
+                 tests/test_mc_dropout_gate.py \
+                 tests/test_stacked_gate.py -q -rs | tee result.txt
+          if grep -qE '[0-9]+ skipped' result.txt; then
+            echo "::error::A gate backend test skipped, so the backend went unexecuted."
+            grep '^SKIPPED' result.txt
+            exit 1
+          fi
+
   no-private-keys:
     name: No private key material in the history
     runs-on: ubuntu-latest
@@ -165,7 +359,7 @@ jobs:
     # that commit introduces, so adding a key and deleting it in the next
     # commit fails the same way as leaving it in.
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0  # the range walk needs the base commit
 
@@ -188,6 +382,46 @@ jobs:
       - name: Scan the tree
         run: python scripts/check_no_private_keys.py --tree
 
+  default-install:
+    name: Plain pip install emits verifying receipts
+    runs-on: ubuntu-latest
+    # The README promises a receipt for every decision and leads with a plain
+    # `pip install vaara`. This builds the wheel, installs it into an empty
+    # venv with no extras, sends one allowed and one denied call through the
+    # Claude Code hook, and verifies both receipts offline against the trail.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Build the wheel
+        run: |
+          pip install --require-hashes -r .github/requirements-build.txt
+          python -m build --wheel --outdir dist
+
+      - name: Install it into an empty venv, no extras
+        run: |
+          python -m venv /tmp/plain
+          /tmp/plain/bin/pip install dist/vaara-*.whl
+
+      - name: One allow and one deny through the hook, then verify
+        env:
+          HOME: ${{ runner.temp }}/home
+        run: |
+          mkdir -p "$HOME"
+          echo '{"session_id":"ci","tool_name":"Read","tool_input":{"file_path":"/etc/hostname"},"hook_event_name":"PreToolUse","cwd":"/tmp"}' \
+            | /tmp/plain/bin/vaara hook pre-tool-use
+          set +e
+          echo '{"session_id":"ci","tool_name":"Bash","tool_input":{"command":"rm -rf /"},"hook_event_name":"PreToolUse","cwd":"/tmp"}' \
+            | /tmp/plain/bin/vaara hook pre-tool-use
+          test $? -eq 2 || { echo "::error::the deny call was not blocked"; exit 1; }
+          set -e
+          /tmp/plain/bin/vaara receipt verify-decision | tee verify.txt
+          grep -q '^2/2 verified' verify.txt
+
   signing-extras:
     name: Signing extras (attestation, scitt, timeanchor, pq, yaml)
     runs-on: ubuntu-latest
@@ -207,7 +441,7 @@ jobs:
     # module gated on one of these dependencies is caught without editing the
     # job, and the job cannot silently rot into passing on an empty run.
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python 3.12
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -217,14 +451,28 @@ jobs:
       - name: Install pinned deps
         run: pip install --require-hashes -r requirements-dev.txt
 
-      - name: Install Vaara with the signing extras
-        run: pip install -e '.[attestation,scitt,timeanchor,pq,yaml]'
+      - name: Install Vaara with the signing extras and the server extra
+        # The inference proxy and console tests guard on rfc8785 AND fastapi
+        # together. The matrix job had fastapi and no rfc8785, this job had
+        # rfc8785 and no fastapi, so those four files skipped in every job
+        # and nothing went red. This job now carries both, and the skip
+        # reasons those files print are in COVERED below. Found 2026-09-22.
+        # Since 2026-10-10 rfc8785 is in requirements-dev.txt as well: it is
+        # a base dependency, decision binding digests refuse to run without
+        # it, and the matrix job was testing an install that cannot exist.
+        # rich renders the standalone examples, which tests/test_examples_run.py
+        # starts as subprocesses; this is the job with the attestation extra
+        # the data-locality example needs, so it is the one that runs them.
+        # pycose is a second COSE implementation, used only by
+        # tests/test_receipt_rfc9942.py to check Vaara's RFC 9942 receipts with
+        # code that shares nothing with Vaara's own signer.
+        run: pip install -e '.[attestation,scitt,timeanchor,pq,yaml]' 'fastapi>=0.110' 'uvicorn>=0.27' 'httpx>=0.27' 'rich>=13' 'pycose>=1.1'
 
       - name: Run tests, failing on any skip these extras should have prevented
         run: |
           set -o pipefail
           pytest -q -rs | tee result.txt
-          COVERED='rfc8785|cbor2|asn1crypto|dilithium|yaml|attestation extra|timeanchor extra|pq extra'
+          COVERED='rfc8785|cbor2|asn1crypto|dilithium|yaml|pycose|attestation extra|timeanchor extra|pq extra|inference-proxy deps|console deps|proxy deps|examples need rich'
           if grep '^SKIPPED' result.txt | grep -qiE "$COVERED"; then
             echo "::error::A test skipped for a dependency this job installs, so signing-critical code went unexecuted."
             grep '^SKIPPED' result.txt | grep -iE "$COVERED"
@@ -235,7 +483,7 @@ jobs:
     name: Type check (mypy strict set)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python 3.12
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -251,11 +499,36 @@ jobs:
       - name: mypy
         run: mypy src/vaara/policy/
 
+      # The whole tree under the project's default (lenient) config, which
+      # reported 93 errors before the 2026-09-26 sweep and none after.
+      - name: mypy, whole tree
+        run: mypy src
+
+  security-lint:
+    name: Security lint (bandit, medium and up)
+    runs-on: ubuntu-latest
+    # Every medium or high finding was fixed or reviewed and marked with a
+    # reason on 2026-09-26, so a new one fails the build. Low findings
+    # (subprocess use, asserts) are not gated.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install bandit
+        run: pip install bandit==1.9.4
+
+      - name: bandit
+        run: bandit -c pyproject.toml -r src -ll
+
   helm-chart:
     name: Helm chart renders
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python 3.12
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -293,7 +566,7 @@ jobs:
     name: Pre-release smoke test (wheel + classifier)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python 3.12
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -302,3 +575,241 @@ jobs:
 
       - name: Run preflight smoke test
         run: ./scripts/preflight.sh
+
+  codex-e2e:
+    name: Codex governed (real binary)
+    runs-on: ubuntu-latest
+    # Runs the Codex CLI itself against a scripted local model, with the
+    # hooks `vaara init` writes, and reads back what Codex told the model
+    # and what the trail recorded. Pinned so a Codex release that changes
+    # the hook contract fails here on purpose, when the pin is moved.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install Vaara and Codex
+        run: |
+          pip install --require-hashes -r requirements-dev.txt
+          pip install -e . --no-deps
+          pip install 'fastapi>=0.110' 'uvicorn>=0.27' 'httpx>=0.27'
+          npm install -g @openai/codex@0.156.1
+          codex --version
+
+      # Codex runs commands in a bubblewrap sandbox, which Ubuntu's AppArmor
+      # default stops from creating user namespaces. With it allowed, the
+      # test also checks that an allowed patch really wrote its file.
+      - name: Allow unprivileged user namespaces for Codex's sandbox
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Run the Codex end-to-end test, failing on any skip
+        env:
+          VAARA_CODEX_SANDBOX: '1'
+        run: |
+          set -o pipefail
+          pytest tests/test_codex_real_binary.py \
+                 tests/test_proxy_gates_codex_real_binary.py -q -rs | tee result.txt
+          if grep -qE '[0-9]+ skipped' result.txt; then
+            echo "::error::The Codex test skipped, so Codex was not found."
+            exit 1
+          fi
+
+  claude-code-e2e:
+    name: Claude Code governed (real binary)
+    runs-on: ubuntu-latest
+    # Runs Claude Code itself against a scripted local Messages API, with the
+    # hooks `vaara init` writes, and reads back what Claude Code told the
+    # model, what the trail recorded and the signed receipt for each
+    # decision. It also drives an escalated MCP call through a signed human
+    # approve and deny. Pinned so a Claude Code release that changes the hook
+    # contract fails here on purpose, when the pin is moved.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: Install Vaara and Claude Code
+        run: |
+          pip install --require-hashes -r requirements-dev.txt
+          # The attestation extra: the engine signs a receipt per decision
+          # only with it, and the test checks those receipts.
+          pip install -e '.[attestation]'
+          npm install -g @anthropic-ai/claude-code@2.1.280
+          claude --version
+
+      - name: Run the Claude Code end-to-end test, failing on any skip
+        run: |
+          set -o pipefail
+          pytest tests/test_claude_code_real_binary.py \
+            tests/test_claude_code_escalation_real_binary.py -q -rs | tee result.txt
+          if grep -qE '[0-9]+ skipped' result.txt; then
+            echo "::error::The Claude Code test skipped, so Claude Code was not found."
+            exit 1
+          fi
+
+  gemini-e2e:
+    name: Gemini CLI governed (real binary)
+    runs-on: ubuntu-latest
+    # Runs the Gemini CLI itself against a scripted local model, with the
+    # hooks `vaara init` writes, and reads back what Gemini CLI told the
+    # model and what the trail recorded. Pinned so a Gemini CLI release that
+    # changes the hook contract fails here on purpose, when the pin is moved.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: Install Vaara and Gemini CLI
+        run: |
+          pip install --require-hashes -r requirements-dev.txt
+          pip install -e . --no-deps
+          npm install -g @google/gemini-cli@0.61.0
+          gemini --version
+
+      - name: Run the Gemini CLI end-to-end test, failing on any skip
+        run: |
+          set -o pipefail
+          pytest tests/test_gemini_real_binary.py -q -rs | tee result.txt
+          if grep -qE '[0-9]+ skipped' result.txt; then
+            echo "::error::The Gemini CLI test skipped, so Gemini CLI was not found."
+            exit 1
+          fi
+
+  copilot-e2e:
+    name: Copilot CLI governed (real binary)
+    runs-on: ubuntu-latest
+    # Runs the Copilot CLI itself against a scripted local model through its
+    # bring-your-own-model settings, offline and signed out, with the hooks
+    # `vaara init` writes, and reads back what Copilot CLI told the model and
+    # what the trail recorded. Pinned so a Copilot CLI release that changes
+    # the hook contract fails here on purpose, when the pin is moved.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: Install Vaara and Copilot CLI
+        run: |
+          pip install --require-hashes -r requirements-dev.txt
+          pip install -e . --no-deps
+          npm install -g @github/copilot@1.0.88
+          copilot --version
+
+      - name: Run the Copilot CLI end-to-end test, failing on any skip
+        run: |
+          set -o pipefail
+          pytest tests/test_copilot_real_binary.py -q -rs | tee result.txt
+          if grep -qE '[0-9]+ skipped' result.txt; then
+            echo "::error::The Copilot CLI test skipped, so Copilot CLI was not found."
+            exit 1
+          fi
+
+  os-layer-e2e:
+    name: Linux OS layer (kernel floor, guard, real agent)
+    runs-on: ubuntu-24.04
+    # The floor is an AppArmor profile and the guard a root fanotify listener,
+    # so this job runs both for real. The guard starts under sudo for the
+    # runner's account; the test then runs as that account and starts Copilot
+    # CLI, with no Vaara hooks, under `vaara run` against a scripted model.
+    # It reads back the files the model asked Copilot CLI to change and the
+    # guard's own trail, then runs Copilot CLI again with Vaara's hooks, whose
+    # verdicts reach it through the relay to `vaara run`.
+    #
+    # The guard marks the whole mount. If it stops answering, every open and
+    # exec on the runner waits with it, so this job has no log to show and
+    # cannot be cancelled, and no step inside it can report that state. The
+    # unit test in tests/test_oslayer.py covers the one cause seen so far: it
+    # fails when a decision loads compiled code after start().
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: Install Vaara and Copilot CLI
+        run: |
+          pip install --require-hashes -r requirements-dev.txt
+          pip install -e . --no-deps
+          npm install -g @github/copilot@1.0.88
+          copilot --version
+          sudo aa-status --enabled && echo "AppArmor enabled"
+
+      - name: Start the guard
+        run: |
+          sudo "$(command -v python)" -m vaara.cli os-guard --user "$USER" > guard.log 2>&1 &
+          for _ in $(seq 60); do
+            [ -S /run/vaara/os-guard.sock ] && break
+            sleep 1
+          done
+          if [ ! -S /run/vaara/os-guard.sock ]; then
+            cat guard.log
+            echo "::error::The guard did not start."
+            exit 1
+          fi
+
+      - name: Run the OS layer end-to-end test, failing on any skip
+        run: |
+          # The suite points HOME at a sandbox; this test needs the operator's
+          # real home, which is the one the guard serves.
+          # Twenty minutes is three bounded runs with room. Past that, SIGABRT
+          # makes pytest's faulthandler print every thread's stack before it
+          # dies, so a hang in the test names its line instead of holding the
+          # runner for six hours with an empty log.
+          # Output goes to a file, not through a pipe: an agent process left
+          # behind by a killed run would hold a pipe open and the step with it.
+          set +e
+          VAARA_TEST_USE_REAL_HOME=1 VAARA_OSLAYER_E2E=1 \
+            timeout -s ABRT -k 30 20m pytest tests/test_oslayer_e2e.py -q -rs > result.txt 2>&1
+          rc=$?
+          set -e
+          cat result.txt
+          sudo pkill -9 -f 'vaara.cli run' || true
+          sudo pkill -9 -f copilot || true
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::pytest exited $rc"
+            exit "$rc"
+          fi
+          if grep -qE '[0-9]+ skipped' result.txt; then
+            echo "::error::The OS layer test skipped, so it did not run."
+            exit 1
+          fi
+
+      - name: Guard log and kernel refusals
+        if: always()
+        run: |
+          cat guard.log || true
+          sudo dmesg | grep -E 'apparmor="DENIED"|suppressed' | tail -40 || true

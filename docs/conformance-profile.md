@@ -23,7 +23,7 @@ reproduce the published verdicts under the same checker. The aggregate runner
 `scripts/conformance_runner.py` discovers every suite, runs each checker in a
 subprocess, and returns a single pass/fail.
 
-Profile v1 covers the 44 suites listed below, at the `v0` vector format. The
+Profile v1 covers the 55 suites listed below, at the `v0` vector format. The
 authoritative, always-current enumeration for any tagged release is the runner's
 own `--list` output at that tag.
 
@@ -43,6 +43,16 @@ and ECDSA signature paths. Two suites need one more each: `pq_hybrid_v0` needs
 when their dependency is absent rather than failing the run. None of these is
 Vaara. The point of the profile is that you run standard public crypto, never
 the producer's stack.
+
+On Windows, check that Git did not rewrite the line endings. The SEP-2828
+corpus is pinned byte for byte, and Git for Windows installs with
+`core.autocrlf=true`, which converts LF to CRLF on checkout and breaks every
+digest without changing any content. The repository's `.gitattributes` prevents
+this on a fresh clone. An older clone is repaired with `git config
+core.autocrlf false`, then `git rm --cached -r .` and `git reset --hard`. The
+`conformance_statement_v0` suite detects the case and reports SKIP with that
+reason, so it is never counted as a failed suite or a disagreement with the
+spec.
 
 ## The one command
 
@@ -78,15 +88,17 @@ Inside a checker, two kinds of assertion are distinguished:
 
 Suites reported `SKIP`, not pass, in an aggregate run:
 
-- `article12_fold_v0` validates a bundle handed to it on the command line rather
-  than a bare directory of case files. It skips on every run. The runner lists
-  it explicitly so the gap reads as a gap, not as silent coverage.
 - `pq_hybrid_v0` and `qualified_time_v0` skip when their optional dependency is
   missing, with the reason printed. Install `dilithium_py` and `asn1crypto` and
   both run.
 
-So a clean checkout with `rfc8785` and `cryptography` alone grades 41 passed,
-0 failed, 3 skipped across the 44 suites.
+`article12_fold_v0` grades a produced regulator package rather than loose case
+files. One sample package per scenario is committed under its `packages/`
+directory, so its checker runs bare like every other suite. It can also be
+pointed at any package: `_check_independent.py <package.zip>`.
+
+So a clean checkout with `rfc8785` and `cryptography` alone grades 53 passed,
+0 failed, 2 skipped across the 55 suites.
 
 ## What a pass means, and what it does not
 
@@ -102,28 +114,34 @@ grows; conformance is always against a named version.
 ## Suites in Profile v1
 
 ```
-acp_checkout_v0            decision_pairing_v0
-agent_decision_v0          enforcement_attestation_v0
-agent_identity_v0          enforcement_set_v0
-ap2_v0                     evidence_bundle_v0
-article12_fold_v0          evidence_ref_v0
-atlas_threat_v0            execution_receipt_v0
-attestation_result_v0      external_evidence_v0
-audit_summary_v0           fallback_projection_v0
-authorization_v0           governance_decision_v0
-build_bundle_v0            handoff_set_v0
-bundle_doc_v0              ingest_v0
-bundle_set_v0              key_rotation_v0
-capability_scope_v0        normalize_v0
-class_gate_v0              pq_hybrid_v0
-conformance_statement_v0   qualified_time_v0
-contiguity_v0              record_conformance_v0
-credential_binding_v0      record_set_v0
-credential_grant_v0        release_condition_v0
-crewai_enforcement_v0      sep2787_attestation_v0
-cross_org_handoff_v0       tap_v0
-cross_stack_revocation_v0  transparency_consistency_v0
-data_locality_v0           x402_settlement_v0
+acp_checkout_v0                decision_vocabulary_v0
+agent_decision_v0              enforcement_attestation_v0
+agent_identity_v0              enforcement_set_v0
+ap2_v0                         enforcement_v0
+article12_fold_v0              evidence_bundle_v0
+atlas_threat_v0                evidence_ref_v0
+attestation_result_v0          execution_receipt_v0
+attribute_attestation_v0       external_evidence_v0
+attribute_attestation_zk_v0    fallback_projection_v0
+audit_summary_v0               governance_decision_v0
+authorization_v0               handoff_set_v0
+build_bundle_v0                hcs27_checkpoint_v0
+bundle_doc_v0                  ingest_v0
+bundle_set_v0                  key_rotation_v0
+cage_v0                        normalize_v0
+capability_scope_v0            pq_hybrid_v0
+capture_digest_only_v0         qualified_time_v0
+class_gate_v0                  record_conformance_v0
+conformance_statement_v0       record_set_v0
+contiguity_v0                  release_condition_v0
+credential_binding_v0          revocation_freshness_v0
+credential_grant_v0            sep2787_attestation_v0
+crewai_enforcement_v0          tap_v0
+cross_org_handoff_v0           trail_decision_v0
+cross_stack_revocation_v0      trail_rotation_v0
+data_locality_v0               transparency_consistency_v0
+decision_disposition_v0        x402_settlement_v0
+decision_pairing_v0
 ```
 
 ## Related

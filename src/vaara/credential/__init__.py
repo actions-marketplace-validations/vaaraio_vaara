@@ -37,7 +37,19 @@ from vaara.credential._grant_attenuation import (
     chain_is_attenuating,
 )
 from vaara.credential._grant_capability import Capability
-from vaara.credential._grant_emit import emit_grant, verify_grant_signature
+from vaara.credential._grant_emit import (
+    emit_grant,
+    signing_payload,
+    verify_grant_signature,
+)
+from vaara.credential._grant_mandate import (
+    EAA_Q_SERVICE_TYPE,
+    GrantMandate,
+    encode_attestation,
+    mandate_digest_of,
+    mandate_from_dict,
+    verify_mandate_binding,
+)
 from vaara.credential._grant_parse import (
     asserted_from_dict,
     binding_from_dict,
@@ -52,9 +64,48 @@ from vaara.credential._grant_types import (
     GrantScope,
 )
 from vaara.credential._grant_verify import GrantVerdict, verify_grant
+from vaara.credential._permission import (
+    PERMISSION_TYPE,
+    Limit,
+    Permission,
+    check_trail_against_permission,
+    evaluate_call,
+    permission_digest,
+    permission_from_dict,
+    Reviewer,
+    sign_permission,
+    verify_permission_signature,
+)
+from vaara.credential._review_signature import (
+    REVIEW_RESOLUTION_TYPE,
+    ReviewedResolution,
+    ReviewReport,
+    check_review_resolutions,
+    sign_resolution,
+)
+from vaara.credential._trail_grant import (
+    GrantedCall,
+    TrailGrantReport,
+    check_trail_against_grant,
+)
 from vaara.credential.gateway import CredentialGateway
 
 __all__ = [
+    "check_review_resolutions",
+    "sign_resolution",
+    "REVIEW_RESOLUTION_TYPE",
+    "Reviewer",
+    "ReviewedResolution",
+    "ReviewReport",
+    "check_trail_against_permission",
+    "verify_permission_signature",
+    "sign_permission",
+    "permission_from_dict",
+    "permission_digest",
+    "evaluate_call",
+    "Permission",
+    "PERMISSION_TYPE",
+    "Limit",
     "AUTHORIZATION_SCHEMA",
     "AttenuationReport",
     "AuthorizationReceipt",
@@ -65,23 +116,33 @@ __all__ = [
     "ClassGateDecision",
     "ContiguityReport",
     "CredentialGateway",
+    "EAA_Q_SERVICE_TYPE",
     "GrantAlgorithm",
     "GrantAsserted",
     "GrantBinding",
+    "GrantMandate",
     "GrantScope",
     "GrantVerdict",
+    "GrantedCall",
     "ReceiptSigner",
     "asserted_from_dict",
     "binding_from_dict",
     "build_authorization_evidence",
+    "check_trail_against_grant",
     "emit_grant",
+    "encode_attestation",
     "enforce_on_sealed_class",
     "evidence_binding_ok",
     "grant_from_dict",
+    "mandate_digest_of",
+    "mandate_from_dict",
     "mint_authorization_receipt",
     "mint_for_signer",
     "scope_from_dict",
+    "signing_payload",
+    "TrailGrantReport",
     "verify_contiguity",
     "verify_grant",
     "verify_grant_signature",
+    "verify_mandate_binding",
 ]

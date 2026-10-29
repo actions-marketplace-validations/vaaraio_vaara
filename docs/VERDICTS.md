@@ -9,7 +9,7 @@ collect for Article X?" This document answers "given that evidence,
 what does Vaara conclude, and why?"
 
 The rules described here are the same rules executed by
-`vaara.compliance.engine.ComplianceEngine.assess_conformity`. Every
+`vaara.compliance.engine.ComplianceEngine.assess`. Every
 report produced by `vaara compliance report` surfaces the inputs and
 the rationale per article in the `verdict_inputs` block.
 
@@ -83,17 +83,17 @@ the engine.
 |---|---|---|---|---|---|---|
 | 9(1) | Risk Management System | 10 | 720 h (30 d) | 20 | 180 h (7.5 d) | yes |
 | 9(2)(a) | Risk Identification and Analysis | 5 | 720 h | 10 | 180 h | yes |
-| 9(4)(a) | Risk Mitigation Measures | 3 | 720 h | 6 | 180 h | yes |
-| 9(7) | Testing Procedures | 10 | 720 h | 20 | 180 h | yes |
+| 9(5)(a) | Risk Mitigation Measures | 3 | 720 h | 6 | 180 h | yes |
+| 9(6) | Testing Procedures | 10 | 720 h | 20 | 180 h | yes |
 | 11(1) | Technical Documentation | n/a | n/a | n/a | n/a | yes (external) |
 | 12(1) | Record-Keeping (Logging) | 20 | 720 h | 40 | 180 h | yes |
 | 13(1) | Transparency and Provision of Information | 5 | 720 h | 10 | 180 h | yes |
 | 14(1) | Human Oversight: Design | 1 | 720 h | 2 | 180 h | yes |
 | 14(4)(d) | Human Oversight: Override Capability | 1 | 720 h | 2 | 180 h | no |
 | 15(1) | Accuracy, Robustness and Cybersecurity | 10 | 168 h (7 d) | 20 | 42 h | yes |
-| 26(10) | Deployer Obligations: Logging | 10 | 720 h | 20 | 180 h | yes |
+| 26(6) | Deployer Obligations: Logging | 10 | 720 h | 20 | 180 h | yes |
 | 50(1) | Transparency Obligation: AI System Disclosure | 1 | 720 h | 2 | 180 h | yes |
-| 61(1) | Post-Market Monitoring | 20 | 720 h | 40 | 180 h | yes |
+| 72(1) | Post-Market Monitoring | 20 | 720 h | 40 | 180 h | yes |
 | 73(1) | Serious Incident Reporting | 1 | 720 h | 2 | 180 h | no |
 
 Article 11(1) is the external-evidence row. It does not consume runtime
@@ -113,9 +113,24 @@ collapses the report to `evidence_insufficient` overall.
 
 | Article | Title | Min count | Staleness window | Strong-count | Strong-freshness | Critical |
 |---|---|---|---|---|---|---|
-| 10(1) | ICT Risk Management: Protection and Prevention | 5 | 720 h | 10 | 180 h | yes |
-| 12(1) | ICT Incident Detection | 10 | 720 h | 20 | 180 h | yes |
-| 13(1) | ICT Incident Response and Learning | 5 | 720 h | 10 | 180 h | no |
+| 9(1) | ICT Risk Management: Protection and Prevention | 5 | 720 h | 10 | 180 h | yes |
+| 10(1) | ICT Anomaly Detection | 10 | 720 h | 20 | 180 h | yes |
+| 13(1) | ICT Learning and Evolving | 5 | 720 h | 10 | 180 h | no |
+
+## SOC 2 per-criterion thresholds
+
+The two credential and change criteria are judged against a one-year
+window: key custodians and procedures change rarely, and a report that
+called them stale after thirty quiet days would be wrong.
+
+| Criterion | Title | Min count | Staleness window | Strong-count | Strong-freshness | Critical |
+|---|---|---|---|---|---|---|
+| CC6.1 | Logical Access Security | 10 | 720 h | 20 | 180 h | yes |
+| CC6.2 | Credential Registration and Removal | 1 | 8760 h | 2 | 2190 h | no |
+| CC6.3 | Access Authorisation by Role and Least Privilege | 5 | 720 h | 10 | 180 h | yes |
+| CC7.2 | Monitoring for Anomalies | 20 | 720 h | 40 | 180 h | yes |
+| CC7.3 | Evaluation of Security Events | 5 | 720 h | 10 | 180 h | yes |
+| CC8.1 | Change Management | 1 | 8760 h | 2 | 2190 h | no |
 
 ## What an auditor sees
 
@@ -173,6 +188,14 @@ The same article rendered after a broken chain produces:
 The second and third lines are preserved so an auditor can see what the
 verdict would have been on the underlying evidence had the chain held.
 The first line is the pin.
+
+A chain whose only breaks are gaps a repair declared on the chain itself
+(`REPAIR_GAP` records naming every lost sequence number) is pinned the
+same way, because what the lost records held cannot be shown. Its first
+line reads `Audit chain not intact (declared gap); ...` instead, and the
+gap names the lost sequence numbers and the repair record that declared
+them, so a reader can tell a declared loss from a break nothing accounts
+for.
 
 ## What this document is not
 

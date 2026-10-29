@@ -37,8 +37,38 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     from vaara.policy.schema import Policy
+    from vaara.scorer.lineage import LineageStore
 
 logger = logging.getLogger(__name__)
+
+
+def _balanced_thresholds() -> tuple[float, float]:
+    """The allow/deny pair for the balanced mode, from the mode table.
+
+    ``vaara.policy.modes`` is the document of record for what a named
+    operating point means, and it says balanced is "Vaara's default
+    operating point (0.55 / 0.85). Current behaviour when no mode is
+    selected." That second sentence was false: the constructor below
+    used 0.40 / 0.70, a pair belonging to no mode in the table, so a
+    caller who selected nothing got thresholds nobody had chosen.
+
+    Measured 2026-09-22 on a Claude Code install whose config had no
+    ``protection`` key: every MCP call escalated, because an upper
+    conformal bound of 0.427 clears 0.40 and does not clear 0.55.
+
+    Read through a function rather than imported at module scope to keep
+    the policy package off this module's import path, which it has never
+    been on: ``Policy`` above is a typing-only import.
+    """
+    from vaara.policy.modes import get_mode
+
+    mode = get_mode("balanced")
+    return mode.escalate, mode.deny
+
+
+#: Thresholds a scorer runs with when the caller selects nothing. Equal to
+#: the balanced mode by construction, so the table stays the single source.
+DEFAULT_THRESHOLD_ALLOW, DEFAULT_THRESHOLD_DENY = _balanced_thresholds()
 
 
 # ── Context coercion helpers ─────────────────────────────────────────────
@@ -74,10 +104,28 @@ def _coerce_optional_unit_float(value: Any) -> Optional[float]:
 # ── Decision types ────────────────────────────────────────────────────────
 
 class Decision(str, Enum):
-    """Scorer decision — allow, deny, or escalate for human review."""
+    """Scorer decision.
+
+    ALLOW, DENY and ESCALATE are the coarse vocabulary and they are frozen.
+    Published conformance checkers hold a closed verdict set (see
+    ``tests/vectors/record_set_v0/_check_independent.py``) and grade any
+    other value non-conforming, and independent parties already run those
+    checkers against pinned commits. Renaming one of these three is a
+    wire-format break dressed up as a refactor.
+
+    MODIFY, STEP_UP and DEFER are the AARM Core R4 refinements. They are
+    policy-layer names: each projects onto one of the coarse three at the
+    pipeline boundary (``vaara.pipeline._FINE_TO_COARSE``) and again at the
+    receipt boundary (``vaara.audit.receipts._VERDICT_TO_WIRE``). None of
+    them is permissive on its own, which is what keeps ``allowed`` a
+    single-meaning bool for every existing relying party.
+    """
     ALLOW = "allow"
     DENY = "deny"
     ESCALATE = "escalate"  # Human review required
+    MODIFY = "modify"      # Only with altered arguments; blocks, then retry
+    STEP_UP = "step_up"    # Only after stronger authentication; a hold
+    DEFER = "defer"        # Not now, possibly later; a hold
 
 
 @dataclass
@@ -133,7 +181,14 @@ class RiskAssessment:
                 )
 
     def to_backend_decision(self) -> dict:
-        """Convert to a plain decision dict (allowed/action/reason/backend)."""
+        """Convert to a plain decision dict (allowed/action/reason/backend).
+
+        ``allowed`` is True for ALLOW and nothing else, including the three
+        R4 refinements: MODIFY, STEP_UP and DEFER are all holds at the moment
+        the gate returns. The pipeline re-derives this bool from the decision
+        string anyway (see ``vaara.pipeline`` step 6) and does not trust the
+        value here, so the two must not be allowed to drift apart.
+        """
         return {
             "allowed": self.decision == Decision.ALLOW,
             "action": self.decision.value,
@@ -168,6 +223,49 @@ class SequencePattern:
     risk_boost: float              # Additive risk when pattern detected
     window_size: int = 10          # How many recent actions to scan
     description: str = ""
+    escalate: bool = False         # A match also holds the call for a human
+
+
+#: Label carried by any call that sends data off the machine (see
+#: _param_signals.outbound_action). Sequence steps match it like an action name.
+OUTBOUND_LABEL = "net.outbound"
+
+#: Label carried by any write into a location the agent host loads again in a
+#: later session: skills, memory, instruction files, hooks, MCP configuration
+#: (see _param_signals.persistent_write).
+PERSIST_LABEL = "agent.persist_write"
+
+#: Label carried by any call that names an agent-persistent file an earlier
+#: session wrote after an outbound call (see vaara.scorer.lineage). Added only
+#: when the scorer has a lineage store.
+TAINT_LABEL = "agent.tainted_read"
+
+
+def action_labels(tool_name: str, context: dict[str, Any]) -> frozenset[str]:
+    """Names a sequence step can match for this call.
+
+    The raw tool name, the classified action type the pipeline passes as
+    ``action_name`` (so ``read_file`` and ``Read`` both match ``data.read``),
+    and OUTBOUND_LABEL when the call sends data out. A web fetch classifies as
+    ``data.read`` by its name, but what it reads is the remote page, not the
+    agent's data, so an outbound fetch does not also count as the read.
+    PERSIST_LABEL is added when the call writes into an agent-persistent
+    location.
+    """
+    from vaara.scorer._param_signals import outbound_action, persistent_write
+    labels = {tool_name}
+    action_name = context.get("action_name")
+    action_name = action_name if isinstance(action_name, str) else None
+    if action_name and action_name != "unknown":
+        labels.add(action_name)
+    parameters = context.get("parameters")
+    if outbound_action(tool_name, action_name, parameters):
+        labels.add(OUTBOUND_LABEL)
+        if tool_name != "data.read":
+            labels.discard("data.read")
+    if persistent_write(tool_name, action_name, parameters):
+        labels.add(PERSIST_LABEL)
+    return frozenset(labels)
 
 
 # Built-in dangerous sequences — extensible at runtime
@@ -178,6 +276,33 @@ BUILTIN_SEQUENCES = [
         risk_boost=0.4,
         window_size=5,
         description="Read then export — possible data exfiltration",
+    ),
+    SequencePattern(
+        "read_then_outbound",
+        ("data.read", OUTBOUND_LABEL),
+        risk_boost=0.4,
+        window_size=5,
+        description="Read then an outbound call (mail, web fetch or search, "
+                    "shell network command) — data can leave through a "
+                    "different tool than the one that read it",
+    ),
+    SequencePattern(
+        "outbound_then_persist",
+        (OUTBOUND_LABEL, PERSIST_LABEL),
+        risk_boost=0.5,
+        window_size=8,
+        description="Outbound call (web fetch, mail, shell network command) "
+                    "then a write into a skill, memory, instruction or hook "
+                    "file — fetched content can steer every later session",
+    ),
+    SequencePattern(
+        "tainted_then_outbound",
+        (TAINT_LABEL, OUTBOUND_LABEL),
+        risk_boost=0.6,
+        window_size=8,
+        description="A file an earlier session wrote after an outbound call "
+                    "is read or loaded, then an outbound call follows: the "
+                    "planted instruction acting in a new session",
     ),
     SequencePattern(
         "data_destruction",
@@ -441,16 +566,21 @@ class ConformalCalibrator:
         key = self._bucket_key(category)
         with self._lock:
             bucket = self._ensure_bucket_locked(key)
-            bucket.append(residual)
             if len(bucket) >= self._min_calibration:
                 # FACI adaptive alpha update, scoped to this bucket so the
                 # default bucket's alpha trajectory cannot be perturbed by
                 # outcomes routed to a per-category bucket (and vice versa).
+                # Coverage is judged against the quantile the interval was
+                # built from, i.e. the calibration set BEFORE this residual:
+                # judging it against a set that already holds it lets the
+                # outcome widen the interval it is scored against, which
+                # overstates coverage (fixed 2026-09-26).
                 quantile = self._get_quantile_locked(key)
                 covered = residual <= quantile
                 err_t = 0.0 if covered else 1.0
                 alpha_t = self._alpha_t[key] + self._gamma * (self._alpha - err_t)
                 self._alpha_t[key] = min(0.5, max(0.001, alpha_t))
+            bucket.append(residual)
 
     def _get_quantile_locked(self, key: str) -> float:
         """Conformal quantile for the named bucket. Caller must hold ``self._lock``."""
@@ -460,17 +590,14 @@ class ConformalCalibrator:
         sorted_residuals = sorted(bucket)
         n = len(sorted_residuals)
         alpha_t = self._alpha_t.get(key, self._alpha)
-        # Quantile level: ceil((1 - alpha)(n + 1)) / n
-        level = math.ceil((1 - alpha_t) * (n + 1)) / n
-        level = min(1.0, level)
-        idx = min(int(level * n), n - 1)
+        # The k-th smallest residual, k = ceil((1 - alpha)(n + 1)), which is
+        # index k - 1. Kept in integers: the earlier level = k / n, then
+        # int(level * n), picked index k (one too high) and rested on a
+        # float product landing on a whole number. k > n clamps to the
+        # largest residual.
+        k = math.ceil((1 - alpha_t) * (n + 1))
+        idx = min(max(k, 1), n) - 1
         return sorted_residuals[idx]
-
-    def _get_quantile(self, category: Optional[str] = None) -> float:
-        """Conformal quantile from the named bucket's residuals."""
-        key = self._bucket_key(category)
-        with self._lock:
-            return self._get_quantile_locked(key)
 
     def predict_interval(
         self,
@@ -510,6 +637,11 @@ class AgentProfile:
     bad_outcomes: int = 0        # Actions that resulted in harm
     action_counts: dict[str, int] = field(default_factory=dict)
     recent_actions: deque = field(default_factory=lambda: deque(maxlen=50))
+    # Per entry of recent_actions, the names a sequence step can match.
+    recent_labels: deque = field(default_factory=lambda: deque(maxlen=50))
+    # Per entry of recent_actions, the action id the trail knows it by ("" when
+    # the caller gave none), so a matched sequence can name its earlier steps.
+    recent_ids: deque = field(default_factory=lambda: deque(maxlen=50))
     first_seen: float = 0.0
     last_seen: float = 0.0
 
@@ -525,16 +657,17 @@ class AgentProfile:
             return 0.0
         return self.bad_outcomes / self.total_actions
 
-    @property
-    def age_seconds(self) -> float:
-        if self.first_seen == 0:
-            return 0.0
-        return self.last_seen - self.first_seen
 
-    def record_action(self, action_name: str, timestamp: float) -> None:
+    def record_action(
+        self, action_name: str, timestamp: float,
+        labels: Optional[frozenset[str]] = None,
+        action_id: str = "",
+    ) -> None:
         self.total_actions += 1
         self.action_counts[action_name] = self.action_counts.get(action_name, 0) + 1
         self.recent_actions.append((action_name, timestamp))
+        self.recent_labels.append(labels or frozenset({action_name}))
+        self.recent_ids.append(action_id)
         if self.first_seen == 0:
             self.first_seen = timestamp
         self.last_seen = timestamp
@@ -603,8 +736,8 @@ class AdaptiveScorer:
 
     def __init__(
         self,
-        threshold_allow: float = 0.4,
-        threshold_deny: float = 0.7,
+        threshold_allow: float = DEFAULT_THRESHOLD_ALLOW,
+        threshold_deny: float = DEFAULT_THRESHOLD_DENY,
         alpha: float = 0.10,
         mwu_eta: float = 0.1,
         sequence_patterns: Optional[list[SequencePattern]] = None,
@@ -614,6 +747,7 @@ class AdaptiveScorer:
         pre_seed_calibration: bool = True,
         mondrian_categories: bool = False,
         policy_lookup: Optional[Callable[[str], Any]] = None,
+        lineage: Optional["LineageStore"] = None,
     ) -> None:
         """
         Args:
@@ -654,6 +788,11 @@ class AdaptiveScorer:
                 state, conformal calibrator, agent profiles, and sequence
                 detector remain shared across tenants — only threshold
                 application is per-tenant in v0.40.
+            lineage: Optional ``vaara.scorer.lineage.LineageStore``. When
+                set, a write that completes a sequence ending in an
+                agent-persistent write marks the written file, and a later
+                call naming a marked file carries TAINT_LABEL. None (the
+                default) keeps the scorer free of any file state.
         """
         if threshold_allow >= threshold_deny:
             raise ValueError(
@@ -683,6 +822,15 @@ class AdaptiveScorer:
 
         # Sequence patterns
         self._sequences = list(sequence_patterns or BUILTIN_SEQUENCES)
+        self._seq_escalate: Optional[str] = None
+        # Names of the patterns the current call matched, for the lineage mark.
+        self._seq_matched: list[str] = []
+        # Per matched pattern, the action ids of its earlier steps.
+        self._seq_steps: dict[str, list[str]] = {}
+        self._lineage = lineage
+        # (agent_id, session_id) pairs whose earlier actions are already in
+        # the agent's window, replayed or seen live; see seed_session.
+        self._seen_sessions: set[tuple[str, str]] = set()
 
         # Agent profiles (agent_id to AgentProfile). OrderedDict provides
         # LRU semantics: move_to_end on access, popitem(last=False) to
@@ -738,6 +886,7 @@ class AdaptiveScorer:
                 risk_boost=sp.risk_boost,
                 window_size=max(len(sp.pattern), 10),
                 description=", ".join(sp.regulatory),
+                escalate=sp.escalate,
             )
             for sp in policy.sequences
         ]
@@ -870,6 +1019,13 @@ class AdaptiveScorer:
         threshold_allow, threshold_deny = self._thresholds_for(tenant_id, tool_name)
 
         # Build risk signals from each expert
+        labels = action_labels(tool_name, context)
+        tainted = self._tainted_paths(context.get("parameters"))
+        if tainted:
+            labels = labels | {TAINT_LABEL}
+        session_id = context.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            self._seen_sessions.add((agent_id, session_id))
         signals = self._compute_signals(
             tool_name=tool_name,
             agent_id=agent_id,
@@ -877,6 +1033,7 @@ class AdaptiveScorer:
             agent_confidence=agent_confidence,
             reversibility=reversibility,
             blast_radius=blast_radius,
+            labels=labels,
         )
 
         # MWU-weighted combination
@@ -900,11 +1057,37 @@ class AdaptiveScorer:
         # risk to be averaged away by the experts. Floor the decision score so
         # the base install (no ML extra) does not silently allow it. Benign
         # and private hosts return 0.0 and leave the score untouched.
-        from vaara.scorer._param_signals import metadata_endpoint_risk
+        from vaara.scorer._param_signals import (
+            argument_hold,
+            destructive_action,
+            metadata_endpoint_risk,
+        )
         content_floor = metadata_endpoint_risk(context.get("parameters"))
         if content_floor > decision_score:
             decision_score = content_floor
             signals["parameter_content"] = content_floor
+
+        # A call that deletes or discards state is held for a human whatever
+        # the experts made of it: raised to the escalate line, never lowered,
+        # so a call already past the deny line stays denied.
+        destructive = destructive_action(tool_name, context.get("parameters"))
+        if destructive and decision_score < threshold_allow:
+            decision_score = threshold_allow
+            signals["destructive_action"] = threshold_allow
+
+        # A short link, a literal credential on an outbound call or a form
+        # submission is held the same way. Each shows only in the arguments,
+        # and each has an ordinary use a person can approve.
+        arg_hold = argument_hold(tool_name, context.get("parameters"))
+        if arg_hold and decision_score < threshold_allow:
+            decision_score = threshold_allow
+            signals["argument_hold"] = threshold_allow
+
+        # A matched sequence marked escalate holds the call the same way.
+        held_by = self._seq_escalate
+        if held_by and decision_score < threshold_allow:
+            decision_score = threshold_allow
+            signals["sequence_escalate"] = threshold_allow
 
         if decision_score < threshold_allow:
             decision = Decision.ALLOW
@@ -916,7 +1099,9 @@ class AdaptiveScorer:
         # Record this action in agent profile
         now = time.time()
         profile = self._get_or_create_agent(agent_id)
-        profile.record_action(tool_name, now)
+        call_id = context.get("action_id")
+        profile.record_action(tool_name, now, labels,
+                              call_id if isinstance(call_id, str) else "")
         if decision == Decision.DENY:
             profile.denied_actions += 1
         elif decision == Decision.ESCALATE:
@@ -932,6 +1117,28 @@ class AdaptiveScorer:
             f"[{lower:.3f}, {upper:.3f}] "
             f"(threshold allow<{threshold_allow} deny>{threshold_deny})"
         )
+        if content_floor > upper:
+            # The decision was taken on the content floor, not the interval.
+            # A reason that quoted only the interval read as "deny at 0.11
+            # under a 0.7 threshold", which contradicts itself.
+            explanation += f"; content floor {content_floor:.2f} decided"
+        if "destructive_action" in signals:
+            explanation += f"; destructive ({destructive}), held for a human"
+        if "argument_hold" in signals:
+            explanation += f"; {arg_hold}, held for a human"
+        if "sequence_escalate" in signals:
+            explanation += f"; sequence {held_by}, held for a human"
+        # Every other matched sequence is named too. A match that only raised
+        # the score left a bare number in the signals, and the trail could not
+        # say which pattern had moved the decision.
+        raised_by = [n for n in self._seq_matched
+                     if not ("sequence_escalate" in signals and n == held_by)]
+        if raised_by:
+            explanation += f"; sequence {', '.join(raised_by)} matched"
+        if tainted:
+            explanation += (f"; names {tainted[0]}, tainted: written after an "
+                            f"outbound call in an earlier session")
+        lineage_mark = self._lineage_mark(labels, context.get("parameters"))
 
         assessment = RiskAssessment(
             action_name=tool_name,
@@ -958,7 +1165,15 @@ class AdaptiveScorer:
         )
 
         # Return MS-compatible dict
-        return assessment.to_backend_decision()
+        result = assessment.to_backend_decision()
+        steps = {name: ids for name, ids in self._seq_steps.items() if ids}
+        if steps:
+            # The earlier actions that completed each matched sequence, by
+            # action id, for the decision record to name.
+            result["sequence_steps"] = steps
+        if lineage_mark is not None:
+            result["lineage_mark"] = lineage_mark
+        return result
 
     def dry_run_evaluate(self, context: dict[str, Any]) -> Any:
         """Score without mutating agent profiles, global history, or
@@ -997,6 +1212,7 @@ class AdaptiveScorer:
                 agent_confidence=agent_confidence,
                 reversibility=reversibility,
                 blast_radius=blast_radius,
+                labels=action_labels(tool_name, context),
             )
         finally:
             seq_logger.setLevel(prev_level)
@@ -1011,12 +1227,24 @@ class AdaptiveScorer:
         # a parameter pointing at a cloud-metadata endpoint must preview
         # as deny, otherwise vaara_check / /v1/score can say allow where
         # vaara_intercept denies — an inconsistent preview contract.
-        from vaara.scorer._param_signals import metadata_endpoint_risk
+        from vaara.scorer._param_signals import (
+            argument_hold,
+            destructive_action,
+            metadata_endpoint_risk,
+        )
         decision_score = upper
         content_floor = metadata_endpoint_risk(context.get("parameters"))
         if content_floor > decision_score:
             decision_score = content_floor
             signals["parameter_content"] = content_floor
+        if (destructive_action(tool_name, context.get("parameters"))
+                and decision_score < threshold_allow):
+            decision_score = threshold_allow
+        if (argument_hold(tool_name, context.get("parameters"))
+                and decision_score < threshold_allow):
+            decision_score = threshold_allow
+        if self._seq_escalate and decision_score < threshold_allow:
+            decision_score = threshold_allow
 
         if decision_score < threshold_allow:
             decision = Decision.ALLOW
@@ -1048,6 +1276,7 @@ class AdaptiveScorer:
         agent_confidence: Optional[float],
         reversibility: str,
         blast_radius: str,
+        labels: Optional[frozenset[str]] = None,
     ) -> dict[str, float]:
         """Compute risk signals from each expert."""
         signals: dict[str, float] = {}
@@ -1059,7 +1288,9 @@ class AdaptiveScorer:
         signals["agent_history"] = self._agent_history_signal(agent_id)
 
         # Expert 3: Temporal sequence patterns
-        signals["sequence_pattern"] = self._sequence_signal(agent_id, tool_name)
+        signals["sequence_pattern"] = self._sequence_signal(
+            agent_id, tool_name, labels
+        )
 
         # Expert 4: Action frequency / burst detection
         signals["action_frequency"] = self._burst_signal(agent_id)
@@ -1087,7 +1318,10 @@ class AdaptiveScorer:
 
         return min(1.0, max(0.0, risk))
 
-    def _sequence_signal(self, agent_id: str, current_tool: str) -> float:
+    def _sequence_signal(
+        self, agent_id: str, current_tool: str,
+        current_labels: Optional[frozenset[str]] = None,
+    ) -> float:
         """Detect dangerous action sequences in recent history.
 
         Runs two layers: (1) exact match against BUILTIN_SEQUENCES, and
@@ -1098,6 +1332,12 @@ class AdaptiveScorer:
         (e.g., data.export to infra.deploy to gov.vote) without producing
         false positives on single-category legitimate workflows.
         """
+        # Name of the first matched pattern marked escalate, read by the
+        # caller under the same lock; reset first so a call never inherits
+        # the previous call's hold.
+        self._seq_escalate = None
+        self._seq_matched = []
+        self._seq_steps = {}
         profile = self._agents.get(agent_id)
         if profile is None:
             return 0.0
@@ -1105,16 +1345,28 @@ class AdaptiveScorer:
         recent = list(profile.recent_actions)
         # Append current action for matching
         recent_names = [name for name, _ in recent] + [current_tool]
+        recent_labels = list(profile.recent_labels) + [
+            current_labels or frozenset({current_tool})
+        ]
+        # The current call has no earlier id to name; "" never reaches a record.
+        recent_ids = list(profile.recent_ids) + [""]
 
         max_boost = 0.0
         for pattern in self._sequences:
-            matched = self._matches_subsequence(
-                recent_names[-pattern.window_size:], pattern.actions
-            )
+            window = recent_labels[-pattern.window_size:]
+            positions = self._match_positions(window, pattern.actions)
             key = (agent_id, pattern.name)
             was_matched = self._seq_match_state.get(key, False)
-            if matched:
+            if positions is not None:
                 max_boost = max(max_boost, pattern.risk_boost)
+                self._seq_matched.append(pattern.name)
+                offset = len(recent_ids) - len(window)
+                self._seq_steps[pattern.name] = [
+                    recent_ids[offset + i] for i in positions
+                    if recent_ids[offset + i]
+                ]
+                if pattern.escalate and self._seq_escalate is None:
+                    self._seq_escalate = pattern.name
                 if not was_matched:
                     # Transition: new trip. Log once per entry into the
                     # matched state so the risk signal stays strong
@@ -1157,17 +1409,27 @@ class AdaptiveScorer:
         return min(1.0, max_boost)
 
     @staticmethod
-    def _matches_subsequence(history: list[str], pattern: tuple[str, ...]) -> bool:
-        """Check if pattern appears as an ordered subsequence in history."""
+    def _match_positions(
+        history: list, pattern: tuple[str, ...],
+    ) -> Optional[list[int]]:
+        """Indices in history of the earliest ordered match of pattern, or None.
+
+        A history entry is an action name or a set of names (action_labels);
+        a set matches a step when it contains the step's name.
+        """
         if not pattern:
-            return False
+            return None
         pi = 0
-        for action in history:
-            if action == pattern[pi]:
+        positions: list[int] = []
+        for index, action in enumerate(history):
+            hit = (pattern[pi] in action if isinstance(action, (set, frozenset))
+                   else action == pattern[pi])
+            if hit:
+                positions.append(index)
                 pi += 1
                 if pi == len(pattern):
-                    return True
-        return False
+                    return positions
+        return None
 
     def _burst_signal(self, agent_id: str) -> float:
         """Detect action bursts — too many actions in a short window."""
@@ -1210,6 +1472,91 @@ class AdaptiveScorer:
         # A gap where confidence is high but risk is high is suspicious
         gap = max(0.0, agent_confidence - (1.0 - base_risk))
         return min(1.0, gap)
+
+    # ── Session replay and lineage ────────────────────────────────
+
+    def session_seen(self, agent_id: str, session_id: str) -> bool:
+        """True when this scorer already holds the session's actions."""
+        with self._lock:
+            return (agent_id, session_id) in self._seen_sessions
+
+    def seed_session(
+        self, agent_id: str, session_id: str,
+        entries: list[tuple],
+    ) -> bool:
+        """Put a session's earlier actions into the agent's sequence window.
+
+        For a scorer that starts fresh per call (a host hook is one process
+        per tool call) and so has never seen the session. ``entries`` are the
+        earlier actions as ``(tool_name, action_name, parameters)`` or
+        ``(tool_name, action_name, parameters, action_id)``, oldest first; they are labelled the way a live call is, taint included. Only
+        the window is filled: the actions are not counted again as track
+        record, burst or denials, which the trail already holds. Returns
+        False, and does nothing, when this scorer has already seen the
+        session, so a long-lived process never counts an action twice.
+        """
+        key = (agent_id, session_id)
+        with self._lock:
+            if not session_id or key in self._seen_sessions:
+                return False
+            self._seen_sessions.add(key)
+            if len(self._seen_sessions) > self._max_tracked_agents:
+                self._seen_sessions.pop()
+            profile = self._get_or_create_agent(agent_id)
+            window = profile.recent_labels.maxlen or len(entries)
+            for entry in entries[-window:]:
+                tool_name, action_name, parameters = entry[:3]
+                action_id = entry[3] if len(entry) > 3 else ""
+                labels = action_labels(tool_name, {"action_name": action_name,
+                                                   "parameters": parameters})
+                if self._tainted_paths(parameters):
+                    labels = labels | {TAINT_LABEL}
+                profile.recent_actions.append((tool_name, 0.0))
+                profile.recent_labels.append(labels)
+                profile.recent_ids.append(action_id if isinstance(action_id, str) else "")
+            return True
+
+    def _tainted_paths(self, parameters: Any) -> list[str]:
+        if self._lineage is None:
+            return []
+        from vaara.scorer._param_signals import persist_paths_named
+        try:
+            return [p for p in persist_paths_named(parameters)
+                    if self._lineage.tainted(p) is not None]
+        except Exception:
+            logger.exception("lineage lookup failed; scoring without it")
+            return []
+
+    def _lineage_mark(self, labels: frozenset[str],
+                      parameters: Any) -> Optional[dict[str, str]]:
+        """The file this call would plant, as ``{"path", "pattern"}``, when it
+        is an agent-persistent write completing a sequence that ends in one.
+        Proposed, not written: whether the write can land is the caller's to
+        know (a deny rule or enforcement may stop it), so the pipeline
+        commits the mark with commit_lineage."""
+        if self._lineage is None or PERSIST_LABEL not in labels:
+            return None
+        names = {p.name: p for p in self._sequences}
+        hit = next((n for n in self._seq_matched
+                    if PERSIST_LABEL in names[n].actions), None)
+        if hit is None:
+            return None
+        from vaara.scorer._param_signals import persistent_write
+        path = persistent_write("", "data.write", parameters)
+        return {"path": path, "pattern": hit} if path else None
+
+    def commit_lineage(self, mark: Any, agent_id: str, session_id: str) -> None:
+        """Record a mark _lineage_mark proposed, once the write can land."""
+        if self._lineage is None or not isinstance(mark, dict):
+            return
+        path, pattern = mark.get("path"), mark.get("pattern")
+        if not isinstance(path, str) or not isinstance(pattern, str):
+            return
+        try:
+            self._lineage.mark(path, agent_id=agent_id, session_id=session_id,
+                               pattern=pattern)
+        except Exception:
+            logger.exception("lineage mark failed for %s", path)
 
     # ── Agent management ──────────────────────────────────────────
 
@@ -1323,24 +1670,6 @@ class AdaptiveScorer:
 
     # ── Sequence pattern management ───────────────────────────────
 
-    def add_sequence_pattern(self, pattern: SequencePattern) -> None:
-        """Register a new dangerous sequence pattern.
-
-        A pattern with the same name replaces the existing one so repeated
-        registration (e.g. on hot reload) stays idempotent instead of
-        silently accumulating duplicates.
-        """
-        with self._lock:
-            self._sequences = [p for p in self._sequences if p.name != pattern.name]
-            self._sequences.append(pattern)
-
-    def remove_sequence_pattern(self, name: str) -> bool:
-        """Remove a sequence pattern by name."""
-        with self._lock:
-            before = len(self._sequences)
-            self._sequences = [p for p in self._sequences if p.name != name]
-            return len(self._sequences) < before
-
     # ── Introspection ─────────────────────────────────────────────
 
     @property
@@ -1363,6 +1692,31 @@ class AdaptiveScorer:
     @property
     def thresholds(self) -> tuple[float, float]:
         return (self._threshold_allow, self._threshold_deny)
+
+    def policy_state(self) -> dict[str, Any]:
+        """What an operator configured this scorer to decide by, as plain JSON.
+
+        Thresholds, sequence patterns and the loaded policy. Learned state
+        (calibration, expert weights, agent profiles) moves with every
+        decision and is not part of it. A per-tenant policy lookup is named
+        as present; the policies behind it are not listed.
+        """
+        from vaara.policy_state import jsonable
+
+        with self._lock:
+            state: dict[str, Any] = {
+                "scorer": type(self).__name__,
+                "thresholds": {"allow": self._threshold_allow, "deny": self._threshold_deny},
+                "sequences": [
+                    {"name": s.name, "actions": list(s.actions), "riskBoost": s.risk_boost,
+                     "windowSize": s.window_size, "escalate": bool(s.escalate)}
+                    for s in self._sequences
+                ],
+                "perTenantPolicies": self._policy_lookup is not None,
+            }
+            if self._default_policy is not None:
+                state["policy"] = jsonable(self._default_policy)
+        return state
 
     def status(self) -> dict[str, Any]:
         """Dashboard-friendly status snapshot."""

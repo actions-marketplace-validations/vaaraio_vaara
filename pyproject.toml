@@ -4,13 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vaara"
-version = "1.71.0"
+version = "2.17.0"
 description = "Accountable Autonomy for AI agents under the EU AI Act: policy-gated tool calls, hash-chained tamper-evident audit trails with external time anchoring, and independently verifiable attestation plus execution receipts per MCP tool call"
 requires-python = ">=3.10"
 license = "AGPL-3.0-or-later"
 authors = [{ name = "Henri Sirkkavaara", email = "hello@vaara.io" }]
 readme = "README.md"
-dependencies = []
+# The signing libraries are in the base install because every decision the
+# engine records leaves a signed receipt (vaara.audit.decision_receipts), and a
+# plain `pip install vaara` has to deliver that. All three ship wheels or are
+# pure Python on every supported platform.
+dependencies = ["cbor2>=5.4", "cryptography>=41.0", "rfc8785>=0.1.4"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -51,20 +55,32 @@ dev = [
 ]
 export = ["cryptography>=41.0"]
 ml = ["xgboost>=2.0", "scikit-learn>=1.3", "joblib>=1.3", "numpy>=1.24", "sentence-transformers>=2.6"]
+# The three per-action-step gate backends in vaara.scorer. torch was required
+# by mc_dropout_gate.py and declared nowhere, so `pip install vaara[ml]` gave
+# you a module that could not import. Separate from ml because the gate
+# backends need neither xgboost nor sentence-transformers.
+gate = ["scikit-learn>=1.3", "joblib>=1.3", "numpy>=1.24", "torch>=2.0"]
 yaml = ["pyyaml>=6.0"]
 server = ["fastapi>=0.110", "uvicorn>=0.27"]
+# Kept so existing `vaara[attestation]` installs keep working; the base install
+# now carries the same three packages.
 attestation = ["cbor2>=5.4", "cryptography>=41.0", "rfc8785>=0.1.4"]
 timeanchor = ["asn1crypto>=1.5", "cryptography>=41.0"]
 scitt = ["cbor2>=5.4", "cryptography>=41.0"]
 proxy = ["fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27"]
 llm-proxy = ["fastapi>=0.110", "uvicorn>=0.29", "httpx[http2]>=0.27"]
 pq = ["dilithium-py>=1.4.0"]
+# Only scripts/hcs27_publish.py needs this. vaara.audit.hcs27 builds and
+# verifies checkpoints with the standard library alone, so a machine with no
+# SDK and no Hedera account can still do everything except submit.
+hedera = ["hiero-sdk-python>=0.2.10"]
 pdf = ["reportlab>=4.0"]
 bedrock = ["boto3>=1.34"]
 azure-content-safety = ["azure-ai-contentsafety>=1.0"]
 gcp-model-armor = ["google-cloud-modelarmor>=0.1"]
 nemo-guardrails = ["nemoguardrails>=0.10"]
-guardrails-ai = ["guardrails-ai>=0.5"]
+# litellm 1.107.0 was a poisoned release (2026-10-21); guardrails-ai pulls litellm.
+guardrails-ai = ["guardrails-ai>=0.5", "litellm!=1.107.0"]
 llm-guard = ["llm-guard>=0.3"]
 rebuff = ["rebuff>=0.1"]
 crewai = ["crewai>=1.0"]
@@ -74,6 +90,8 @@ vaara = "vaara.cli:main"
 vaara-audit = "vaara.audit_cli:main"
 vaara-mcp-proxy = "vaara.integrations.mcp_proxy:main"
 vaara-mcp-server = "vaara.integrations.mcp_server:main"
+vaara-infer-proxy = "vaara.integrations.infer_proxy:main"
+vaara-console = "vaara.integrations.infer_console:main"
 
 [tool.setuptools]
 # Default (true) auto-includes every tracked file inside a package, which
@@ -85,20 +103,42 @@ include-package-data = false
 where = ["src"]
 
 [tool.setuptools.package-data]
-# Ship only the production bundle. v9 is the sole bundle loaded at runtime
-# (_DEFAULT_BUNDLE in adversarial_classifier.py); v1-v8 are retained in the
+# Ship only the production bundle. v11 is the sole bundle loaded at runtime
+# (_DEFAULT_BUNDLE in adversarial_classifier.py); v1-v9 are retained in the
 # repo for bench/cross-eval but were ~7MB of dead weight in every wheel.
+#
+# THIS LINE NAMES THE BUNDLE FILE AND MUST MOVE WHEN _DEFAULT_BUNDLE MOVES.
+# Shipping v11 while this still said v9 produced a wheel whose installed package
+# had no v11 in it at all, so the classifier failed to load for everyone who
+# installed rather than checked out. The pre-release smoke test caught it before
+# merge, which is what that job is for.
+#
 # dashboard.html is read at runtime by dashboard.py. include-package-data is
 # false, so without this line `vaara dashboard` works from a checkout and fails
 # for everyone who installed the wheel.
-vaara = ["data/adversarial_classifier_v9.joblib", "py.typed", "dashboard.html", "assets/*.png", "assets/*.svg"]
+vaara = ["data/adversarial_classifier_v11.joblib", "py.typed", "dashboard.html", "assets/*.png", "assets/*.svg"]
 # Declarative source-profile specs loaded at runtime by _declarative.py.
 "vaara.attestation" = ["profiles/*.json"]
-# Default deny patterns for the Claude Code hook runner (vaara hook).
-"vaara.integrations" = ["claude_code_deny.json"]
+# Default deny patterns for the hook runner (vaara hook), and the OpenCode
+# plugin `vaara init` installs.
+"vaara.integrations" = ["claude_code_deny.json", "opencode_plugin.js"]
+
+# Extras no single install can hold, so uv resolves them as separate forks.
+# crewai 1.x pins json-repair==0.25.2 and needs regex>=2024.9.11; every
+# llm-guard 0.3.x pins both outside that. rebuff 0.1.1, the last release,
+# needs openai<2 and guardrails-ai 0.11 needs openai>=2.
+[tool.uv]
+conflicts = [
+    [{ extra = "guardrails-ai" }, { extra = "rebuff" }],
+    [{ extra = "crewai" }, { extra = "llm-guard" }],
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# A test that runs past this many seconds gets its stack printed to stderr
+# by the faulthandler, so a hung CI job names the test instead of timing out
+# after six hours with an empty log. The test keeps running; nothing fails.
+faulthandler_timeout = 300
 markers = [
     "network: reaches a public service (PyPI, npm); skips when unreachable",
 ]

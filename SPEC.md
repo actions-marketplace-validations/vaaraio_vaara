@@ -26,119 +26,309 @@ fixtures live at `tests/vectors/x402_settlement_v0/` with a dependency-light
 checker (`_check_independent.py`) that imports only the standard library,
 `cryptography`, and `rfc8785`.
 
-## 1. Canonicalization
+## 1. Canonicalization, digests, numbers and times
 
-All digests and all signed payloads in this specification are computed over the
-JSON Canonicalization Scheme (JCS, RFC 8785). The canonicalization label for the
-`evidenceRef.canonicalization` field (Section 3) is `jcs-rfc8785`. The values
-`JCS` and `jcs-json-v1` are accepted aliases for the same algorithm; producers
-SHOULD emit `jcs-rfc8785`, consumers MUST accept all three.
+Every digest of a JSON value in this document, and every signed payload, is
+computed over the JSON Canonicalization Scheme (JCS, RFC 8785). The
+canonicalization label for `evidenceRef.canonicalization` (Section 3) is
+`jcs-rfc8785`. The values `JCS` and `jcs-json-v1` are accepted aliases for the
+same algorithm; producers SHOULD emit `jcs-rfc8785`, consumers MUST accept all
+three.
 
-A digest is written `sha256:` followed by the lowercase hex SHA-256 of the
-JCS-canonical bytes of the referenced object.
+A digest is written `sha256:` followed by 64 lowercase hex characters of a
+SHA-256 value. Unless a member's definition says otherwise, the hashed bytes are
+the JCS encoding of the referenced JSON value. Where a member is a digest over
+bytes that are not a JSON value (a UTF-8 string, a configuration file, a joined
+preimage), its definition names those bytes.
+
+No signed block and no evidence record carries a non-integer number. Scores and
+thresholds are decimal strings (`"0.12"`). A producer MUST NOT emit a
+non-integer JSON number in any of them.
+
+Times are RFC 3339 date-times in UTC with the `Z` designator; fractional
+seconds MAY be present. Parse them before comparing: two producers can write the
+same instant with a different number of fractional digits.
 
 ## 2. The receipt envelope
 
-A receipt is a JSON object with these top-level members:
+A receipt is either a *decision receipt* (a decision about an action) or an
+*execution receipt* (what followed). Both share this envelope:
 
-| Field | Type | Required | Meaning |
+| Member | Type | Kind | Presence | Meaning |
+|---|---|---|---|---|
+| `version` | integer | both | REQUIRED | `1` for this document. |
+| `alg` | string | both | REQUIRED | `ES256`, `RS256` or `HS256`. See Section 2.1. |
+| `backLink` | object | both | REQUIRED | The predecessor this receipt answers. Section 2.3. |
+| `decisionDerived` | object | decision | REQUIRED | The decision and its basis. Section 3. |
+| `issuerAsserted` | object | decision | REQUIRED | The issuer block. Section 2.4. |
+| `outcomeDerived` | object | execution | REQUIRED | The outcome. Section 2.7. |
+| `receiptAsserted` | object | execution | REQUIRED | The issuer block. Section 2.4. |
+| `signature` | string | both | REQUIRED | Over the signed payload (Section 2.2). |
+| `timestampAnchors` | array | decision | OPTIONAL | External time attestations. Section 4. |
+| `pqSignature` | object | execution | OPTIONAL | Post-quantum signature beside the classical one. Section 2.5. |
+| `existenceProof` | object | execution | OPTIONAL | A timestamp over the whole signed receipt. Section 2.6. |
+
+A decision receipt carries `decisionDerived` and `issuerAsserted` and neither
+`outcomeDerived` nor `receiptAsserted`; an execution receipt the reverse. The
+schema is closed: a consumer MUST reject a receipt carrying a member not listed
+for its kind, and MUST reject an undefined member inside `backLink`,
+`decisionDerived`, `evidenceRef`, `issuerAsserted`, `receiptAsserted`,
+`outcomeDerived`, `completeness`, `cryptoPosture`, `pqSignature` or
+`existenceProof`. A consumer that rebuilds a signed block from the members it
+understands would otherwise leave out signed bytes and report a receipt verified
+over content it never checked. Evidence records are defined by profiles
+(Section 5), whose own rules govern members they do not define.
+
+### 2.1 Algorithms and signature encoding
+
+`ES256` is ECDSA P-256 with SHA-256, signature the 64-byte `r||s` pair (128 hex
+characters). `RS256` is RSASSA-PKCS1-v1_5 with SHA-256 and `HS256` is HMAC-SHA-256,
+both as in RFC 7518. `signature` is the lowercase hex of the raw signature or MAC
+bytes. No other `alg` is defined in v1, and a consumer MUST reject one.
+
+`HS256` is symmetric: only a holder of the shared secret can verify it, so an
+HS256 receipt is not recomputable by an arbitrary third party. Producers whose
+receipts leave their own trust domain SHOULD use `ES256` or `RS256`. The
+per-profile checkers under `tests/vectors/` accept `ES256` only.
+
+The issuer block repeats the algorithm in its own `alg`, inside the signed bytes.
+The two MUST be equal, and a consumer MUST reject a receipt where they differ
+before trying any key.
+
+### 2.2 Signed payload
+
+The signature is computed over the JCS encoding of the object containing exactly
+these members, with their receipt values:
+
+```
+decision receipt:  ("version", "alg", "backLink", "decisionDerived", "issuerAsserted")
+execution receipt: ("version", "alg", "backLink", "outcomeDerived", "receiptAsserted")
+```
+
+`signature`, `timestampAnchors`, `pqSignature` and `existenceProof` are not part
+of the signed payload: attaching one after signing does not invalidate the
+signature. A consumer MUST verify by rebuilding the payload for the receipt's kind
+from the members as received, canonicalizing it, and checking it under `alg`.
+
+### 2.3 Back link
+
+| Member | Presence | Meaning |
+|---|---|---|
+| `attestationDigest` | REQUIRED | Digest of the predecessor, over its complete JSON form including its own signature. |
+| `attestationNonce` | REQUIRED | Non-empty: the predecessor's nonce, or the identifier the profile names in its place. |
+| `fallbackProjection` | OPTIONAL | Present only when no predecessor attestation exists and `attestationDigest` is over a named projection of the originating request; the value names the projection and its version. |
+
+For a decision receipt the predecessor is the attestation of the request the
+decision governs, unless the profile names another; the engine decision profile
+(Section 5.10) names the previous trail record. An execution receipt carries the
+same `backLink` as its decision receipt. A profile that permits
+`fallbackProjection` MUST define each value it uses, and a consumer MUST reject a
+value it does not implement.
+
+This document defines one value, `tools_call_params_plus_meta_authorization_binding_v1`,
+for an MCP `tools/call` request: the projection is `{"projection": <value>,
+"name": params.name, "arguments": params.arguments, "authorizationBinding":
+params._meta.authorization_binding}` and `attestationDigest` is its digest.
+`authorization_binding` is required and is an object with a non-empty string
+`nonce`; `name` and `arguments` are required. No other `_meta` member enters, so a
+gateway and a provider seeing one call with different sidecars agree. When the
+projection cannot be built the binding fails, and a consumer MUST NOT widen it.
+Vectors at `tests/vectors/fallback_projection_v0/` and
+`tests/vectors/decision_pairing_v0/`.
+
+### 2.4 Issuer block
+
+`issuerAsserted` and `receiptAsserted` have the same members, all inside the
+signed payload:
+
+| Member | Type | Presence | Meaning |
 |---|---|---|---|
-| `version` | integer | MUST | Envelope version. `1` for this document. |
-| `alg` | string | MUST | Signature algorithm. `ES256` in v1. A receipt that names anything else is rejected by the reference checkers. |
-| `backLink` | object | MUST | Binds this receipt to its attestation/predecessor: `attestationDigest`, `attestationNonce`. |
-| `decisionDerived` | object | MUST | The decision and the evidence it derives from. See Section 3. |
-| `issuerAsserted` | object | MUST | Issuer-asserted identity claims: `iss`, `sub`, `iat`, `nonce`, `alg`, `secretVersion`. |
-| `signature` | string | MUST | Detached signature, hex. For `ES256`, the 64-byte `r||s` pair (128 hex chars). |
-| `timestampAnchors` | array | MAY | External time attestations over this receipt. See Section 4. |
+| `iss` | string | REQUIRED | The issuer. |
+| `sub` | string | REQUIRED | The agent or principal the action was taken by or for. |
+| `iat` | string | REQUIRED | Issuance time, RFC 3339 UTC. A string, not a JWT NumericDate. |
+| `nonce` | string | REQUIRED | Unique per receipt; SHOULD carry at least 128 random bits. |
+| `alg` | string | REQUIRED | Equal to the envelope `alg`. |
+| `secretVersion` | string | REQUIRED | Names the verification key; resolved from `iss` and `secretVersion` out of band. |
+| `aud` | string | OPTIONAL | The relying party the receipt was issued for. |
+| `taskId` | string | OPTIONAL | The long-running task the action belongs to. |
+| `completeness` | object | OPTIONAL | Per-boundary sequence (Section 5.3). |
+| `sigSuite` | string | OPTIONAL | Committed hybrid suite (Section 2.5). Execution receipts only. |
+| `cryptoPosture` | object | OPTIONAL | Algorithms protecting the receipt (Section 2.5). |
 
-### 2.1 Signed payload
+`aud` and `taskId`, when present, are non-empty. Checked against an expected
+value they give bound, conflict, or unsupported (absent): absence means the
+issuer bound none. `completeness` carries exactly `boundaryId` (non-empty
+string), `seq` (integer, 0 or more) and `runningCount` (= `seq + 1`), all
+required; a consumer MUST reject a partial or inconsistent block. An execution
+receipt's boundary is its decisions' boundary with `#execution` appended, so a
+refused decision, which has no execution receipt, does not read as a gap.
 
-The signature is computed over the JCS-canonical bytes of the object containing
-exactly these members, in this set, with their receipt values:
+### 2.5 Post-quantum signature and crypto posture
 
-```
-("version", "alg", "backLink", "decisionDerived", "issuerAsserted")
-```
+There is no post-quantum `alg` in v1. An execution receipt MAY commit to a hybrid
+suite with `receiptAsserted.sigSuite`, `"ES256+ML-DSA-65"` or
+`"RS256+ML-DSA-65"`, whose classical part MUST equal `alg`. `pqSignature` then
+carries `alg` (`"ML-DSA-65"`, FIPS 204), `keyid` (the ML-DSA verification key)
+and `sig` (hex ML-DSA-65 over the same signed-payload bytes). A consumer MUST
+reject any other `sigSuite`; a consumer that verifies ML-DSA MUST reject a
+committed hybrid suite whose `pqSignature` is absent or does not verify (a
+stripped signature). A `pqSignature` without `sigSuite` commits nothing. A
+decision receipt MUST NOT carry `sigSuite`. Vectors at
+`tests/vectors/pq_hybrid_v0/` (needs `dilithium_py`, skips without it).
 
-`signature` and `timestampAnchors` are NOT part of the signed payload: a receipt
-can gain anchors after signing without invalidating the signature. A consumer
-MUST verify the signature by reconstructing this payload, canonicalizing it, and
-checking it against the public key under `alg`.
+`cryptoPosture` has `assetType` (`"algorithm"`), `algorithms` (non-empty array of
+`{algorithm, primitive, nistQuantumSecurityLevel}`) and `nistQuantumSecurityLevel`
+(0 to 5, the highest in `algorithms`). Levels: `HS256` 0 (`mac`), `ES256` and
+`RS256` 0 (`signature`), `ML-DSA-65` 3 (`signature`). A consumer recomputes it
+from `alg` and `sigSuite`; a posture that does not match, or claims an ML-DSA leg
+no `sigSuite` commits, is not backed by the receipt.
 
-### 2.2 Post-quantum protection
+### 2.6 Existence proof
 
-There is no post-quantum `alg` value in v1. What ships is additive and lives
-next to the classical signature rather than replacing it: an execution record
-MAY carry a `pqSignature` sibling block (`alg`, `keyid`, `sig`) under a
-registered hybrid suite, `ES256+ML-DSA-65` or `RS256+ML-DSA-65`, so a verifier
-that cannot do ML-DSA still verifies the classical signature and a verifier
-that can sees a stripped block as the downgrade it is. Vectors at
-`tests/vectors/pq_hybrid_v0/`, which needs `dilithium_py` (`vaara[pq]`) and
-skips without it. The signed handoff zip is separate again: it signs Ed25519 by
-default and ML-DSA-65 under the same extra.
+An execution receipt MAY carry `existenceProof`: `backend`
+(`"rfc3161-eidas-qualified"`), `hashAlgorithm` (`"sha256"`), `recordDigest` (digest
+of the receipt with `existenceProof` removed, signature included) and `token`
+(base64 DER RFC 3161 TimeStampToken imprinting that digest). It is outside the
+signed payload; the token covers the signed receipt. The time is qualified only
+when the consumer pins the token signer's issuer from a trusted list it holds.
 
-## 3. Evidence binding (`decisionDerived.evidenceRef`)
+### 2.7 Execution receipt
 
-`decisionDerived` carries the decision (`decision`, `decidedAt`, `policyId`,
-`reason`, `riskScore`, `thresholdAllow`, `thresholdBlock`) and one
-`evidenceRef` object that binds the decision to a recomputable evidence record:
+| Member | Presence | Meaning |
+|---|---|---|
+| `status` | REQUIRED | `executed`, `refused` or `errored` (attempted and failed). Anything else is rejected. |
+| `completedAt` | REQUIRED | Time the outcome was recorded. |
+| `resultCommitment` | OPTIONAL | Commitment to the result, or to the error for `errored`. Absent for `refused`. |
+| `decisionDigest` | OPTIONAL | Digest of the decision receipt this outcome answers, over its signed members and signature, without `timestampAnchors`. |
 
-| Field | Meaning |
-|---|---|
-| `canonicalization` | The label from Section 1 (`jcs-rfc8785` / `JCS` / `jcs-json-v1`). |
-| `digest` | `sha256:` of the JCS-canonical evidence record. |
-| `ref` | An advisory, profile-defined locator for the evidence record. Not an identifier: see below. |
-| `schema` | The schema id of the evidence record (profile-defined). |
+`resultCommitment` is either `{projection, projectionDigest}` (`projection` a
+string holding the JCS encoding of the result or of `{"digest": "sha256:..."}`
+over it; `projectionDigest` over the UTF-8 bytes of `projection`) or `{ref,
+digest, canonicalization}` (`ref` a locator, `digest` over the result,
+`canonicalization` `"jcs"`). `decisionDigest` binds an outcome to one decision's
+content, so it cannot be reattached to another decision about the same call.
+Vectors at `tests/vectors/execution_receipt_v0/` and
+`tests/vectors/decision_pairing_v0/`.
+
+## 3. Decision and evidence binding (`decisionDerived`)
+
+| Member | Presence | Meaning |
+|---|---|---|
+| `decision` | REQUIRED | `allow`, `block` or `escalate`. Anything else is rejected. |
+| `decidedAt` | REQUIRED | Time of the decision. |
+| `reason` | OPTIONAL | The issuer's reason. |
+| `policyId` | OPTIONAL | The policy the decision was made under. |
+| `riskScore`, `thresholdAllow`, `thresholdBlock` | OPTIONAL | Decimal strings. |
+| `clientTurnId` | OPTIONAL | A turn id the client claimed; recorded, not vouched for. |
+| `evidenceRef` | OPTIONAL | Binds the decision to an evidence record. Every profile in Section 5 requires it. |
+| `rationale` | OPTIONAL | `rule`, `reason`, `declaredIntent` (strings) and optional `intentSatisfied` (boolean). |
+| `binding` | OPTIONAL | `policyDigest` (JCS of the policy), `intentDigest` (UTF-8 of the declared intent), `inputsDigest` (JCS of the inputs) and `bindingDigest` (UTF-8 of the three digests and `decision` joined by byte `0x1F`). |
+| `decisionProof` | OPTIONAL | A zero-knowledge proof opened against `bindingDigest`. Its format is not defined here; a consumer that does not verify it MUST NOT read it as evidence. |
+
+`allow` permits the action, `block` refuses it, and `escalate` refers it to a
+person or other authority without permitting it; a later decision settles it.
+Verdicts such as `deny` or `revise` in the profiles below are checker outputs,
+not values of `decision`.
+
+`evidenceRef`:
+
+| Member | Presence | Meaning |
+|---|---|---|
+| `canonicalization` | REQUIRED | A label from Section 1. |
+| `digest` | REQUIRED | Digest of the evidence record. |
+| `schema` | REQUIRED | The evidence record's schema id (profile-defined). |
+| `ref` | OPTIONAL | An advisory, profile-defined locator. Not an identifier: see below. |
 
 The binding is recomputable: given the receipt and the evidence record, a third
-party confirms `sha256(JCS(evidence_record)) == evidenceRef.digest` with no
-access to the issuer. This is the property independent implementers verify today.
+party confirms the record's digest equals `evidenceRef.digest` with no access to
+the issuer.
 
-`digest` is the binding; `ref` is advisory. Earlier revisions called `ref` an
-opaque *locator*, which implies it names exactly one record. It does not. A
-profile MAY assign the same `ref` to more than one evidence record, and profiles
-in use already do: where a single action settles to several parties, each party's
-record is a separate evidence record under one shared `ref`. Those records differ
-under `digest` because their contents differ.
-
-A consumer therefore MUST NOT resolve an evidence record by `ref` alone, and MUST
-confirm `sha256(JCS(evidence_record)) == evidenceRef.digest` before treating the
-record as the one the receipt decided over. Resolving by `ref` alone admits a
-record that shares the locator but is not the record the issuer signed over, and
-no check in this document fails when it happens.
+`digest` is the binding; `ref` is advisory. A profile MAY assign the same `ref`
+to more than one evidence record, and profiles in use do: where one action
+settles to several parties, each party's record is a separate evidence record
+under one shared `ref`, and they differ under `digest`. A consumer therefore
+MUST NOT resolve an evidence record by `ref` alone, and MUST confirm the digest
+before treating the record as the one the receipt decided over.
 
 ## 4. Timestamp anchors (`timestampAnchors`)
 
-A timestamp anchor is an external attestation that this receipt existed no later
-than a stated time. Anchors are additive and optional. Each anchor binds the
-**anchored digest** = `sha256:` of the JCS-canonical signed payload (Section 2.1),
-so an anchor commits to the exact signed receipt without depending on later
-anchors.
+A timestamp anchor is evidence from outside the issuer that a decision receipt
+existed no later than a stated time. Anchors are optional and attach to decision
+receipts; an execution receipt uses `existenceProof` (Section 2.6). Every anchor
+binds `anchoredDigest`, the digest of the receipt's signed payload (Section 2.2),
+so it commits to the exact signed receipt and to no other anchor.
 
 ```json
 {
   "method": "rfc3161",
   "anchoredDigest": "sha256:…",
-  "token": "<method-specific time token>",
-  "authority": "<optional human-readable authority id>"
+  "token": "<base64 DER RFC 3161 TimeStampToken>",
+  "authority": "<optional human-readable authority name>"
 }
 ```
 
-Registered methods (the registry is open; a profile MAY register more):
+`method` and `anchoredDigest` are required; `authority` is optional and
+informative.
 
-| `method` | What it is | Who can produce it |
+| `method` | What it is | Further members |
 |---|---|---|
-| `rfc3161` | An RFC 3161 timestamp token from any Time-Stamping Authority. | Self-hostable (e.g. OpenSSL `ts`); needs no third party. |
-| `rfc3161-eidas-qualified` | An RFC 3161 token from a *qualified* TSA under eIDAS. | A qualified trust service provider. Adds legal / court-admissible weight; this is the only thing the qualification adds over `rfc3161`. |
-| `ledger` | A commitment of the anchored digest to a public ledger; the block time bounds existence. | Self-producible; trust-minimized, no TSA. |
-| `scitt` | A transparency-log inclusion proof: the anchored digest is appended to a SCITT-compatible Merkle transparency log, and the entry carries the inclusion proof (sibling hashes) and the log's root hash at the time of append. The verifier recomputes the root from leaf + proof alone — no key, no operator to trust. The entry carries `logId` (base64 of the log identity digest), `leafIndex`, `treeSize`, `inclusionProof` (array of base64 sibling hashes), and `rootHash` (base64 Merkle root). | Self-hostable via the in-process transparency log (producer: `vaara.audit.scitt_anchor`), or against a remote SCITT log (e.g. Sigstore Rekor). |
+| `rfc3161` | An RFC 3161 token imprinting `anchoredDigest`, from any TSA, including one the producer runs (`openssl ts`). | `token` |
+| `rfc3161-eidas-qualified` | As `rfc3161`, from a qualified TSA under eIDAS. The qualification adds legal weight and nothing else. | `token` |
+| `rfc3161-blinded` | As `rfc3161`, the authority shown a salted digest instead. Section 4.1. | `token`, `anchorSalt` |
+| `rfc3161-eidas-qualified-blinded` | As `rfc3161-eidas-qualified`, blinded the same way. | `token`, `anchorSalt` |
+| `scitt` | Inclusion of `anchoredDigest` as a leaf of an append-only Merkle log hashed as in RFC 6962. The identifier is historical: this is not registration with an IETF SCITT transparency service, and the entry is not a COSE receipt. | `logId`, `leafIndex`, `treeSize`, `inclusionProof`, `rootHash` |
 
-A receipt MAY carry several anchors of different methods. The technical anchor
-(`rfc3161`, `scitt`) and the legal anchor (`rfc3161-eidas-qualified`) are
-independent: a producer can stand up its own time evidence and add qualified
-legal weight as a separate, swappable method. No single anchor method is
-load-bearing for the receipt's integrity, which rests on the Section 2.1
-signature.
+For every method a consumer MUST first recompute `anchoredDigest` and reject the
+anchor if it differs. The method name proves nothing about the token's signer: the
+time is independent of the issuer only when the consumer checks the signer against
+a certificate or trusted list it holds, and qualified only when that list is a
+qualified trust list.
+
+For `scitt`, `logId` is base64 SHA-256 of the log name, `leafIndex` and `treeSize`
+are integers, `inclusionProof` is an array of base64 sibling hashes and `rootHash`
+the base64 root at append time. The consumer recomputes the root from the leaf
+(the 32 raw bytes of `anchoredDigest`) and the proof. `rootHash` is the log
+operator's own claim; the anchor witnesses the receipt only when checked against a
+tree head held independently of the receipt, directly or through an RFC 9162
+consistency proof. Producer: `vaara receipt anchor-scitt`; head: `anchor-scitt-head`;
+verify: `verify-scitt --head`.
+
+This document maintains the method registry. A consumer MUST NOT treat an anchor
+whose method it does not implement as verified, and MUST NOT reject the receipt
+because of it: integrity rests on the signature, and an anchor is extra evidence.
+
+### 4.1 Blinded anchors
+
+An unblinded anchor sends the timestamping authority exactly the value the
+receipt then publishes as `anchoredDigest`. An authority keeps a request log,
+every entry in it sits behind a customer account, and a log that is sold,
+breached or produced under compulsion lets whoever holds it match its entries
+against any corpus of published receipts.
+
+A blinded anchor closes that match. The producer draws a fresh 32-byte salt,
+sends the authority
+
+```
+sha256( "vaara/anchor-blind/v1" || salt || anchoredDigest_bytes )
+```
+
+and carries the salt in the anchor entry as `anchorSalt` (64 lowercase hex
+characters). `anchoredDigest` still names the Section 2.2 signed payload.
+
+A producer MUST draw the salt from a cryptographic random source and MUST NOT
+reuse it. A verifier MUST recompute the imprint, MUST reject a blinded anchor
+whose `anchorSalt` is absent or not 32 bytes of hex, and MUST reject an unblinded
+method that carries `anchorSalt`, so a blinded anchor is never read as a plain
+one.
+
+**What this does and does not buy.** It stops a party holding only the
+authority's log from matching it against receipts it was not given. It does not
+hide the anchor from anyone holding the receipt, since the salt travels with it,
+and it does not hide the fact, timing or volume of anchoring from the authority.
+
+A receipt MAY carry several anchors of different methods. The producer's own time
+evidence (`rfc3161` from its own TSA, or `scitt`) and the legal anchor
+(`rfc3161-eidas-qualified`) are independent and can be added separately.
 
 ## 5. Profiles
 
@@ -169,6 +359,25 @@ ships recomputable vectors, not because it is another instance of the binding.
 | TAP request binding | `tap.request/v0` | `vaara.receipt/v1` | `tests/vectors/tap_v0/` |
 | generic external execution evidence | `vaara.authorization/v0` (names an `external_execution_evidence` slot) | `vaara.receipt/v1` | `tests/vectors/external_evidence_v0/` |
 | release condition | `vaara.release-condition/v0` (consumes `vaara.authorization/v0`) | `vaara.receipt/v1` | `tests/vectors/release_condition_v0/` |
+| attribute attestation | `vaara.attribute-attestation/v0` | `vaara.receipt/v1` | `tests/vectors/attribute_attestation_v0/` |
+| hidden-value attribute attestation | `vaara.attribute-attestation-zk/v0` (proved by `vaara.attribute-predicate/v0`) | `vaara.receipt/v1` | `tests/vectors/attribute_attestation_zk_v0/` |
+| engine decision (the floor) | `vaara.trail-decision/v0` | `vaara.receipt/v1` | `tests/vectors/trail_decision_v0/`, `tests/vectors/cage_v0/` |
+
+The floor of the format is the engine decision profile (5.10): one receipt per
+decision an engine records on its hash-chained trail, bound to that trail
+record, with no rail, settlement artifact or external evidence record to join.
+It is the smallest conforming receipt and what a default install emits for
+every decision.
+
+Three further suites in the same repository are related to this format and are
+not profiles of it, because the artifact each one verifies is not a
+`vaara.receipt/v1` envelope: `tests/vectors/governance_decision_v0/` (signed
+governance decision and outcome records in the `{record, signature}` shape
+proposed for the CrewAI framework), `tests/vectors/credential_binding_v0/` (the
+signed HS256 grant a credential broker issues, the artifact the authorization
+profile's `grantFingerprint` names), and `tests/vectors/atlas_threat_v0/` (a
+flat HMAC record of a MITRE ATLAS threat detection). Each ships a standalone
+checker, and none defines an evidence schema for `evidenceRef`.
 
 ### 5.2 Profile example: x402 settlement binding
 
@@ -197,7 +406,9 @@ machine reason (`capability_exceeded`, `binding_unknown`, `missing_credential`,
 
 - An authorization record (`schema` = `vaara.authorization/v0`) whose JCS digest
   is the receipt's `evidenceRef.digest`. It binds `toolName`, `tenantId`, the
-  grant by content address (`grantFingerprint` = `sha256(JCS(signed grant))`),
+  grant by content address (`grantFingerprint` = `sha256(JCS(grant))` over the
+  grant with its `signature` member removed, the bytes the grant's signature
+  covers),
   the runtime argument commitment (`argsCommitment` = `sha256(JCS(args))`), the
   evaluated `capabilities`, and the `verdict` / `reason`.
 - The raw arguments never enter the record; only their commitment does, so the
@@ -444,6 +655,356 @@ evidence and the two public keys, with no issuer access. See
 `tests/vectors/release_condition_v0/_check_independent.py`; the `vaara
 release-check` verb is the same evaluation at the command line.
 
+### 5.8 Profile: attribute attestation (`vaara.attribute-attestation/v0`)
+
+Section 5.7 asks what a receipt is worth when money is waiting. This one asks
+what a *value* is worth. An attribute attestation binds a subject to attribute
+values, states where each value came from, and says how long it holds.
+
+Any signed record can assert an attribute. Whether the assertion is evidence
+depends entirely on its source, so every attribute MUST name its own, drawn from
+a closed and totally ordered set:
+
+| standing | meaning |
+|---|---|
+| `undeclared` | nothing is claimed about where the value came from |
+| `operator_declared` | the party being judged supplied it |
+| `measured` | the issuer observed it directly |
+| `protocol_defined` | the value is fixed by a specification and cannot differ |
+
+`protocol_defined` outranks `measured` because a value fixed by a specification
+cannot be wrong, while a measurement can come from a faulty sensor. `undeclared`
+is the floor and MUST NOT convert upward. A verifier that encounters a standing
+outside this set MUST treat the attestation as malformed and MUST NOT floor it to
+`undeclared`, because a verifier that silently downgrades what it does not
+recognise lets an issuer introduce a standing of its own.
+
+A relying party states the floor it requires. Evaluation returns one of
+`accepted`, `withheld`, `expired` or `refused`, each carrying a reason from a
+closed set, with the reason space partitioned exactly as in Section 5.7. A value
+below the floor is sound evidence of a claim and no evidence of a fact: it
+`withheld`s, and it MUST NOT be reported the same way as a broken signature.
+
+Checks run in the order soundness, clock, sufficiency. Soundness MUST precede the
+clock so an expired window cannot swallow a broken signature.
+
+The signature is over the JCS encoding of the document with its own `signature`
+member removed, the same rule as Section 5.7 and the data-locality record, so a
+verifier that checks one checks all three with no new code. Attributes are
+emitted sorted by name so two issuers building the same statement produce the
+same bytes. Both ends of the validity window are inclusive.
+
+**What this is not.** A `vaara.attribute-attestation/v0` document is not a
+qualified electronic attestation of attributes under Regulation (EU) 910/2014 and
+MUST NOT be described as one, or as qualified, in any conforming implementation
+or its documentation. Those terms are tied to a supervised, audited entry on a
+Member State trusted list, and no cryptographic property substitutes for the
+listing. An attestation issued and signed by the party it describes proves
+integrity and never independence; implementations SHOULD surface that standing
+rather than omit it. A qualified timestamp anchor (Section 4) raises the
+confidence in *when* the attestation existed and changes nothing about the
+standing of its contents.
+
+Vectors are in `tests/vectors/attribute_attestation_v0/`, whose checker also
+asserts that the reason-to-state mapping covers all four states and that the
+standing ladder is a total order.
+
+### 5.9 Profile: hidden-value attribute attestation (`vaara.attribute-attestation-zk/v0`)
+
+Section 5.8 asks what a value is worth. This one asks what an issuer has to keep
+in order to say it.
+
+An attestation provider that vouches for an attribute has to hold the attribute.
+Anything held can be sold, subpoenaed, breached or repurposed, and a policy
+statement does not change what the holder is capable of. This profile commits to
+the value at issuance and hands the opening to the holder, so what remains on the
+issuer's side is a commitment and a signature over it.
+
+One field changes from Section 5.8:
+
+```
+5.8:   {name, value,      source, sourceDetail}
+5.9:   {name, commitment, source, sourceDetail}
+```
+
+`source` and `sourceDetail` stay in the clear and stay on the same closed,
+totally ordered ladder, with the same floor rule and the same prohibition on
+flooring a standing a verifier does not recognise. A relying party is entitled to
+judge how strongly a value was sourced, and is entitled to nothing further.
+
+#### The issuance ritual
+
+An issuer conforming to this profile MUST, for each attribute:
+
+1. draw a fresh blind, uniform over the scalar field, and compute the commitment
+2. sign the document containing the commitment
+3. hand the value and the blind to the holder
+4. retain neither
+
+Step 4 is the property the profile exists for. A blind MUST NOT be reused across
+issuances: two commitments to the same value under the same blind are equal, and
+a relying party holding both learns that the values match.
+
+#### Commitments and predicates
+
+Commitments are Pedersen commitments `C = v*G + r*H` over NIST P-256. `H` is
+derived by hash-to-curve from a fixed public label, so its discrete logarithm to
+`G` is unknown by construction, there is no trusted setup, and any party
+recomputes `H` from the published label. Commitments are perfectly hiding and
+computationally binding.
+
+A relying party asks whether a predicate holds over the hidden value. Three kinds
+are defined, and all three reduce to the same range argument over a shifted
+commitment, because Pedersen commitments add:
+
+| predicate | prover shows | verifier target |
+|---|---|---|
+| `at_least` | `value - lower` is in range | `C - lower*G` |
+| `at_most` | `upper - value` is in range | `upper*G - C` |
+| `in_range` | both, in that order | both, in that order |
+
+The blind follows the shift: it stays as issued for the `at_least` direction and
+negates for the `at_most` direction. A witness outside the proved interval has no
+valid bit decomposition, so a predicate that does not hold has no proof, and a
+conforming prover MUST refuse to emit one rather than emit something that will
+not verify.
+
+Each proof's Fiat-Shamir transcript MUST be seeded with the attestation digest,
+the attribute name, the JCS encoding of the predicate, and the direction, so a
+proof does not transfer to another document, another attribute or another
+threshold. A verifier MUST reject a proof whose envelope names an attestation
+digest, attribute or predicate other than the one being asked about, and MUST
+report that rejection separately from a proof that is bound and fails to verify.
+
+#### Evaluation
+
+Evaluation returns `accepted`, `withheld`, `expired` or `refused`, each carrying a
+reason from a closed set, partitioned as in Sections 5.7 and 5.8. Checks run in
+the order soundness, clock, sufficiency, and within sufficiency the presented
+proof is judged before the standing floor, so a forged proof is reported as
+forged rather than as merely weaker than what was asked for.
+
+A presented proof that is absent and a presented proof that is invalid MUST NOT
+share a state. Nothing proved is not the same fact as something forged, and one
+boolean for both discards the difference between "not yet" and "no".
+
+#### Limits, stated rather than implied
+
+**This is not selective disclosure.** One signature covers every commitment in
+the document. A holder cannot present three attributes out of ten from a single
+signed credential; that requires a signature scheme built for it and is outside
+this profile. Per-attribute commitment covers the model above and nothing wider.
+
+**This is not qualified.** A `vaara.attribute-attestation-zk/v0` document is not a
+qualified electronic attestation of attributes under Regulation (EU) 910/2014 and
+MUST NOT be described as one, or as qualified, in any conforming implementation
+or its documentation. Those terms are tied to a supervised, audited entry on a
+Member State trusted list, and no cryptographic property substitutes for the
+listing.
+
+**The issuer is still trusted for the value at issuance.** Hiding the value
+protects it from the relying party and from anyone the issuer might later sell
+to. It says nothing about whether the issuer committed to the truth. This is the
+same residual documented in `docs/prove-what-an-ai-agent-did.md`: a record proves
+what was recorded and does not prove that the recording was honest.
+
+**Discarding is structural, not physical.** A conforming implementation removes
+the reason to retain a value, which is what a subpoena, a breach or a change of
+ownership reaches. It does not and cannot guarantee that no copy survives in
+process memory, in a backup, or in whatever produced the value upstream.
+
+**Values are bounded integers.** Every committed value and every predicate bound
+MUST lie in `[0, 2**32)`, which is the interval the range argument proves
+membership of. A value outside it MUST be refused at issuance. String attributes
+are not carried by this version; they would require a membership proof against a
+committed set.
+
+Vectors are in `tests/vectors/attribute_attestation_zk_v0/`, whose checker rebuilds
+the curve arithmetic, the commitments and the range argument from the published
+parameters and imports no Vaara. It also asserts, before grading any case, that
+`H` recomputes from its label, that commitments are additively homomorphic, that
+the same value under two blinds gives two different commitments, and that a
+missing proof and a broken proof land in different states.
+
+### 5.10 Profile: engine decision (`vaara.trail-decision/v0`)
+
+The engine writes one of these receipts for every decision it records on its
+audit trail, beside the trail at `receipts/<YYYY-MM-DD>/<recordId>.json`. The
+file holds the envelope under `receipt` and the evidence record under
+`evidence`. The evidence record is the decision as the trail holds it:
+
+| Field | Meaning |
+|---|---|
+| `schema` | `vaara.trail-decision/v0` |
+| `recordId`, `actionId` | The trail record and the action it decided. |
+| `eventType` | `decision_made` or `action_blocked`. |
+| `agentId`, `toolName`, `tenantId` | As recorded. `tenantId` is `""` when unset. |
+| `decision`, `reason` | The trail's words: `allow`, `escalate` or `deny`, and its reason. |
+| `riskScore` | Decimal string. |
+| `decidedAt` | ISO 8601 UTC, milliseconds. |
+| `recordHash` | `sha256:` and the trail record's own hash. |
+| `previousHash` | `sha256:` and the hash of the record before it. An empty genesis link is written as the SHA-256 of the empty string. |
+| `decisionDetail` | The refinement behind the verdict, present only when the trail record carries one. |
+| `approver`, `humanDisposed` | Who disposed of the decision: `approver` is exactly `human` or `policy`, `humanDisposed` is true only when a human acted on this decision, and a producer MUST NOT write `humanDisposed` true with any other approver. Present together, only when the trail record carries an approver; absent means no disposition was asserted, never that a human acted. Vectors: `tests/vectors/decision_disposition_v0/`. |
+| `cage` | The cage the deciding process ran in. See "The cage block" below. Absent on records written before the cage layer. |
+| `refusal` | On a `deny` only: what the refusal rests on. See "The refusal block" below. Absent on records written before it. |
+| `enforcement` | Whether the party that wrote the decision could have stopped the action: `could_block` (it stands in the path and its verdict is honoured), `shadow` (it could, but was set to let every call through) or `recorded_only` (it records the action and cannot hold it). Absent means not recorded: a reader MUST NOT read a `block` without `could_block` as an action that was stopped. `vaara receipt verify-decision` counts verified blocks by this field. Vectors: `tests/vectors/enforcement_v0/`. |
+| `argumentsCommitment` | `sha256:` and 64 lowercase hex characters: a salted commitment to the arguments of the request the decision answered. See "The arguments commitment" below. Absent when the trail recorded none for that request. |
+| `policyDigest` | `sha256:` and 64 lowercase hex characters over the engine's decision state when it decided. See "The policy digest" below. Absent on records written without one. |
+
+The envelope writes the trail's `deny` as `block`. `backLink.attestationDigest`
+is `previousHash`, `backLink.attestationNonce` is `recordId`, and
+`evidenceRef.ref` is `vaara:trail/<recordId>`. The issuer public key sits beside
+the receipts as `issuer-es256.pub.pem`, and `issuerAsserted.secretVersion` names
+it as `es256:` plus the first 16 hex characters of SHA-256 over its DER
+SubjectPublicKeyInfo.
+
+A verifier checks the signature and the evidence digest as in Sections 2.2 and
+3. With the trail in hand it also looks up `recordId` and confirms the stored
+record hash matches `recordHash`. A receipt whose record is missing from the
+trail, or whose hash differs, fails. The evidence record carries no tool
+arguments, so a receipt can leave the machine without them.
+
+#### The arguments commitment
+
+A receipt without the arguments cannot show which arguments were decided on,
+and a plain digest of them would not help: most tool arguments are low entropy,
+so anyone holding the receipt could confirm a guess. Each action request on the
+trail therefore records a fresh 16-byte salt (`arguments_salt`, 32 lowercase hex
+characters) and the commitment it gives (`arguments_commitment`) beside the
+arguments, and the decision's receipt carries the commitment:
+
+```
+argumentsCommitment = "sha256:" || hex( SHA-256( "vaara.arguments.v1\n" || salt || JCS(arguments) ) )
+```
+
+`salt` is the 16 raw bytes, `JCS` is RFC 8785, and `arguments` is the request's
+`parameters` object as the trail recorded it. Arguments JCS cannot encode get no
+commitment, and the receipt then has no `argumentsCommitment`.
+
+To show one decision's arguments to a third party, the trail's holder discloses
+that request's arguments and salt as a `vaara.arguments-disclosure/v0` object
+(`schema`, `recordId`, `actionId`, `arguments`, `salt`). The verifier checks the
+receipt as above, checks that the disclosure's `actionId` is the receipt's, and
+recomputes the commitment. Every request has its own salt and no key is shared,
+so one disclosure opens one decision and nothing else. Two decisions over the
+same arguments carry different commitments, so receipts alone do not show that
+two decisions saw the same input. `vaara receipt disclose-arguments` writes a
+disclosure from the trail and `vaara receipt verify-arguments` checks one.
+
+Vectors are in `tests/vectors/trail_decision_v0/`: receipts written by the
+engine's own sink over a SQLite trail, tampered copies, the trail's record
+hashes, and `expected.json` with each file's verdict. The macOS app's verifier
+checks the same files. `tests/vectors/trail_decision_v0/valid/6-allow.json` is a decision written after its
+action request under a described engine state, so it carries
+`argumentsCommitment` and `policyDigest`. Its companions, indexed in
+`companions.json`, are what the trail's holder hands a third party: the
+disclosure that opens the commitment, a disclosure with changed arguments that
+does not, and the `vaara.engine-policy/v0` state the digest is computed over.
+The independent checker recomputes both without the trail.
+
+#### The policy digest
+
+A receipt that says the policy decided cannot be checked against anything
+unless it says which policy. The engine describes the state it decides by as
+one `vaara.engine-policy/v0` object: `schema`, the Vaara version as `vaara`,
+`enforce` (false in shadow mode), the scorer's configured state as `scorer`
+(for the default scorer: its class, `thresholds`, `sequences`,
+`perTenantPolicies` and the loaded `policy`), and `authority` when session
+authority decay is configured. Learned state, such as calibration and expert
+weights, changes with every decision and is not part of it.
+
+Each decision record carries `policy_digest`, `sha256:` and the SHA-256 of the
+state's RFC 8785 form, and the receipt carries it as `policyDigest`. The first
+decision a pipeline records, and the first after its state changes, also
+carries the state as `policy_state`, so a reader holding the trail finds the
+state behind every digest and recomputes it. A per-tenant policy lookup is
+named as present; the policies behind it are not in the state.
+
+#### The refusal block
+
+A refusal word alone cannot tell a control that held from a control that was
+never reached. A deny from a scorer that could not be reached reads the same
+as a deny from one that judged the action too risky. `refusal` separates the
+two. It is a member of the evidence record, so the evidence digest and the
+signature bind it, and it appears on every `deny` and on nothing else.
+
+| Member | Type | Rule |
+|---|---|---|
+| `basis` | string | Always present. `evaluated`: a check ran and the action failed it. `not_evaluated`: a check the decision needed did not complete, so the action was refused without being judged. `undetermined`: the trail does not record which. |
+| `violationType` | string | Present when the trail records a ground. The ground the trail recorded, for example `risk_threshold`, `policy_rule` or `scorer_unavailable`. |
+| `policyId` | string | Present when the trail records one. The policy the deny came from. |
+| `unavailableInput` | string | Only with `not_evaluated`, when the trail names it. The input the check could not get, for example `scorer:<host>`. Never a URL path, query or credential. |
+
+The basis follows the recorded ground. `risk_threshold`, `policy_rule`,
+`privilege_attenuation`, `perimeter_filter`, `parameter_schema` and
+`egress_not_allowed` are `evaluated`. `scorer_failure`, `scorer_unavailable`
+and `invalid_decision` are `not_evaluated`. Any other ground, and a deny with
+none, is `undetermined`: the issuer never states that a check ran when its
+trail does not say so. A reader that needs the grounds of a refusal treats
+`undetermined` as grounds not established, while the refusal itself still
+stands. A verifier ignores members it does not know.
+
+#### The cage block
+
+`cage` says which cage, if any, the process that made the decision ran in,
+and whether the issuer confirmed at decision time that the confinement held
+on that process. It is a member of the evidence record, so the evidence
+digest and the signature bind it like any other member.
+
+| Member | Type | Rule |
+|---|---|---|
+| `driver` | string | Always present, never empty. The cage's driver name, or `none` when no cage was declared to the deciding process. |
+| `confirmed` | boolean | Always present. See below. |
+| `basis` | string | Present whenever `driver` is not `none`. What the confirmation rests on: `declared` when only the launcher's declaration stands, otherwise the name of the fact that was read. |
+| `configDigest` | string | Optional. `sha256:` and 64 lowercase hex characters over the cage's effective configuration. The driver defines which bytes it covers. |
+| `upstream` | string | Optional, informative. The cage's own name and version. |
+| `name` | string | Optional, informative. This launch's name inside the cage. |
+
+`driver: none` carries `confirmed: false` and no other member.
+`confirmed: true` means exactly this: at decision time the issuer read, on
+the deciding process or the platform under it, the fact that `basis` names,
+and the fact held. It requires a `basis` other than `none` or `declared`. It
+does not mean that the cage enforced the configuration `configDigest` names,
+that the cage is free of defects, or that anyone other than the issuer
+observed the fact. A verifier ignores members it does not know.
+
+The block names the deciding process, not the agent the decision was about.
+One launch can therefore produce blocks that differ by surface: a decision
+made inside the caged tree (a harness hook) names the cage and confirms it;
+a decision made by a process outside the tree about that tree (the OS-layer
+guard on a folder, the egress proxy on a connection) names that process's own
+confinement, which may be `none` or the declared block unconfirmed. Each is
+true of the process that signed it. A reader collecting one launch's
+receipts groups them by agent and `name`, not by the block.
+
+`configDigest` is a comparator, not a recomputation target. Two receipts with
+the same `driver` and `configDigest` ran under the same declared
+configuration; a verifier holding that configuration and the driver's rule
+can confirm the digest, and one without them treats it as an opaque value.
+
+The engine never writes a block that breaks these rules. A block passed in by
+custom code is held to them on the receipt: a `configDigest` that is not
+`sha256:` hex is left out, and an unsupported `confirmed: true` is written as
+`false`. The trail record keeps what it was given.
+
+Known basis values: `apparmor_label` (the process carries the cage's AppArmor
+label), `seccomp_filter` (a seccomp filter and `no_new_privs` are on),
+`no_new_privs`, `bwrap_init` (pid 1 of the pid namespace is bubblewrap),
+`gvisor_kernel_log` (the kernel log is gVisor's), `hypervisor_present` (the
+CPU reports a hypervisor underneath). `hypervisor_present` is the weakest:
+it shows a virtual machine, not which one. Known drivers: `vaara-cage`,
+`openshell`, `codex`, `sandbox-runtime`, `gvisor`, `firecracker`, `kata`,
+`agent-sandbox`, `microsandbox`, `nono`, `e2b`, `apple-container`. Both lists
+are open.
+
+Vectors are in `tests/vectors/cage_v0/`: an unconfined run, a declared cage
+the kernel did not confirm, and a confirmed cage, written by the engine's own
+sink; a block changed after signing; and three blocks that are signed and
+digest-consistent but break a rule of the block (confirmed on `declared`,
+confirmed with `driver: none`, a malformed `configDigest`). The checker gives
+each file a `signature`, `evidence` and `cage` verdict.
+
 ## 6. The ingest envelope (`vaara.ingest/v0`)
 
 The profiles in Section 5 bind external evidence *into* a `vaara.receipt/v1`
@@ -456,7 +1017,7 @@ any foreign record, content-addressed, and asserts nothing the source did not
 establish.
 
 It is a sibling envelope to `vaara.receipt/v1`, not a profile of it, and reuses
-the Section 1 canonicalization and the Section 2.1 signing construction
+the Section 1 canonicalization and the Section 2.2 signing construction
 unchanged. The signed payload is:
 
 - `schema` = `vaara.ingest/v0`, `version`, `alg`.
@@ -486,11 +1047,23 @@ what it is not.
 
 An implementation conforms to `vaara.receipt/v1` if, for every receipt it emits:
 
-1. The Section 2.1 signature verifies against the stated `alg` and key.
-2. `evidenceRef.digest` equals `sha256(JCS(evidence_record))` for the referenced
-   record, under one of the Section 1 canonicalization labels.
-3. Any `timestampAnchors[].anchoredDigest` equals the `sha256:` of the JCS
-   signed payload of the same receipt.
+1. The receipt keeps the rules of Sections 2 and 3: one kind, no undefined
+   members, an `alg` from Section 2.1 repeated unchanged in the issuer block, a
+   defined `decision` or `status` value, and a well-formed `completeness` block
+   where one is present.
+2. The Section 2.2 signature verifies against the stated `alg` and key.
+3. For a decision receipt, `evidenceRef.digest` equals
+   `sha256(JCS(evidence_record))` for the referenced record, under one of the
+   Section 1 canonicalization labels. An execution receipt carries no
+   `evidenceRef`, so this check does not apply to it.
+4. Any `timestampAnchors[].anchoredDigest` equals the digest of the signed
+   payload of the same receipt, and any `existenceProof.recordDigest` equals the
+   digest of the receipt with `existenceProof` removed.
+5. For an execution receipt, `backLink` recomputes from its predecessor, and
+   a `resultCommitment`, where one is present, recomputes from the result.
+   Section 2.7 keeps the member optional, so an `executed` receipt without
+   one has nothing to recompute.
+6. Any cage block in an evidence record keeps the rules of Section 5.10.
 
 The committed vectors plus `_check_independent.py` are the reference conformance
 suite; `python tests/vectors/x402_settlement_v0/_check_independent.py` exiting 0
@@ -501,7 +1074,13 @@ both reproducible with no Vaara import;
 
 ## 8. Versioning
 
-The envelope version is the integer `version` field and the `vaara.receipt/vN`
-schema id. Additive, backward-compatible changes (new optional fields, new
-anchor methods, new profiles) do not bump `N`. A change to the signed-payload
-field set, the canonicalization, or the signature construction bumps `N`.
+The envelope version is the integer `version` member and the `vaara.receipt/vN`
+schema id. A change to the signed-payload member set, the canonicalization, or
+the signature construction bumps `N`.
+
+A new optional member of a block in Sections 2 or 3 is added only by a revision
+of this document and does not bump `N`. Because those blocks are closed, a
+consumer built to an earlier revision rejects a receipt carrying the new member.
+That is intended: it fails closed rather than verifying bytes it does not
+understand. New anchor methods and new profiles do not change how the envelope
+is parsed.

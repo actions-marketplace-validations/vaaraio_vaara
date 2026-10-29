@@ -1,0 +1,145 @@
+[
+  {
+    "record_id": "3c38a7cf-39fe-5c31-906b-90957e8f4ab7",
+    "action_id": "9447d186-a55b-59e1-95bf-1a63689954fb",
+    "event_type": "action_requested",
+    "timestamp": 1780000002.0,
+    "agent_id": "agent:vector",
+    "tool_name": "tx.transfer",
+    "data": {
+      "parameters": {
+        "amount": 50000,
+        "to": "acct:9"
+      },
+      "arguments_salt": "89b24cf71bfce4d177857c0dbcea4ec5",
+      "arguments_commitment": "sha256:8095cff2d0e9c478422995e74538e380739e173e9d7223c7a916fea01c0ba359",
+      "context": {},
+      "action_category": "financial",
+      "reversibility": "irreversible",
+      "blast_radius": "shared",
+      "urgency": "irrevocable",
+      "base_risk_score": 0.875,
+      "agent_confidence": null,
+      "session_id": "",
+      "parent_action_id": null,
+      "sequence_position": 0
+    },
+    "regulatory_articles": [
+      {
+        "domain": "eu_ai_act",
+        "article": "Article 12(1)",
+        "requirement": "Automatic recording of events (logging capabilities)",
+        "how_satisfied": "Every action request is recorded with full context before processing"
+      },
+      {
+        "domain": "dora",
+        "article": "Article 10(1)",
+        "requirement": "Mechanisms to promptly detect anomalous activities, including ICT-related incidents",
+        "how_satisfied": "All agent actions are logged as events for incident detection"
+      }
+    ],
+    "previous_hash": "",
+    "record_hash": "bea8503f0dab108bf2aebc5f0be670d70f2e723e3ed84e3724f29f9075e3052f",
+    "system_operation": "logging_intake",
+    "data_usage": "tool_args+context",
+    "decision_making": "n/a",
+    "limitations": null,
+    "tenant_id": "",
+    "chain_version": 2
+  },
+  {
+    "record_id": "7bf2078e-f32e-52af-bf26-a95d113a3434",
+    "action_id": "9447d186-a55b-59e1-95bf-1a63689954fb",
+    "event_type": "risk_scored",
+    "timestamp": 1780000003.0,
+    "agent_id": "agent:vector",
+    "tool_name": "tx.transfer",
+    "data": {
+      "point_estimate": 0.5,
+      "conformal_lower": 0.4,
+      "conformal_upper": 0.6,
+      "signals": {},
+      "calibration_size": 0,
+      "effective_alpha": 0.1,
+      "bucket_category": null
+    },
+    "regulatory_articles": [
+      {
+        "domain": "eu_ai_act",
+        "article": "Article 9(2)(a)",
+        "requirement": "Risk management system shall identify and analyse known and reasonably foreseeable risks",
+        "how_satisfied": "Adaptive risk scoring with conformal prediction intervals quantifies risk for every action"
+      },
+      {
+        "domain": "eu_ai_act",
+        "article": "Article 9(6)",
+        "requirement": "High-risk AI systems shall be tested to identify the most appropriate and targeted risk management measures",
+        "how_satisfied": "Conformal calibration provides distribution-free coverage guarantees on risk estimates"
+      }
+    ],
+    "previous_hash": "bea8503f0dab108bf2aebc5f0be670d70f2e723e3ed84e3724f29f9075e3052f",
+    "record_hash": "606b928fe94c0af414a95bae1d7433e7da1016a132f0d9aa46b38a4cf0fc3489",
+    "system_operation": "scoring",
+    "data_usage": "tool_args+history+policy",
+    "decision_making": "heuristic_score",
+    "limitations": null,
+    "tenant_id": "",
+    "chain_version": 2
+  },
+  {
+    "record_id": "b1b66ac5-0cdf-56aa-8c08-b8db9d066945",
+    "action_id": "9447d186-a55b-59e1-95bf-1a63689954fb",
+    "event_type": "decision_made",
+    "timestamp": 1780000004.0,
+    "agent_id": "agent:vector",
+    "tool_name": "tx.transfer",
+    "data": {
+      "decision": "allow",
+      "reason": "vector: policy returned allow",
+      "risk_score": 0.5,
+      "policy_digest": "sha256:dbb9e45494afea14faf18f61fc29821a4d011d1d980f85e8ac4d0e681b3ebcdd",
+      "policy_state": {
+        "schema": "vaara.engine-policy/v0",
+        "vaara": "0.0.0+vectors",
+        "enforce": true,
+        "scorer": {
+          "scorer": "_FixedScorer"
+        },
+        "authority": {
+          "budget": 3.0,
+          "low": 1.0,
+          "half_life_s": 3600.0,
+          "floor": 0.3,
+          "enabled": true
+        }
+      },
+      "enforcement": "could_block",
+      "cage": {
+        "driver": "none",
+        "confirmed": false
+      }
+    },
+    "regulatory_articles": [
+      {
+        "domain": "eu_ai_act",
+        "article": "Article 14(1)",
+        "requirement": "High-risk AI systems shall be designed to be effectively overseen by natural persons",
+        "how_satisfied": "Three-tier decision (allow/escalate/deny) ensures humans review borderline cases"
+      },
+      {
+        "domain": "eu_ai_act",
+        "article": "Article 14(4)(a)",
+        "requirement": "The human shall be able to properly understand the relevant capacities and limitations of the system and duly monitor its operation",
+        "how_satisfied": "Decision records include risk scores, confidence intervals, and contributing signals"
+      }
+    ],
+    "previous_hash": "606b928fe94c0af414a95bae1d7433e7da1016a132f0d9aa46b38a4cf0fc3489",
+    "record_hash": "48d8e7433845f39b35a8c8182e8d32a64fdbe75ca0b3af70c93912a36a4c347c",
+    "system_operation": "decision_threshold",
+    "data_usage": "risk_score+thresholds",
+    "decision_making": "threshold_match",
+    "limitations": null,
+    "tenant_id": "",
+    "chain_version": 2
+  }
+]

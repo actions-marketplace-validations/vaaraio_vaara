@@ -120,11 +120,23 @@ def test_openai_buffered_deny_strips_tool_calls(tmp_path):
     assert doc["choices"][0]["finish_reason"] == "stop"
 
 
+def _reading(handler):
+    """The same upstream answering with a read. A tool named for deleting is
+    held for a human at any threshold, so the allow path is driven with one
+    that is not."""
+    def respond(request: httpx.Request) -> httpx.Response:
+        resp = handler(request)
+        return httpx.Response(resp.status_code, headers=resp.headers,
+                              content=resp.content.replace(b"delete_file", b"read_file"))
+    return respond
+
+
 def test_allow_passes_response_unchanged(tmp_path):
     # Thresholds so high nothing denies: enforcing pipeline, allow verdicts.
     app = build_app(
         emitter=None, upstream="http://up", pipeline=_pipeline(0.98, 0.99),
-        client=httpx.AsyncClient(transport=httpx.MockTransport(_anthropic_upstream)),
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(_reading(_anthropic_upstream))),
     )
     status, raw = _drive(app, "/v1/messages", {
         "model": "claude-sonnet-5", "messages": MESSAGES, "stream": False,
@@ -173,7 +185,7 @@ def test_streamed_allow_replays_original_bytes(tmp_path):
     app = build_app(
         emitter=None, upstream="http://up", pipeline=_pipeline(0.98, 0.99),
         client=httpx.AsyncClient(
-            transport=httpx.MockTransport(_anthropic_stream_upstream)),
+            transport=httpx.MockTransport(_reading(_anthropic_stream_upstream))),
     )
     status, raw = _drive(app, "/v1/messages", {
         "model": "claude-sonnet-5", "messages": MESSAGES, "stream": True,
@@ -191,8 +203,8 @@ def test_escalate_approved_via_handshake_passes_through(tmp_path):
             reqs = list(approvals.glob("*.request.json")) if approvals.exists() else []
             if reqs:
                 action_id = reqs[0].name.removesuffix(".request.json")
-                (approvals / f"{action_id}.decision.json").write_text(
-                    json.dumps({"decision": "approve", "decided_at": time.time()}))
+                from vaara.approvals import write_decision
+                write_decision(action_id, "approve", approvals_dir=approvals)
                 return
             time.sleep(0.02)
 
@@ -225,6 +237,50 @@ def test_escalate_without_approvals_dir_fails_closed(tmp_path):
     assert "tool_use" not in [b.get("type") for b in doc["content"]]
     assert "blocked by Vaara policy" in " ".join(
         b.get("text", "") for b in doc["content"])
+
+
+def _closed_holds(pipeline):
+    from vaara.audit.trail import EventType
+
+    return pipeline.trail.get_records_by_type(EventType.ESCALATION_RESOLVED)
+
+
+def test_unanswered_approval_closes_the_hold_as_a_policy_deny(tmp_path):
+    # Nobody writes a decision file. The call is refused, and the trail says
+    # the hold ended as a deny by policy, not that it is still waiting.
+    pipeline = _escalate_all()
+    app = build_app(
+        emitter=None, upstream="http://up", pipeline=pipeline,
+        approvals_dir=tmp_path / "approvals", approvals_timeout=0.3,
+        client=httpx.AsyncClient(transport=httpx.MockTransport(_anthropic_upstream)),
+    )
+    status, raw = _drive(app, "/v1/messages", {
+        "model": "claude-sonnet-5", "messages": MESSAGES, "stream": False,
+    })
+    assert status == 200
+    assert "tool_use" not in [b.get("type") for b in json.loads(raw)["content"]]
+    [closed] = _closed_holds(pipeline)
+    assert closed.data["resolution"] == "deny"
+    assert closed.data["reviewer"] == "approvals-timeout"
+    assert closed.data["approver"] == "policy"
+    assert closed.data.get("human_disposed") is not True
+
+
+def test_hold_with_no_approval_channel_closes_as_a_policy_deny():
+    # No approvals directory means nobody is asked. The llm-proxy already
+    # closes such a hold; this gate left it open.
+    pipeline = _escalate_all()
+    app = build_app(
+        emitter=None, upstream="http://up", pipeline=pipeline,
+        client=httpx.AsyncClient(transport=httpx.MockTransport(_anthropic_upstream)),
+    )
+    _drive(app, "/v1/messages", {
+        "model": "claude-sonnet-5", "messages": MESSAGES, "stream": False,
+    })
+    [closed] = _closed_holds(pipeline)
+    assert closed.data["resolution"] == "deny"
+    assert closed.data["approver"] == "policy"
+    assert closed.data.get("human_disposed") is not True
 
 
 # --- allow-list bypass -------------------------------------------------------
@@ -263,3 +319,42 @@ def test_unmatched_pattern_still_gated(tmp_path):
     asyncio.run(
         gate_tool_calls(p, calls, model_name="m", allow_patterns=["read_*"]))
     assert p.seen == ["delete_repo"]
+
+
+def test_a_human_approval_at_the_model_layer_is_recorded_as_a_human_disposition(tmp_path):
+    """The hook, the MCP server and the OS guard write approver=human on the
+    resolution a person made through the approvals directory. The model-layer
+    gate records the same decision through the same handshake and must say
+    the same thing, or its receipts read as though policy replayed it."""
+    from vaara.audit.trail import EventType
+
+    approvals = tmp_path / "approvals"
+    pipeline = _escalate_all()
+
+    def responder():
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            reqs = list(approvals.glob("*.request.json")) if approvals.exists() else []
+            if reqs:
+                action_id = reqs[0].name.removesuffix(".request.json")
+                from vaara.approvals import write_decision
+                write_decision(action_id, "approve", approvals_dir=approvals)
+                return
+            time.sleep(0.02)
+
+    thread = threading.Thread(target=responder, daemon=True)
+    thread.start()
+    app = build_app(
+        emitter=None, upstream="http://up", pipeline=pipeline,
+        approvals_dir=approvals, approvals_timeout=10,
+        client=httpx.AsyncClient(transport=httpx.MockTransport(_anthropic_upstream)),
+    )
+    status, _raw = _drive(app, "/v1/messages", {
+        "model": "claude-sonnet-5", "messages": MESSAGES, "stream": False,
+    })
+    thread.join(timeout=1)
+    assert status == 200
+    [resolved] = pipeline.trail.get_records_by_type(EventType.ESCALATION_RESOLVED)
+    assert resolved.data["resolution"] == "allow"
+    assert resolved.data["approver"] == "human"
+    assert resolved.data["human_disposed"] is True

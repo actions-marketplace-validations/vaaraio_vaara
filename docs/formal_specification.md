@@ -12,7 +12,7 @@ Let an AI agent **A** operate in an environment **E** by executing a sequence of
 **Goal**: Construct an adaptive risk scorer **f: A × H to [0, 1]** and a conformal prediction set **C(aₜ) ⊆ [0, 1]** such that:
 
 1. The scorer learns from outcomes: f improves over time as action consequences are observed.
-2. The prediction set provides a distribution-free coverage guarantee: P(r*(aₜ) ∈ C(aₜ)) ≥ 1 − α for any α ∈ (0, 1), regardless of the underlying distribution of risks.
+2. The prediction set provides a distribution-free coverage guarantee: P(r*(aₜ) ∈ C(aₜ)) ≥ 1 − α for any α ∈ (0, 1) when the calibration points are exchangeable with the test point (§5.1), with no assumption on the shape of the risk distribution, and a long-run miss rate that tends to α under arbitrary distribution shift (§5.2).
 3. Temporal sequences are scored compositionally, not independently.
 
 ## 2. Action Space and Taxonomy
@@ -144,7 +144,7 @@ Let C(aₜ) = [f(aₜ) − q̂, f(aₜ) + q̂] be the conformal interval. The de
 
 This is **conservative by construction**: the decision is based on the worst-case risk within the 1 − α confidence set. If even the worst case is safe, allow. If even the best case is dangerous, deny. Between: escalate for human judgment.
 
-**Proposition 5.2**: Let θ_allow = 0.4 and θ_deny = 0.7 (the scorer defaults; the policy loader's own defaults are 0.55/0.85). With the seeded calibration prior (§8.3), the interval starts at [f(a) − 0.19, f(a) + 0.19]. A raw score of f(a) < 0.21 is then needed for auto-allow, and f(a) > 0.51 for auto-deny, with the band between routed to human review. Operators who disable the prior (`pre_seed_calibration=False`) get the strict cold start: the interval is [f(a) − 0.3, f(a) + 0.3] until ~30 real outcomes land, and most actions escalate — maximally cautious by design.
+**Proposition 5.2**: Let θ_allow = 0.55 and θ_deny = 0.85, which is the balanced mode and the default for the scorer and the policy loader alike. With the seeded calibration prior (§8.3), the interval starts at [f(a) − 0.19, f(a) + 0.19]. A raw score of f(a) < 0.36 is then needed for auto-allow, and f(a) > 0.66 for auto-deny, with the band between routed to human review. Operators who disable the prior (`pre_seed_calibration=False`) get the strict cold start: the interval is [f(a) − 0.3, f(a) + 0.3] until ~30 real outcomes land, and most actions escalate — maximally cautious by design.
 
 ## 6. Temporal Sequence Scoring
 
@@ -184,7 +184,7 @@ Records form a hash chain. Each record carries a `previous_hash` field, and the 
 
 where canonical_json uses sorted keys, no whitespace, and rejects non-finite numbers. (Chain v2 additionally binds `tenant_id` and `chain_version` into the same payload.) **Proposition 7.1**: Tampering with any record rᵢ (i < t) changes hᵢ, which cascades to hₜ through the committed previous_hash fields. Chain verification is O(n).
 
-This satisfies EU AI Act Article 12(1) requirement for tamper-evident logging and DORA Article 12(1) requirement for ICT incident detection with automated alert mechanisms.
+This satisfies EU AI Act Article 12(1) requirement for tamper-evident logging and DORA Article 10(1) requirement for prompt detection of anomalous activities.
 
 ## 8. Convergence Properties
 
@@ -198,18 +198,18 @@ With K = 5 experts and η = 0.1:
 ### 8.2 Conformal Coverage Guarantee
 
 With n = 30 calibration points (minimum) and α = 0.10:
-- Finite-sample coverage: ≥ 1 − α − 1/(n+1) = 0.868 (worst case with 30 points)
-- With n = 100: ≥ 0.890
-- With n = 1000: ≥ 0.899 (approaching 0.90 asymptotically)
+- Finite-sample coverage under exchangeability: at least 1 − α = 0.90, and at most 1 − α + 1/(n+1) = 0.932 with 30 points
+- With n = 100: between 0.90 and 0.910
+- With n = 1000: between 0.90 and 0.901 (the interval tightens towards exactly 0.90)
 
-The FACI adaptive alpha further tightens this under stationarity and maintains approximate coverage under shift.
+Under shift the per-step bound no longer applies, and the FACI adaptive alpha holds the long-run miss rate at α instead. `tests/test_outcome_and_calibration_invariants.py` checks that the quantile is the ⌈(1−α)(n+1)⌉-th smallest residual and that the long-run miss rate stays within 0.01 of α on an abrupt shift, regime switching, and a sequence that keeps rising above its own maximum.
 
 ### 8.3 Cold Start Duration
 
 A just-constructed scorer is **calibrated from birth**: 50 synthetic benign calibration points are seeded at construction (`pre_seed_calibration=True`, the default), so the conformal quantile lands at ~0.19 and the starting interval is [f(a) − 0.19, f(a) + 0.19] rather than the ±0.3 zero-residual fallback. Real outcome reports overwrite the prior within max_calibration = 2000 reports; no migration or warm-up period is needed. During the prior window:
 
 - MWU weights start uniform, f(a) ≈ (s₁ + s₂ + s₃ + s₄ + s₅) / 5, and adapt with every reported outcome
-- The decision band comes from the thresholds alone: with defaults (0.4 / 0.7), raw scores below ~0.21 auto-allow and above ~0.51 auto-deny
+- The decision band comes from the thresholds alone: with defaults (0.55 / 0.85), raw scores below ~0.36 auto-allow and above ~0.66 auto-deny
 - Operators who want the strict historical behaviour — ±0.3 intervals and most actions escalating until ~30 outcomes — pass `pre_seed_calibration=False`
 
 This is **correct behavior**: a first deployment is useful immediately, and the conservative choice remains available as an explicit operator decision.
